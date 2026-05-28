@@ -14,24 +14,42 @@ APP_AUTHOR   := Gilson Santos / OpenAI
 APP_VERSION  := 0.3.0
 
 ARCH := -march=armv8-a -mtune=cortex-a57 -mtp=soft -fPIE
-CFLAGS   := -g -Wall -O2 -ffunction-sections $(ARCH) $(DEFINES) -D__SWITCH__ -DNSTV_USE_SDL -DNSTV_USE_SDL_TTF -DNSTV_USE_SDL_IMAGE
-CXXFLAGS := $(CFLAGS) -std=c++17 -fno-rtti -fexceptions
+CFLAGS   = -g -Wall -O2 -ffunction-sections $(ARCH) $(DEFINES) -D__SWITCH__ -DNSTV_USE_SDL -DNSTV_USE_SDL_TTF -DNSTV_USE_SDL_IMAGE $(FFMPEG_DEFINES)
+CXXFLAGS = $(CFLAGS) -std=c++17 -fno-rtti -fexceptions
 ASFLAGS  := -g $(ARCH)
 LDFLAGS  := -specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
 
 PORTLIBS := $(DEVKITPRO)/portlibs/switch
 LIBNX    := $(DEVKITPRO)/libnx
 
+FFMPEG_AVAILABLE := $(wildcard $(PORTLIBS)/lib/libavformat.a)
+ifeq ($(FFMPEG_AVAILABLE),)
+FFMPEG_DEFINES :=
+FFMPEG_LIBS :=
+else
+FFMPEG_DEFINES := -DNSTV_USE_FFMPEG
+FFMPEG_LIBS := -lavformat -lavcodec -lavutil -lswscale -lswresample -lz -lbz2 -llzma -lm
+endif
+
 LIBS := \
+  $(FFMPEG_LIBS) \
   -lSDL2_image \
   -lSDL2_ttf \
   -lSDL2 \
+  -lavformat \
+  -lavcodec \
+  -ldav1d \
+  -lavutil \
+  -lswscale \
   -lfreetype \
   -lharfbuzz \
+  -lass \
+  -lfribidi \
   -lpng \
   -ljpeg \
   -lwebp \
   -lbz2 \
+  -llzma \
   -lcurl \
   -lmbedtls \
   -lmbedx509 \

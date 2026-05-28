@@ -19,6 +19,7 @@ enum class Button {
 
 void platformInit();
 void platformExit();
+Button pollButton();
 Button pollButtonBlocking();
 void clearScreen();
 void presentScreen();

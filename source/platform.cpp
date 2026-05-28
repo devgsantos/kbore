@@ -14,6 +14,10 @@
 
 #include <curl/curl.h>
 
+#ifdef NSTV_USE_SDL
+#include <SDL2/SDL.h>
+#endif
+
 
 namespace nstv {
 
@@ -39,23 +43,98 @@ void platformExit() {
   curl_global_cleanup();
 }
 
+Button pollButton() {
+#ifdef __SWITCH__
+  if (!appletMainLoop()) {
+    return Button::Quit;
+  }
+
+  padUpdate(&pad);
+  u64 down = padGetButtonsDown(&pad);
+
+  if (down & HidNpadButton_Up) return Button::Up;
+  if (down & HidNpadButton_Down) return Button::Down;
+  if (down & HidNpadButton_Left) return Button::Left;
+  if (down & HidNpadButton_Right) return Button::Right;
+  if (down & HidNpadButton_A) return Button::Select;
+  if (down & HidNpadButton_B) return Button::Back;
+  if (down & HidNpadButton_X) return Button::Favorite;
+  if (down & HidNpadButton_Plus) return Button::Menu;
+  if (down & HidNpadButton_Minus) return Button::Quit;
+
+  return Button::None;
+#else
+#ifdef NSTV_USE_SDL
+  SDL_Event event;
+  while (SDL_PollEvent(&event)) {
+    if (event.type == SDL_QUIT) return Button::Quit;
+
+    if (event.type == SDL_KEYDOWN) {
+      switch (event.key.keysym.sym) {
+        case SDLK_UP:
+        case SDLK_w:
+          return Button::Up;
+        case SDLK_DOWN:
+        case SDLK_s:
+          return Button::Down;
+        case SDLK_LEFT:
+        case SDLK_a:
+          return Button::Left;
+        case SDLK_RIGHT:
+        case SDLK_d:
+          return Button::Right;
+        case SDLK_RETURN:
+        case SDLK_SPACE:
+        case SDLK_e:
+          return Button::Select;
+        case SDLK_BACKSPACE:
+        case SDLK_ESCAPE:
+        case SDLK_b:
+          return Button::Back;
+        case SDLK_x:
+          return Button::Favorite;
+        case SDLK_m:
+        case SDLK_PLUS:
+        case SDLK_EQUALS:
+          return Button::Menu;
+        case SDLK_q:
+          return Button::Quit;
+        default:
+          break;
+      }
+    }
+  }
+
+  return Button::None;
+#else
+  return Button::None;
+#endif
+#endif
+}
+
 Button pollButtonBlocking() {
 #ifdef __SWITCH__
   while (appletMainLoop()) {
-    padUpdate(&pad);
-    u64 down = padGetButtonsDown(&pad);
-    if (down & HidNpadButton_Up) return Button::Up;
-    if (down & HidNpadButton_Down) return Button::Down;
-    if (down & HidNpadButton_Left) return Button::Left;
-    if (down & HidNpadButton_Right) return Button::Right;
-    if (down & HidNpadButton_A) return Button::Select;
-    if (down & HidNpadButton_B) return Button::Back;
-    if (down & HidNpadButton_X) return Button::Favorite;
-    if (down & HidNpadButton_Plus) return Button::Menu;
-    if (down & HidNpadButton_Minus) return Button::Quit;
+    Button button = pollButton();
+    if (button != Button::None) {
+      return button;
+    }
+
     sleepMs(8);
   }
+
   return Button::Quit;
+#else
+#ifdef NSTV_USE_SDL
+  while (true) {
+    Button button = pollButton();
+
+    if (button != Button::None) {
+      return button;
+    }
+
+    sleepMs(8);
+  }
 #else
   char ch;
   std::cin >> ch;
@@ -71,6 +150,7 @@ Button pollButtonBlocking() {
     case 'q': return Button::Quit;
     default: return Button::None;
   }
+#endif
 #endif
 }
 

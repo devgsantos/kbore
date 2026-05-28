@@ -7,11 +7,13 @@ SOURCES        := source
 INCLUDES       := include
 
 HOST_CXX       ?= g++
-HOST_CXXFLAGS  := -std=c++17 -Wall -Wextra -O2 -DNSTV_USE_SDL -DNSTV_USE_SDL_TTF -DNSTV_USE_SDL_IMAGE -I$(INCLUDES)
+HOST_CXXFLAGS  = -std=c++17 -Wall -Wextra -O2 -DNSTV_USE_SDL -DNSTV_USE_SDL_TTF -DNSTV_USE_SDL_IMAGE $(HOST_FFMPEG_CFLAGS) -I$(INCLUDES)
 HOST_SDL_CFLAGS := $(shell pkg-config --cflags sdl2 SDL2_ttf SDL2_image 2>/dev/null)
 HOST_SDL_LIBS   := $(shell pkg-config --libs sdl2 SDL2_ttf SDL2_image 2>/dev/null)
 HOST_CURL_LIBS  := $(shell pkg-config --libs libcurl 2>/dev/null || curl-config --libs)
-HOST_LDFLAGS   := $(HOST_SDL_LIBS) $(HOST_CURL_LIBS) -lz
+HOST_FFMPEG_CFLAGS := $(shell pkg-config --exists libavformat libavcodec libavutil libswscale 2>/dev/null && echo -DNSTV_USE_FFMPEG $$(pkg-config --cflags libavformat libavcodec libavutil libswscale))
+HOST_FFMPEG_LIBS   := $(shell pkg-config --exists libavformat libavcodec libavutil libswscale 2>/dev/null && pkg-config --libs libavformat libavcodec libavutil libswscale)
+HOST_LDFLAGS   := $(HOST_SDL_LIBS) $(HOST_FFMPEG_LIBS) $(HOST_CURL_LIBS) -lz
 HOST_SRCS      := $(wildcard $(SOURCES)/*.cpp)
 HOST_BIN       := $(BUILD)/$(TARGET)-host
 
