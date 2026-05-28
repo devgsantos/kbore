@@ -8,8 +8,13 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <curl/curl.h>
 #include <zlib.h>
+#ifdef NSTV_USE_SDL_IMAGE
+#include <SDL2/SDL.h>
+#include <SDL2/SDL_image.h>
+#endif
 
 namespace nstv {
 namespace {
@@ -62,7 +67,7 @@ const Bitmap *ImageCache::get(const std::string &url) {
   Entry entry;
   std::vector<uint8_t> bytes;
 
-  if (download(url, bytes) && (decodePng(bytes, entry.bitmap) || decodePpm(bytes, entry.bitmap))) {
+  if (download(url, bytes) && (decodeSdlImage(bytes, entry.bitmap) || decodePng(bytes, entry.bitmap) || decodePpm(bytes, entry.bitmap))) {
     entry.status = Status::Loaded;
   } else {
     entry.status = Status::Failed;
@@ -108,6 +113,49 @@ bool ImageCache::download(const std::string &url, std::vector<uint8_t> &data) {
   return code == CURLE_OK && status >= 200 && status < 300 && !data.empty();
 }
 
+
+
+bool ImageCache::decodeSdlImage(const std::vector<uint8_t> &data, Bitmap &bitmap) {
+#ifndef NSTV_USE_SDL_IMAGE
+  (void)data;
+  (void)bitmap;
+  return false;
+#else
+  if (data.empty()) return false;
+
+  static bool initialized = false;
+  if (!initialized) {
+    IMG_Init(IMG_INIT_PNG | IMG_INIT_JPG | IMG_INIT_WEBP);
+    initialized = true;
+  }
+
+  SDL_RWops *rw = SDL_RWFromConstMem(data.data(), static_cast<int>(data.size()));
+  if (!rw) return false;
+
+  SDL_Surface *loaded = IMG_Load_RW(rw, 1);
+  if (!loaded) return false;
+
+  SDL_Surface *rgba = SDL_ConvertSurfaceFormat(loaded, SDL_PIXELFORMAT_RGBA32, 0);
+  SDL_FreeSurface(loaded);
+  if (!rgba) return false;
+
+  bitmap.width = rgba->w;
+  bitmap.height = rgba->h;
+  bitmap.rgba.resize(static_cast<std::size_t>(bitmap.width * bitmap.height * 4));
+
+  const uint8_t *src = static_cast<const uint8_t *>(rgba->pixels);
+  for (int y = 0; y < bitmap.height; ++y) {
+    std::memcpy(
+      bitmap.rgba.data() + static_cast<std::size_t>(y * bitmap.width * 4),
+      src + static_cast<std::size_t>(y * rgba->pitch),
+      static_cast<std::size_t>(bitmap.width * 4)
+    );
+  }
+
+  SDL_FreeSurface(rgba);
+  return true;
+#endif
+}
 
 bool ImageCache::decodePpm(const std::vector<uint8_t> &data, Bitmap &bitmap) {
   if (data.size() < 3 || data[0] != 'P' || data[1] != '6') {

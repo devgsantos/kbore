@@ -1,0 +1,153 @@
+# =========================
+# NSTV / C++ / Switch build
+# =========================
+
+# Build folders
+build/
+build-*/
+out/
+dist/
+release/
+debug/
+
+# Object / dependency files
+*.o
+*.obj
+*.d
+*.a
+*.so
+*.dll
+*.dylib
+*.lib
+
+# Executables
+*.elf
+*.nro
+*.nacp
+*.map
+*.bin
+*.exe
+
+# Host binary
+nstv-native-host
+nstv-native
+
+# Generated preview frames/images
+nstv-frame.ppm
+nstv-frame.png
+frame.ppm
+frame.png
+preview.ppm
+preview.png
+
+# =========================
+# Local app data / cache
+# =========================
+
+# Runtime cache
+cache/
+cache/**
+
+# Local persisted playlist/manifest data
+active-manifest.json
+playlists.json
+channels-cache.json
+
+# Local downloaded images/logos
+images-cache/
+image-cache/
+logos-cache/
+
+# =========================
+# Configs / secrets
+# =========================
+
+# Keep example config, ignore local real config
+config.json
+.env
+.env.*
+!.env.example
+!config.example.json
+
+# API keys / private values
+*.key
+*.pem
+*.p12
+*.crt
+
+# =========================
+# Fonts
+# =========================
+# Do not commit local font files
+fonts/
+*.ttf
+*.otf
+*.woff
+*.woff2
+
+# =========================
+# DevkitPro / local toolchain
+# =========================
+
+devkitpro/
+devkitPro/
+portlibs/
+libnx/
+
+# =========================
+# IDE / editor
+# =========================
+
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*~
+
+# =========================
+# OS files
+# =========================
+
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# =========================
+# Logs
+# =========================
+
+*.log
+logs/
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+
+# =========================
+# Archives / packages
+# =========================
+
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+
+# =========================
+# CMake, if used later
+# =========================
+
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile.cmake
+compile_commands.json
+
+# =========================
+# SDL / generated assets
+# =========================
+
+*.bmp
+*.ppm

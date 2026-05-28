@@ -1,3 +1,4 @@
+#ifndef NSTV_USE_SDL
 #include "nstv/graphics.hpp"
 #include <algorithm>
 #include <array>
@@ -473,3 +474,5 @@ void Graphics::drawHeaderIcon(const std::string &name, int x, int y, int size, C
 
 
 } // namespace nstv
+
+#endif // NSTV_USE_SDL

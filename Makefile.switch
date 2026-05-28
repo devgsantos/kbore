@@ -11,10 +11,10 @@ DATA         := data
 INCLUDES     := include
 APP_TITLE    := NSTV Native
 APP_AUTHOR   := Gilson Santos / OpenAI
-APP_VERSION  := 0.2.0
+APP_VERSION  := 0.3.0
 
 ARCH := -march=armv8-a -mtune=cortex-a57 -mtp=soft -fPIE
-CFLAGS   := -g -Wall -O2 -ffunction-sections $(ARCH) $(DEFINES) -D__SWITCH__
+CFLAGS   := -g -Wall -O2 -ffunction-sections $(ARCH) $(DEFINES) -D__SWITCH__ -DNSTV_USE_SDL -DNSTV_USE_SDL_TTF -DNSTV_USE_SDL_IMAGE
 CXXFLAGS := $(CFLAGS) -std=c++17 -fno-rtti -fexceptions
 ASFLAGS  := -g $(ARCH)
 LDFLAGS  := -specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
@@ -22,7 +22,28 @@ LDFLAGS  := -specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir 
 PORTLIBS := $(DEVKITPRO)/portlibs/switch
 LIBNX    := $(DEVKITPRO)/libnx
 
-LIBS := -lcurl -lmbedtls -lmbedx509 -lmbedcrypto -lz -lnx
+LIBS := \
+  -lSDL2_image \
+  -lSDL2_ttf \
+  -lSDL2 \
+  -lfreetype \
+  -lharfbuzz \
+  -lpng \
+  -ljpeg \
+  -lwebp \
+  -lbz2 \
+  -lcurl \
+  -lmbedtls \
+  -lmbedx509 \
+  -lmbedcrypto \
+  -lz \
+  -lEGL \
+  -lGLESv2 \
+  -lglad \
+  -lglapi \
+  -ldrm_nouveau \
+  -lm \
+  -lnx
 LIBDIRS := $(PORTLIBS) $(LIBNX)
 
 ifneq ($(BUILD),$(notdir $(CURDIR)))

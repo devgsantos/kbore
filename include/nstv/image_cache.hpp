@@ -22,6 +22,7 @@ private:
   std::map<std::string, Entry> entries_;
 
   bool download(const std::string &url, std::vector<uint8_t> &data);
+  bool decodeSdlImage(const std::vector<uint8_t> &data, Bitmap &bitmap);
   bool decodePng(const std::vector<uint8_t> &data, Bitmap &bitmap);
   bool decodePpm(const std::vector<uint8_t> &data, Bitmap &bitmap);
 };

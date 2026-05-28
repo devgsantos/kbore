@@ -1,0 +1,500 @@
+#ifdef NSTV_USE_SDL
+
+#include "nstv/graphics.hpp"
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <string>
+#include <vector>
+
+#include <SDL2/SDL.h>
+#ifdef NSTV_USE_SDL_TTF
+#include <SDL2/SDL_ttf.h>
+#endif
+
+#ifdef __SWITCH__
+#include <switch.h>
+#endif
+
+namespace nstv {
+namespace {
+SDL_Window *g_window = nullptr;
+SDL_Renderer *g_renderer = nullptr;
+bool g_sdlReady = false;
+
+#ifdef NSTV_USE_SDL_TTF
+std::map<std::string, TTF_Font *> g_fontCache;
+bool g_ttfReady = false;
+#endif
+
+SDL_Color toSDL(Color c) { return SDL_Color{c.r, c.g, c.b, c.a}; }
+
+void setDraw(Color c) {
+  SDL_SetRenderDrawBlendMode(g_renderer, SDL_BLENDMODE_BLEND);
+  SDL_SetRenderDrawColor(g_renderer, c.r, c.g, c.b, c.a);
+}
+
+Color mix(Color a, Color b, float t) {
+  t = std::max(0.0f, std::min(1.0f, t));
+  return Color{
+    static_cast<uint8_t>(a.r + (b.r - a.r) * t),
+    static_cast<uint8_t>(a.g + (b.g - a.g) * t),
+    static_cast<uint8_t>(a.b + (b.b - a.b) * t),
+    static_cast<uint8_t>(a.a + (b.a - a.a) * t)
+  };
+}
+
+std::string normalizeAscii(const std::string &input) {
+  // SDL_ttf supports UTF-8. Keep the original string for TTF, but strip control bytes.
+  std::string out;
+  out.reserve(input.size());
+  for (unsigned char c : input) {
+    if (c < 0x20 && c != '\n' && c != '\t') continue;
+    out.push_back(static_cast<char>(c));
+  }
+  return out;
+}
+
+
+std::array<uint8_t, 7> fallbackGlyph(char ch) {
+  if (ch >= 'a' && ch <= 'z') ch = char(ch - 'a' + 'A');
+
+  switch (ch) {
+    case 'A': return {0x0E,0x11,0x11,0x1F,0x11,0x11,0x11};
+    case 'B': return {0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E};
+    case 'C': return {0x0F,0x10,0x10,0x10,0x10,0x10,0x0F};
+    case 'D': return {0x1E,0x11,0x11,0x11,0x11,0x11,0x1E};
+    case 'E': return {0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F};
+    case 'F': return {0x1F,0x10,0x10,0x1E,0x10,0x10,0x10};
+    case 'G': return {0x0F,0x10,0x10,0x17,0x11,0x11,0x0F};
+    case 'H': return {0x11,0x11,0x11,0x1F,0x11,0x11,0x11};
+    case 'I': return {0x1F,0x04,0x04,0x04,0x04,0x04,0x1F};
+    case 'J': return {0x01,0x01,0x01,0x01,0x11,0x11,0x0E};
+    case 'K': return {0x11,0x12,0x14,0x18,0x14,0x12,0x11};
+    case 'L': return {0x10,0x10,0x10,0x10,0x10,0x10,0x1F};
+    case 'M': return {0x11,0x1B,0x15,0x15,0x11,0x11,0x11};
+    case 'N': return {0x11,0x19,0x15,0x13,0x11,0x11,0x11};
+    case 'O': return {0x0E,0x11,0x11,0x11,0x11,0x11,0x0E};
+    case 'P': return {0x1E,0x11,0x11,0x1E,0x10,0x10,0x10};
+    case 'Q': return {0x0E,0x11,0x11,0x11,0x15,0x12,0x0D};
+    case 'R': return {0x1E,0x11,0x11,0x1E,0x14,0x12,0x11};
+    case 'S': return {0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E};
+    case 'T': return {0x1F,0x04,0x04,0x04,0x04,0x04,0x04};
+    case 'U': return {0x11,0x11,0x11,0x11,0x11,0x11,0x0E};
+    case 'V': return {0x11,0x11,0x11,0x11,0x0A,0x0A,0x04};
+    case 'W': return {0x11,0x11,0x11,0x15,0x15,0x1B,0x11};
+    case 'X': return {0x11,0x0A,0x04,0x04,0x04,0x0A,0x11};
+    case 'Y': return {0x11,0x0A,0x04,0x04,0x04,0x04,0x04};
+    case 'Z': return {0x1F,0x02,0x04,0x08,0x10,0x10,0x1F};
+
+    case '0': return {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E};
+    case '1': return {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E};
+    case '2': return {0x0E,0x11,0x01,0x02,0x04,0x08,0x1F};
+    case '3': return {0x1E,0x01,0x01,0x0E,0x01,0x01,0x1E};
+    case '4': return {0x02,0x06,0x0A,0x12,0x1F,0x02,0x02};
+    case '5': return {0x1F,0x10,0x10,0x1E,0x01,0x01,0x1E};
+    case '6': return {0x0E,0x10,0x10,0x1E,0x11,0x11,0x0E};
+    case '7': return {0x1F,0x01,0x02,0x04,0x08,0x08,0x08};
+    case '8': return {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E};
+    case '9': return {0x0E,0x11,0x11,0x0F,0x01,0x01,0x0E};
+
+    case ':': return {0x00,0x04,0x04,0x00,0x04,0x04,0x00};
+    case '.': return {0x00,0x00,0x00,0x00,0x00,0x0C,0x0C};
+    case ',': return {0x00,0x00,0x00,0x00,0x04,0x04,0x08};
+    case '-': return {0x00,0x00,0x00,0x1F,0x00,0x00,0x00};
+    case '_': return {0x00,0x00,0x00,0x00,0x00,0x00,0x1F};
+    case '/': return {0x01,0x02,0x02,0x04,0x08,0x08,0x10};
+    case '|': return {0x04,0x04,0x04,0x04,0x04,0x04,0x04};
+    case '+': return {0x00,0x04,0x04,0x1F,0x04,0x04,0x00};
+    case '*': return {0x00,0x15,0x0E,0x1F,0x0E,0x15,0x00};
+    case '<': return {0x02,0x04,0x08,0x10,0x08,0x04,0x02};
+    case '>': return {0x08,0x04,0x02,0x01,0x02,0x04,0x08};
+    case '(': return {0x02,0x04,0x08,0x08,0x08,0x04,0x02};
+    case ')': return {0x08,0x04,0x02,0x02,0x02,0x04,0x08};
+    case '[': return {0x0E,0x08,0x08,0x08,0x08,0x08,0x0E};
+    case ']': return {0x0E,0x02,0x02,0x02,0x02,0x02,0x0E};
+    case '!': return {0x04,0x04,0x04,0x04,0x04,0x00,0x04};
+    case '?': return {0x0E,0x11,0x01,0x02,0x04,0x00,0x04};
+    case '#': return {0x0A,0x1F,0x0A,0x0A,0x1F,0x0A,0x00};
+    case '%': return {0x19,0x19,0x02,0x04,0x08,0x13,0x13};
+    case '&': return {0x0C,0x12,0x14,0x08,0x15,0x12,0x0D};
+    case ' ': return {0x00,0x00,0x00,0x00,0x00,0x00,0x00};
+
+    default: return {0x1F,0x11,0x05,0x02,0x05,0x11,0x1F};
+  }
+}
+
+const char *firstExistingFont() {
+  // Prefer project-bundled fonts. On Switch, copy the fonts folder to:
+  // sdmc:/switch/nstv/fonts/
+  static std::vector<std::string> paths = {
+#ifdef __SWITCH__
+    "sdmc:/switch/nstv/fonts/Roboto-Regular.ttf",
+    "sdmc:/switch/nstv/fonts/Roboto-Medium.ttf",
+    "sdmc:/switch/nstv/fonts/Roboto_SemiCondensed-Regular.ttf",
+    "sdmc:/switch/nstv/fonts/ConcertOne-Regular.ttf",
+    "sdmc:/switch/nstv/fonts/OpenSans-Regular.ttf",
+    "sdmc:/switch/nstv/fonts/DejaVuSans.ttf",
+#else
+    "./fonts/Roboto-Regular.ttf",
+    "./fonts/Roboto-Medium.ttf",
+    "./fonts/Roboto_SemiCondensed-Regular.ttf",
+    "./fonts/ConcertOne-Regular.ttf",
+    "./fonts/OpenSans-Regular.ttf",
+    "./fonts/open-sans/OpenSans-Regular.ttf",
+    "/usr/share/fonts/truetype/roboto/unhinted/RobotoTTF/Roboto-Regular.ttf",
+    "/usr/share/fonts/truetype/roboto/Roboto-Regular.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+#endif
+  };
+
+  for (const auto &path : paths) {
+    FILE *fp = std::fopen(path.c_str(), "rb");
+    if (fp) {
+      std::fclose(fp);
+      return path.c_str();
+    }
+  }
+  return nullptr;
+}
+
+#ifdef NSTV_USE_SDL_TTF
+TTF_Font *fontForScale(int scale, bool bold) {
+  if (!g_ttfReady) return nullptr;
+  const char *fontPath = firstExistingFont();
+  if (!fontPath) return nullptr;
+
+  // Map legacy scale values to TV-friendly point sizes.
+  int size = 12;
+  switch (scale) {
+    case 1: size = 12; break;
+    case 2: size = 16; break;
+    case 3: size = 22; break;
+    case 4: size = 28; break;
+    case 5: size = 34; break;
+    case 6: size = 42; break;
+    default: size = std::max(10, scale * 7); break;
+  }
+
+  std::string key = std::string(fontPath) + ":" + std::to_string(size) + (bold ? ":bold" : ":regular");
+  auto found = g_fontCache.find(key);
+  if (found != g_fontCache.end()) return found->second;
+
+  TTF_Font *font = TTF_OpenFont(fontPath, size);
+  if (!font) {
+    std::fprintf(stderr, "[NSTV] Failed to open font %s: %s\n", fontPath, TTF_GetError());
+    return nullptr;
+  }
+
+  if (bold) TTF_SetFontStyle(font, TTF_STYLE_BOLD);
+  g_fontCache[key] = font;
+  return font;
+}
+#endif
+
+std::map<const uint8_t *, SDL_Texture *> g_textureCache;
+
+} // namespace
+
+Color rgb(uint8_t r, uint8_t g, uint8_t b) { return Color{r,g,b,255}; }
+Color rgba(uint8_t r, uint8_t g, uint8_t b, uint8_t a) { return Color{r,g,b,a}; }
+Color lighten(Color c, int a) { return Color{uint8_t(std::min(255, c.r+a)), uint8_t(std::min(255, c.g+a)), uint8_t(std::min(255, c.b+a)), c.a}; }
+Color darken(Color c, int a) { return Color{uint8_t(std::max(0, c.r-a)), uint8_t(std::max(0, c.g-a)), uint8_t(std::max(0, c.b-a)), c.a}; }
+Color typeColor(const std::string &type) {
+  if (type == "movies") return rgb(126, 34, 206);
+  if (type == "series") return rgb(13, 148, 136);
+  if (type == "radio") return rgb(194, 65, 12);
+  return rgb(37, 99, 235);
+}
+
+Graphics::Graphics() {
+  if (g_sdlReady) return;
+
+  SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS);
+#ifdef NSTV_USE_SDL_TTF
+  if (TTF_Init() == 0) g_ttfReady = true;
+#endif
+  g_window = SDL_CreateWindow(
+    "NSTV",
+    SDL_WINDOWPOS_CENTERED,
+    SDL_WINDOWPOS_CENTERED,
+    Width,
+    Height,
+    SDL_WINDOW_SHOWN
+  );
+  g_renderer = SDL_CreateRenderer(g_window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+  if (!g_renderer) {
+    g_renderer = SDL_CreateRenderer(g_window, -1, SDL_RENDERER_SOFTWARE);
+  }
+  SDL_SetRenderDrawBlendMode(g_renderer, SDL_BLENDMODE_BLEND);
+  g_sdlReady = true;
+}
+
+void Graphics::beginFrame(Color color) {
+  if (!g_renderer) return;
+  setDraw(color);
+  SDL_RenderClear(g_renderer);
+  fillVerticalGradient(0, 0, Width, Height, rgb(6, 9, 18), rgb(2, 5, 11));
+  fillHorizontalGradient(0, 0, Width, 120, rgba(11, 19, 42, 170), rgba(2, 5, 16, 0));
+}
+
+void Graphics::present() {
+  if (!g_renderer) return;
+  SDL_RenderPresent(g_renderer);
+#ifndef __SWITCH__
+  // Host preview screenshot for quick visual validation.
+  SDL_Surface *surface = SDL_CreateRGBSurfaceWithFormat(0, Width, Height, 32, SDL_PIXELFORMAT_RGBA32);
+  if (surface) {
+    SDL_RenderReadPixels(g_renderer, nullptr, SDL_PIXELFORMAT_RGBA32, surface->pixels, surface->pitch);
+    SDL_SaveBMP(surface, "nstv-frame.bmp");
+    SDL_FreeSurface(surface);
+  }
+#endif
+}
+
+void Graphics::putPixel(int x, int y, Color color) {
+  if (!g_renderer) return;
+  if (x < 0 || y < 0 || x >= Width || y >= Height) return;
+  setDraw(color);
+  SDL_RenderDrawPoint(g_renderer, x, y);
+}
+
+void Graphics::blendPixel(int x, int y, Color color) { putPixel(x, y, color); }
+
+void Graphics::fillRect(int x, int y, int w, int h, Color color) {
+  if (!g_renderer || w <= 0 || h <= 0 || color.a == 0) return;
+  setDraw(color);
+  SDL_Rect r{x,y,w,h};
+  SDL_RenderFillRect(g_renderer, &r);
+}
+
+void Graphics::strokeRect(int x, int y, int w, int h, Color color, int thickness) {
+  if (!g_renderer || w <= 0 || h <= 0) return;
+  setDraw(color);
+  for (int i = 0; i < thickness; ++i) {
+    SDL_Rect r{x+i,y+i,w-2*i,h-2*i};
+    SDL_RenderDrawRect(g_renderer, &r);
+  }
+}
+
+void Graphics::fillRoundRect(int x, int y, int w, int h, int radius, Color color) {
+  if (!g_renderer || w <= 0 || h <= 0 || color.a == 0) return;
+  radius = std::max(0, std::min(radius, std::min(w,h)/2));
+  fillRect(x + radius, y, w - 2 * radius, h, color);
+  fillRect(x, y + radius, w, h - 2 * radius, color);
+  setDraw(color);
+  for (int yy = -radius; yy <= radius; ++yy) {
+    int dx = static_cast<int>(std::sqrt(std::max(0, radius*radius - yy*yy)));
+    SDL_RenderDrawLine(g_renderer, x + radius - dx, y + radius + yy, x + radius, y + radius + yy);
+    SDL_RenderDrawLine(g_renderer, x + w - radius, y + radius + yy, x + w - radius + dx, y + radius + yy);
+    SDL_RenderDrawLine(g_renderer, x + radius - dx, y + h - radius + yy - 1, x + radius, y + h - radius + yy - 1);
+    SDL_RenderDrawLine(g_renderer, x + w - radius, y + h - radius + yy - 1, x + w - radius + dx, y + h - radius + yy - 1);
+  }
+}
+
+void Graphics::strokeRoundRect(int x, int y, int w, int h, int radius, Color color, int thickness) {
+  if (!g_renderer || w <= 0 || h <= 0) return;
+  radius = std::max(0, std::min(radius, std::min(w,h)/2));
+  setDraw(color);
+  for (int t = 0; t < thickness; ++t) {
+    int ix = x + t;
+    int iy = y + t;
+    int iw = w - 2*t;
+    int ih = h - 2*t;
+    int r = std::max(0, radius - t);
+    SDL_RenderDrawLine(g_renderer, ix+r, iy, ix+iw-r, iy);
+    SDL_RenderDrawLine(g_renderer, ix+r, iy+ih-1, ix+iw-r, iy+ih-1);
+    SDL_RenderDrawLine(g_renderer, ix, iy+r, ix, iy+ih-r);
+    SDL_RenderDrawLine(g_renderer, ix+iw-1, iy+r, ix+iw-1, iy+ih-r);
+    for (int a = 0; a <= 90; ++a) {
+      float rad = a * 3.1415926f / 180.0f;
+      int dx = static_cast<int>(std::cos(rad) * r);
+      int dy = static_cast<int>(std::sin(rad) * r);
+      SDL_RenderDrawPoint(g_renderer, ix+r-dx, iy+r-dy);
+      SDL_RenderDrawPoint(g_renderer, ix+iw-r+dx-1, iy+r-dy);
+      SDL_RenderDrawPoint(g_renderer, ix+r-dx, iy+ih-r+dy-1);
+      SDL_RenderDrawPoint(g_renderer, ix+iw-r+dx-1, iy+ih-r+dy-1);
+    }
+  }
+}
+
+void Graphics::fillVerticalGradient(int x, int y, int w, int h, Color top, Color bottom) {
+  if (h <= 0) return;
+  for (int yy=0; yy<h; ++yy) {
+    fillRect(x, y+yy, w, 1, mix(top, bottom, float(yy) / float(std::max(1, h-1))));
+  }
+}
+
+void Graphics::fillHorizontalGradient(int x, int y, int w, int h, Color left, Color right) {
+  if (w <= 0) return;
+  for (int xx=0; xx<w; ++xx) {
+    fillRect(x+xx, y, 1, h, mix(left, right, float(xx) / float(std::max(1, w-1))));
+  }
+}
+
+void Graphics::fillCircle(int cx, int cy, int radius, Color color) {
+  if (radius <= 0) return;
+  setDraw(color);
+  for (int y=-radius; y<=radius; ++y) {
+    int dx = static_cast<int>(std::sqrt(std::max(0, radius*radius - y*y)));
+    SDL_RenderDrawLine(g_renderer, cx-dx, cy+y, cx+dx, cy+y);
+  }
+}
+
+void Graphics::strokeCircle(int cx, int cy, int radius, Color color, int thickness) {
+  setDraw(color);
+  for (int t=0; t<thickness; ++t) {
+    int r = radius - t;
+    for (int a=0; a<360; ++a) {
+      float rad=a*3.1415926f/180.0f;
+      SDL_RenderDrawPoint(g_renderer, cx+int(std::cos(rad)*r), cy+int(std::sin(rad)*r));
+    }
+  }
+}
+
+void Graphics::drawLine(int x0, int y0, int x1, int y1, Color color, int thickness) {
+  setDraw(color);
+  for (int i=0; i<thickness; ++i) SDL_RenderDrawLine(g_renderer, x0, y0+i, x1, y1+i);
+}
+
+void Graphics::drawText(const std::string &text, int x, int y, int scale, Color color, bool bold) {
+  if (!g_renderer) return;
+  std::string s = normalizeAscii(text);
+#ifdef NSTV_USE_SDL_TTF
+  TTF_Font *font = fontForScale(scale, bold);
+  if (font) {
+    SDL_Surface *surface = TTF_RenderUTF8_Blended(font, s.c_str(), toSDL(color));
+    if (surface) {
+      SDL_Texture *texture = SDL_CreateTextureFromSurface(g_renderer, surface);
+      SDL_Rect dst{x, y, surface->w, surface->h};
+      SDL_RenderCopy(g_renderer, texture, nullptr, &dst);
+      SDL_DestroyTexture(texture);
+      SDL_FreeSurface(surface);
+    }
+    return;
+  }
+#endif
+  // Built-in bitmap fallback. This prevents the UI from disappearing if SDL_ttf
+  // cannot load the TTF font on the Switch SD card.
+  int cx = x;
+  const int pixel = std::max(1, scale);
+  const int step = 6 * pixel + (bold ? 1 : 0);
+
+  for (char ch : s) {
+    auto glyph = fallbackGlyph(ch);
+
+    for (int row = 0; row < 7; ++row) {
+      for (int col = 0; col < 5; ++col) {
+        if ((glyph[row] >> (4 - col)) & 1) {
+          fillRect(cx + col * pixel, y + row * pixel, pixel, pixel, color);
+          if (bold) {
+            fillRect(cx + col * pixel + 1, y + row * pixel, pixel, pixel, color);
+          }
+        }
+      }
+    }
+
+    cx += step;
+  }
+}
+
+void Graphics::drawTextRight(const std::string &text, int rightX, int y, int scale, Color color, bool bold) {
+  drawText(text, rightX - textWidth(text, scale), y, scale, color, bold);
+}
+
+int Graphics::textWidth(const std::string &text, int scale) const {
+  std::string s = normalizeAscii(text);
+#ifdef NSTV_USE_SDL_TTF
+  TTF_Font *font = fontForScale(scale, false);
+  if (font) {
+    int w=0,h=0;
+    TTF_SizeUTF8(font, s.c_str(), &w, &h);
+    return w;
+  }
+#endif
+  return int(s.size()) * (6*scale);
+}
+
+std::string Graphics::fitText(const std::string &text, int maxChars) {
+  std::string s = normalizeAscii(text);
+  if (int(s.size()) <= maxChars) return s;
+  if (maxChars <= 3) return s.substr(0, std::max(0, maxChars));
+  return s.substr(0, maxChars-3) + "...";
+}
+
+void Graphics::drawBadge(const std::string &text, int x, int y, int w, int h, Color bg, Color fg) {
+  fillRoundRect(x,y,w,h,h/2,bg);
+  strokeRoundRect(x,y,w,h,h/2,rgba(255,255,255,55),1);
+  int tw = textWidth(text, 1);
+  drawText(text, x + (w-tw)/2, y + (h-12)/2, 1, fg, true);
+}
+
+void Graphics::drawIconBox(const std::string &kind, int x, int y, int size, Color bg1, Color bg2, Color fg) {
+  fillVerticalGradient(x,y,size,size,bg1,bg2);
+  fillRoundRect(x,y,size,size,10,rgba(0,0,0,0));
+  strokeRoundRect(x,y,size,size,10,rgba(255,255,255,45),1);
+  drawHeaderIcon(kind, x+6, y+6, size-12, fg);
+}
+
+void Graphics::drawHeaderIcon(const std::string &name, int x, int y, int size, Color color) {
+  if (name == "config" || name == "+") {
+    int cx = x + size / 2; int cy = y + size / 2;
+    strokeCircle(cx, cy, size / 4, color, std::max(2, size/18));
+    for (int i=0;i<8;i++){float a=i*6.2831853f/8.0f; drawLine(cx+int(std::cos(a)*size*.34f), cy+int(std::sin(a)*size*.34f), cx+int(std::cos(a)*size*.45f), cy+int(std::sin(a)*size*.45f), color, std::max(2,size/16));}
+    return;
+  }
+  if (name == "categories") {
+    int t=std::max(2,size/18); for(int i=0;i<3;i++){int yy=y+size/4+i*size/5; fillCircle(x+size/5,yy,t+2,color); drawLine(x+size/3,yy,x+size-size/8,yy,color,t);} return;
+  }
+  if (name == "channels" || name == "live") {
+    int t=std::max(2,size/18); strokeRoundRect(x+size/7,y+size/4,size*5/7,size/2,size/12,color,t); drawLine(x+size/2,y+size/4,x+size/2-size/7,y+size/10,color,t); drawLine(x+size/2,y+size/4,x+size/2+size/7,y+size/10,color,t); return;
+  }
+  if (name == "layers") {
+    int t=std::max(2,size/20); for(int i=0;i<3;i++){int yy=y+size/5+i*size/5; drawLine(x+size/2,yy,x+size-size/6,yy+size/8,color,t); drawLine(x+size-size/6,yy+size/8,x+size/2,yy+size/4,color,t); drawLine(x+size/2,yy+size/4,x+size/6,yy+size/8,color,t); drawLine(x+size/6,yy+size/8,x+size/2,yy,color,t);} return;
+  }
+  if (name == "movies") { fillCircle(x+size/2,y+size/2,size/3,color); fillCircle(x+size/2,y+size/2,size/10,rgb(30,20,60)); return; }
+  if (name == "series") { strokeRoundRect(x+size/5,y+size/4,size*3/5,size/2,size/14,color,std::max(2,size/18)); fillRect(x+size/4,y+size/2,size/2,std::max(2,size/12),color); return; }
+  if (name == "radio") { strokeRoundRect(x+size/5,y+size/3,size*3/5,size/3,size/12,color,std::max(2,size/18)); drawLine(x+size/4,y+size/3,x+size*3/4,y+size/8,color,std::max(2,size/18)); return; }
+}
+
+void Graphics::drawLogoPlaceholder(const std::string &name, const std::string &logoUrl, int x, int y, int w, int h) {
+  (void)logoUrl;
+  drawLogoFallback(name, x, y, w, h, w <= 52 ? 2 : 3);
+}
+
+void Graphics::drawLogoFallback(const std::string &name, int x, int y, int w, int h, int scale) {
+  (void)name; (void)scale;
+  fillVerticalGradient(x, y, w, h, rgb(28,38,67), rgb(12,18,32));
+  fillRoundRect(x, y, w, h, 9, rgba(0,0,0,0));
+  strokeRoundRect(x, y, w, h, 9, rgba(255,255,255,55), 1);
+  Color fg = rgb(165, 190, 230);
+  drawHeaderIcon("channels", x + w/6, y + h/7, std::min(w,h)*2/3, fg);
+}
+
+void Graphics::drawImage(const Bitmap &bitmap, int x, int y, int w, int h) {
+  if (!bitmap.valid() || !g_renderer || w <= 0 || h <= 0) return;
+  SDL_Surface *surface = SDL_CreateRGBSurfaceWithFormatFrom(
+    const_cast<uint8_t *>(bitmap.rgba.data()), bitmap.width, bitmap.height, 32, bitmap.width * 4, SDL_PIXELFORMAT_RGBA32);
+  if (!surface) return;
+  SDL_Texture *texture = SDL_CreateTextureFromSurface(g_renderer, surface);
+  SDL_FreeSurface(surface);
+  if (!texture) return;
+  float srcRatio = float(bitmap.width) / float(bitmap.height);
+  float dstRatio = float(w) / float(h);
+  int drawW = w, drawH = h;
+  if (srcRatio > dstRatio) drawH = std::max(1, int(w / srcRatio));
+  else drawW = std::max(1, int(h * srcRatio));
+  SDL_Rect dst{x + (w-drawW)/2, y + (h-drawH)/2, drawW, drawH};
+  SDL_RenderCopy(g_renderer, texture, nullptr, &dst);
+  SDL_DestroyTexture(texture);
+  strokeRoundRect(x, y, w, h, 9, rgba(255,255,255,60), 1);
+}
+
+} // namespace nstv
+
+#endif // NSTV_USE_SDL
