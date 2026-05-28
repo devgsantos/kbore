@@ -1,0 +1,9 @@
+{
+  "parserApiBaseUrl": "https://iptv-parser-kappa.vercel.app",
+  "apiKey": "19ede57ab7225fd3ceedcc93fa6c4460",
+  "defaultPlaylistUrl": "http://host:port/get.php?username=USER&password=PASS&type=m3u_plus&output=ts",
+  "defaultXtreamUrl": "http://bmnew26.site?username=ven2xlvnpm02&password=55859910428",
+  "pageSize": 30,
+  "preloadThreshold": 8,
+  "useUnicodeIcons": false
+}
