@@ -393,128 +393,143 @@ void App::renderDashboardGraphic() {
   const std::string provider = providerLabel(state_.hasManifest ? state_.manifest.provider : Provider::Local);
 
   const Color text = rgb(248,250,252);
-  const Color muted = rgb(166,178,207);
-  const Color panelTop = rgb(18,27,50);
-  const Color panelBottom = rgb(8,13,25);
-  const Color panelBorder = rgb(44,58,86);
-  const Color blue = rgb(0,145,255);
-  const Color brightBlue = rgb(0,191,255);
+  const Color textSoft = rgb(218,226,244);
+  const Color muted = rgb(150,163,190);
+  const Color panelTop = rgb(16,24,45);
+  const Color panelBottom = rgb(7,11,22);
+  const Color panelBorder = rgb(38,52,82);
+  const Color blue = rgb(20,132,255);
+  const Color brightBlue = rgb(0,190,255);
   const Color green = rgb(57,220,35);
+  const Color card = rgba(13,20,37,220);
 
-  // Header
+  auto drawLogoOrFallback = [&](const Channel &channel, int x, int y, int w, int h) {
+    if (!channel.logo.empty()) {
+      const Bitmap *bitmap = imageCache_.get(channel.logo);
+      if (bitmap && bitmap->valid()) {
+        gfx_.drawImage(*bitmap, x, y, w, h);
+        return;
+      }
+    }
+
+    gfx_.drawLogoFallback(channel.name, x, y, w, h, 2);
+  };
+
+
+  // Header -----------------------------------------------------------------
   gfx_.drawIconBox("live", 24, 18, 54, rgb(239,68,68), rgb(127,29,29), rgb(255,255,255));
   gfx_.drawText("NSTV", 92, 18, 7, text, true);
   gfx_.drawText("IPTV PLAYER", 96, 62, 2, text, true);
-  gfx_.drawTextRight("ONLINE", 1080, 36, 3, text, true);
   gfx_.fillCircle(984, 43, 6, green);
+  gfx_.drawTextRight("ONLINE", 1080, 36, 3, text, true);
   gfx_.drawTextRight("21:45", 1190, 30, 5, text, false);
-  gfx_.drawIconBox("+", 1215, 20, 38, rgb(30,41,59), rgb(15,23,42), text);
+  gfx_.drawHeaderIcon("config", 1216, 20, 38, text);
 
   auto drawPanel = [&](Rect r, const std::string &title, const std::string &icon, bool focused){
     gfx_.fillVerticalGradient(r.x, r.y, r.w, r.h, panelTop, panelBottom);
-    gfx_.fillRoundRect(r.x, r.y, r.w, r.h, 16, rgba(0,0,0,0));
     gfx_.strokeRoundRect(r.x, r.y, r.w, r.h, 16, focused ? blue : panelBorder, focused ? 2 : 1);
-    gfx_.drawText(icon, r.x + 22, r.y + 22, 3, blue, true);
-    gfx_.drawText(title, r.x + 64, r.y + 22, 4, text, false);
+    gfx_.drawHeaderIcon(icon, r.x + 20, r.y + 17, 34, blue);
+    gfx_.drawText(title, r.x + 62, r.y + 23, 3, textSoft, true);
   };
 
-  Rect typesPanel{18, 90, 370, 470};
-  Rect categoriesPanel{405, 90, 340, 470};
-  Rect channelsPanel{758, 90, 505, 470};
-  drawPanel(typesPanel, "STREAM TYPES", "#", state_.focus == FocusColumn::Types);
-  drawPanel(categoriesPanel, "CATEGORIES", "[]", state_.focus == FocusColumn::Categories);
+  // Narrower Stream Types + wider channels.
+  Rect typesPanel{18, 90, 300, 470};
+  Rect categoriesPanel{332, 90, 330, 470};
+  Rect channelsPanel{676, 90, 587, 470};
+
+  drawPanel(typesPanel, "STREAM TYPES", "layers", state_.focus == FocusColumn::Types);
+  drawPanel(categoriesPanel, "CATEGORIES", "categories", state_.focus == FocusColumn::Categories);
   std::string chTitle = "CHANNELS";
   if (type) chTitle += " (" + type->label + ")";
-  drawPanel(channelsPanel, chTitle, "TV", state_.focus == FocusColumn::Channels);
-  gfx_.drawTextRight(std::to_string(state_.loadedTotal > 0 ? state_.loadedTotal : (type ? type->totalChannels : 0)) + " CANAIS", channelsPanel.x + channelsPanel.w - 28, channelsPanel.y + 24, 3, muted, false);
+  drawPanel(channelsPanel, chTitle, "channels", state_.focus == FocusColumn::Channels);
+  gfx_.drawTextRight(std::to_string(state_.loadedTotal > 0 ? state_.loadedTotal : (type ? type->totalChannels : 0)) + " CANAIS", channelsPanel.x + channelsPanel.w - 28, channelsPanel.y + 25, 2, muted, false);
 
-  // Types cards
+  // Stream type cards -------------------------------------------------------
   int typeY = typesPanel.y + 70;
   for (int i=0; i<std::min(4, (int)types.size()); ++i) {
     const auto &t = types[i];
     const bool selected = i == state_.selectedType;
     Color base = typeColor(toString(t.id));
-    int y = typeY + i * 78;
-    gfx_.fillHorizontalGradient(typesPanel.x + 16, y, typesPanel.w - 32, 68, rgba(base.r,base.g,base.b, selected?115:58), rgba(12,18,34, selected?245:210));
-    gfx_.fillRoundRect(typesPanel.x + 16, y, typesPanel.w - 32, 68, 13, rgba(0,0,0,0));
-    gfx_.strokeRoundRect(typesPanel.x + 16, y, typesPanel.w - 32, 68, 13, selected ? brightBlue : rgba(255,255,255,18), selected ? 3 : 1);
-    gfx_.drawIconBox(toString(t.id), typesPanel.x + 30, y + 11, 46, lighten(base,25), darken(base,30), text);
-    gfx_.drawText(t.label, typesPanel.x + 94, y + 16, 4, text, true);
+    int y = typeY + i * 74;
+    gfx_.fillHorizontalGradient(typesPanel.x + 14, y, typesPanel.w - 28, 64, rgba(base.r,base.g,base.b, selected?110:55), rgba(12,18,34, selected?245:210));
+    gfx_.fillRoundRect(typesPanel.x + 14, y, typesPanel.w - 28, 64, 13, rgba(0,0,0,0));
+    gfx_.strokeRoundRect(typesPanel.x + 14, y, typesPanel.w - 28, 64, 13, selected ? brightBlue : rgba(255,255,255,18), selected ? 3 : 1);
+    gfx_.drawIconBox(toString(t.id), typesPanel.x + 26, y + 10, 44, lighten(base,25), darken(base,30), text);
+    gfx_.drawText(Graphics::fitText(t.label, 12), typesPanel.x + 82, y + 15, 3, text, true);
     std::string sub = t.id == StreamType::Live ? "CANAIS AO VIVO" : (t.id == StreamType::Movies ? "FILMES" : (t.id == StreamType::Series ? "SERIES" : "RADIOS"));
-    gfx_.drawText(sub, typesPanel.x + 94, y + 45, 2, muted, false);
-    if (t.totalChannels > 0) gfx_.drawBadge(std::to_string(t.totalChannels), typesPanel.x + typesPanel.w - 80, y + 22, 48, 28, rgba(30,41,59,210), text);
+    gfx_.drawText(sub, typesPanel.x + 82, y + 42, 2, muted, false);
+    if (t.totalChannels > 0) gfx_.drawBadge(std::to_string(t.totalChannels), typesPanel.x + typesPanel.w - 68, y + 21, 42, 24, rgba(30,41,59,210), text);
   }
-  // Connection card
-  int cy = typesPanel.y + typesPanel.h - 76;
-  gfx_.fillRoundRect(typesPanel.x + 16, cy, typesPanel.w - 32, 58, 13, rgba(15,23,42,220));
-  gfx_.drawIconBox("OK", typesPanel.x+30, cy+10, 38, rgb(22,101,52), rgb(20,83,45), green);
-  gfx_.drawText("CONEXAO", typesPanel.x+84, cy+12, 3, text, true);
-  gfx_.drawText((provider + " API ONLINE"), typesPanel.x+84, cy+37, 2, green, false);
 
-  // Categories
-  int catRows = 8;
+  int cy = typesPanel.y + typesPanel.h - 74;
+  gfx_.fillRoundRect(typesPanel.x + 14, cy, typesPanel.w - 28, 56, 13, rgba(15,23,42,220));
+  gfx_.drawIconBox("OK", typesPanel.x+26, cy+9, 38, rgb(22,101,52), rgb(20,83,45), green);
+  gfx_.drawText("CONEXAO", typesPanel.x+78, cy+12, 3, text, true);
+  gfx_.drawText((provider + " ONLINE"), typesPanel.x+78, cy+37, 2, green, false);
+
+  // Categories: no side acronym/icon, smaller text -------------------------
+  int catRows = 9;
   int catStart = windowStart(state_.selectedCategory, (int)categories.size(), catRows);
   for (int i=0; i<catRows; ++i) {
     int index = catStart + i;
-    int y = categoriesPanel.y + 70 + i * 47;
+    int y = categoriesPanel.y + 68 + i * 42;
     if (index >= (int)categories.size()) break;
     const auto &c = categories[index];
     bool selected = index == state_.selectedCategory;
-    gfx_.fillRoundRect(categoriesPanel.x + 14, y, categoriesPanel.w - 30, 40, 10, selected ? rgba(18,45,94,230) : rgba(15,23,42,180));
-    gfx_.strokeRoundRect(categoriesPanel.x + 14, y, categoriesPanel.w - 30, 40, 10, selected ? brightBlue : rgba(255,255,255,18), selected ? 2 : 1);
-    std::string icon = index == 0 ? "*" : categoryIcon(c, state_.config.useUnicodeIcons);
-    gfx_.drawText(icon, categoriesPanel.x + 34, y + 11, 3, selected ? rgb(255,214,10) : blue, true);
-    gfx_.drawText(Graphics::fitText(c.name, 17), categoriesPanel.x + 78, y + 10, 3, text, true);
-    gfx_.drawBadge(std::to_string(c.totalChannels), categoriesPanel.x + categoriesPanel.w - 78, y + 9, 46, 24, rgba(41,54,82,220), text);
+    gfx_.fillRoundRect(categoriesPanel.x + 14, y, categoriesPanel.w - 30, 36, 10, selected ? rgba(18,45,94,230) : rgba(15,23,42,180));
+    gfx_.strokeRoundRect(categoriesPanel.x + 14, y, categoriesPanel.w - 30, 36, 10, selected ? brightBlue : rgba(255,255,255,18), selected ? 2 : 1);
+    gfx_.drawText(Graphics::fitText(c.name, 24), categoriesPanel.x + 32, y + 10, 2, selected ? text : textSoft, true);
+    gfx_.drawBadge(std::to_string(c.totalChannels), categoriesPanel.x + categoriesPanel.w - 72, y + 8, 42, 22, rgba(41,54,82,220), text);
   }
 
-  // Channels
-  int channelRows = 6;
+  // Channels/movies: no numeric prefix, smaller text, wider panel ----------
+  int channelRows = 7;
   int chanStart = windowStart(state_.selectedChannel, (int)state_.loadedChannels.size(), channelRows);
   for (int i=0; i<channelRows; ++i) {
     int index = chanStart + i;
-    int y = channelsPanel.y + 70 + i * 63;
+    int y = channelsPanel.y + 66 + i * 55;
     if (index >= (int)state_.loadedChannels.size()) break;
     const auto &ch = state_.loadedChannels[index];
     bool selected = index == state_.selectedChannel;
-    gfx_.fillRoundRect(channelsPanel.x + 14, y, channelsPanel.w - 32, 56, 12, selected ? rgba(12,23,52,245) : rgba(10,15,29,215));
-    gfx_.strokeRoundRect(channelsPanel.x + 14, y, channelsPanel.w - 32, 56, 12, selected ? brightBlue : rgba(255,255,255,20), selected ? 2 : 1);
-    char nbuf[8]; std::snprintf(nbuf, sizeof(nbuf), "%03d", index + 1);
-    gfx_.drawText(nbuf, channelsPanel.x + 30, y + 17, 4, selected ? blue : muted, false);
-    gfx_.drawLogoPlaceholder(ch.name, ch.logo, channelsPanel.x + 96, y + 9, 54, 38);
-    gfx_.drawText(Graphics::fitText(ch.name, 19), channelsPanel.x + 166, y + 10, 4, text, true);
-    gfx_.drawBadge("HD", channelsPanel.x + 348, y + 15, 34, 22, rgb(37,99,235), text);
+    gfx_.fillRoundRect(channelsPanel.x + 14, y, channelsPanel.w - 32, 49, 12, selected ? rgba(12,23,52,245) : rgba(10,15,29,215));
+    gfx_.strokeRoundRect(channelsPanel.x + 14, y, channelsPanel.w - 32, 49, 12, selected ? brightBlue : rgba(255,255,255,20), selected ? 2 : 1);
+
+    // Prefer the real logo from the API. If it is missing or cannot be decoded, use a small acronym fallback.
+    drawLogoOrFallback(ch, channelsPanel.x + 30, y + 7, 48, 35);
+
+    const int nameX = channelsPanel.x + 94;
+    gfx_.drawText(Graphics::fitText(ch.name, 35), nameX, y + 9, 3, text, true);
     std::string sub = selectedCategory ? selectedCategory->name : toString(ch.type);
-    gfx_.drawText(Graphics::fitText(sub, 26), channelsPanel.x + 166, y + 38, 2, muted, false);
-    gfx_.drawText(state_.favorites.count(ch.id) ? "*" : "<3", channelsPanel.x + channelsPanel.w - 60, y + 18, 3, muted, false);
+    gfx_.drawText(Graphics::fitText(sub, 42), nameX, y + 32, 2, muted, false);
+    gfx_.drawText(state_.favorites.count(ch.id) ? "*" : "<3", channelsPanel.x + channelsPanel.w - 42, y + 15, 2, muted, false);
   }
   if (state_.loadedChannels.empty()) {
-    gfx_.drawText("SELECIONE UMA CATEGORIA", channelsPanel.x + 40, channelsPanel.y + 180, 3, muted, false);
-    gfx_.drawText("PRESSIONE A PARA CARREGAR", channelsPanel.x + 40, channelsPanel.y + 210, 3, blue, true);
+    gfx_.drawText("SELECIONE UMA CATEGORIA", channelsPanel.x + 40, channelsPanel.y + 178, 3, muted, false);
+    gfx_.drawText("PRESSIONE A PARA CARREGAR", channelsPanel.x + 40, channelsPanel.y + 206, 2, blue, true);
   }
 
-  // Info panel
+  // Info panel: smaller footer text ----------------------------------------
   Rect info{18, 575, 1245, 88};
   gfx_.fillVerticalGradient(info.x, info.y, info.w, info.h, rgba(27,35,52,235), rgba(13,18,29,235));
   gfx_.fillRoundRect(info.x, info.y, info.w, info.h, 14, rgba(0,0,0,0));
   gfx_.strokeRoundRect(info.x, info.y, info.w, info.h, 14, rgba(255,255,255,35), 1);
   if (selectedChannel) {
-    gfx_.drawLogoPlaceholder(selectedChannel->name, selectedChannel->logo, info.x + 34, info.y + 13, 154, 62);
-    gfx_.drawText(Graphics::fitText(selectedChannel->name, 24), info.x + 210, info.y + 18, 4, text, true);
-    gfx_.drawText(selectedCategory ? Graphics::fitText(selectedCategory->name, 28) : "", info.x + 210, info.y + 50, 3, muted, false);
+    drawLogoOrFallback(*selectedChannel, info.x + 34, info.y + 13, 154, 62);
+    gfx_.drawText(Graphics::fitText(selectedChannel->name, 42), info.x + 210, info.y + 18, 2, text, true);
+    gfx_.drawText(selectedCategory ? Graphics::fitText(selectedCategory->name, 44) : "", info.x + 210, info.y + 46, 1, muted, false);
   } else {
-    gfx_.drawText(state_.hasManifest ? Graphics::fitText(state_.manifest.name, 30) : "NSTV", info.x + 40, info.y + 30, 5, text, true);
+    gfx_.drawText(state_.hasManifest ? Graphics::fitText(state_.manifest.name, 34) : "NSTV", info.x + 40, info.y + 30, 4, text, true);
   }
-  gfx_.drawText("PAGINA " + std::to_string(state_.loadedPage) + " / " + std::to_string(state_.loadedTotalPages), info.x + 610, info.y + 24, 4, text, true);
-  gfx_.drawText("CARREGADOS: " + std::to_string(state_.loadedChannels.size()) + " / " + std::to_string(state_.loadedTotal) + " CANAIS", info.x + 610, info.y + 54, 3, blue, true);
-  gfx_.drawText(provider + ": " + Graphics::fitText(state_.hasManifest ? state_.manifest.name : "CONFIGURE", 24), info.x + 940, info.y + 24, 4, text, false);
-  gfx_.drawText("ATUALIZADO", info.x + 978, info.y + 58, 3, green, false);
+  gfx_.drawText("PAGINA " + std::to_string(state_.loadedPage) + " / " + std::to_string(state_.loadedTotalPages), info.x + 610, info.y + 24, 2, text, true);
+  gfx_.drawText("CARREGADOS: " + std::to_string(state_.loadedChannels.size()) + " / " + std::to_string(state_.loadedTotal) + " CANAIS", info.x + 610, info.y + 50, 1, blue, true);
+  gfx_.drawText(provider + ": " + Graphics::fitText(state_.hasManifest ? state_.manifest.name : "CONFIGURE", 38), info.x + 940, info.y + 24, 2, text, false);
+  gfx_.drawText("ATUALIZADO", info.x + 978, info.y + 54, 1, green, false);
 
-  // Controls footer
+  // Controls footer: smaller text ------------------------------------------
   Rect foot{18, 675, 1245, 36};
   gfx_.fillRoundRect(foot.x, foot.y, foot.w, foot.h, 10, rgba(17,24,39,240));
   gfx_.strokeRoundRect(foot.x, foot.y, foot.w, foot.h, 10, rgba(255,255,255,24), 1);
-  gfx_.drawText("L NAVEGAR    R TROCAR COLUNA    A SELECIONAR    B VOLTAR    X FAVORITOS    + MENU", foot.x + 26, foot.y + 10, 3, text, true);
+  gfx_.drawText("L NAVEGAR   R TROCAR COLUNA   A SELECIONAR   B VOLTAR   X FAVORITOS   + MENU", foot.x + 26, foot.y + 13, 1, text, true);
 }
 
 void App::renderAddPlaylistGraphic() {
@@ -535,7 +550,13 @@ void App::renderPlayerGraphic() {
   const Channel *channel = selectedChannelPtr();
   gfx_.drawText("NOW PLAYING", 80, 70, 6, rgb(248,250,252), true);
   if (channel) {
-    gfx_.drawLogoPlaceholder(channel->name, channel->logo, 80, 150, 260, 150);
+    if (!channel->logo.empty()) {
+      const Bitmap *bitmap = imageCache_.get(channel->logo);
+      if (bitmap && bitmap->valid()) gfx_.drawImage(*bitmap, 80, 150, 260, 150);
+      else gfx_.drawLogoFallback(channel->name, 80, 150, 260, 150, 3);
+    } else {
+      gfx_.drawLogoFallback(channel->name, 80, 150, 260, 150, 3);
+    }
     gfx_.drawText(Graphics::fitText(channel->name, 32), 380, 170, 6, rgb(248,250,252), true);
     gfx_.drawText(Graphics::fitText(channel->url, 48), 380, 230, 3, rgb(166,178,207), false);
   }

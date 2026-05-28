@@ -6,6 +6,7 @@
 #include "nstv/platform.hpp"
 #include "nstv/storage.hpp"
 #include "nstv/graphics.hpp"
+#include "nstv/image_cache.hpp"
 #include <set>
 #include <string>
 
@@ -91,6 +92,7 @@ private:
   ParserApiClient api_;
   AppState state_;
   Graphics gfx_;
+  ImageCache imageCache_;
 };
 
 } // namespace nstv

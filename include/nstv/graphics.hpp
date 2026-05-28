@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace nstv {
 
@@ -17,6 +18,16 @@ struct Rect {
   int y;
   int w;
   int h;
+};
+
+struct Bitmap {
+  int width = 0;
+  int height = 0;
+  std::vector<uint8_t> rgba;
+
+  bool valid() const {
+    return width > 0 && height > 0 && rgba.size() >= static_cast<std::size_t>(width * height * 4);
+  }
 };
 
 class Graphics {
@@ -42,6 +53,9 @@ public:
   void drawBadge(const std::string &text, int x, int y, int w, int h, Color bg, Color fg);
   void drawIconBox(const std::string &kind, int x, int y, int size, Color bg1, Color bg2, Color fg);
   void drawLogoPlaceholder(const std::string &name, const std::string &logoUrl, int x, int y, int w, int h);
+  void drawLogoFallback(const std::string &name, int x, int y, int w, int h, int scale = 2);
+  void drawImage(const Bitmap &bitmap, int x, int y, int w, int h);
+  void drawHeaderIcon(const std::string &name, int x, int y, int size, Color color);
 
   int textWidth(const std::string &text, int scale) const;
   static std::string fitText(const std::string &text, int maxChars);

@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -220,36 +221,62 @@ void Graphics::strokeRect(int x, int y, int w, int h, Color color, int thickness
 }
 
 void Graphics::fillRoundRect(int x, int y, int w, int h, int r, Color color) {
-  fillRect(x+r, y, w-2*r, h, color);
-  fillRect(x, y+r, w, h-2*r, color);
-  for (int yy=-r; yy<=r; ++yy) for (int xx=-r; xx<=r; ++xx) {
-    if (xx*xx+yy*yy <= r*r) {
-      blendPixel(x+r+xx, y+r+yy, color);
-      blendPixel(x+w-r-1+xx, y+r+yy, color);
-      blendPixel(x+r+xx, y+h-r-1+yy, color);
-      blendPixel(x+w-r-1+xx, y+h-r-1+yy, color);
+  if (color.a == 0 || w <= 0 || h <= 0) return;
+
+  r = std::max(0, std::min(r, std::min(w, h) / 2));
+
+  fillRect(x + r, y, std::max(0, w - 2 * r), h, color);
+  fillRect(x, y + r, w, std::max(0, h - 2 * r), color);
+
+  for (int yy = -r; yy <= r; ++yy) {
+    for (int xx = -r; xx <= r; ++xx) {
+      if (xx * xx + yy * yy > r * r) continue;
+
+      if (xx <= 0 && yy <= 0) blendPixel(x + r + xx, y + r + yy, color);
+      if (xx >= 0 && yy <= 0) blendPixel(x + w - r - 1 + xx, y + r + yy, color);
+      if (xx <= 0 && yy >= 0) blendPixel(x + r + xx, y + h - r - 1 + yy, color);
+      if (xx >= 0 && yy >= 0) blendPixel(x + w - r - 1 + xx, y + h - r - 1 + yy, color);
     }
   }
 }
 
+
 void Graphics::strokeRoundRect(int x, int y, int w, int h, int r, Color color, int thickness) {
-  for (int i=0; i<thickness; ++i) {
-    strokeRect(x+i+r, y+i, w-2*(r+i), 1, color, 1);
-    strokeRect(x+i+r, y+h-1-i, w-2*(r+i), 1, color, 1);
-    strokeRect(x+i, y+i+r, 1, h-2*(r+i), color, 1);
-    strokeRect(x+w-1-i, y+i+r, 1, h-2*(r+i), color, 1);
-  }
-  // Approximate glowing border by drawing circles outlines.
-  for (int yy=-r; yy<=r; ++yy) for (int xx=-r; xx<=r; ++xx) {
-    int d = xx*xx + yy*yy;
-    if (d <= r*r && d >= (r-thickness)*(r-thickness)) {
-      blendPixel(x+r+xx, y+r+yy, color);
-      blendPixel(x+w-r-1+xx, y+r+yy, color);
-      blendPixel(x+r+xx, y+h-r-1+yy, color);
-      blendPixel(x+w-r-1+xx, y+h-r-1+yy, color);
+  if (w <= 0 || h <= 0) return;
+  r = std::max(0, std::min(r, std::min(w, h) / 2));
+
+  for (int t = 0; t < thickness; ++t) {
+    const int ix = x + t;
+    const int iy = y + t;
+    const int iw = w - 2 * t;
+    const int ih = h - 2 * t;
+    const int ir = std::max(0, r - t);
+
+    if (iw <= 0 || ih <= 0) break;
+
+    fillRect(ix + ir, iy, std::max(0, iw - 2 * ir), 1, color);
+    fillRect(ix + ir, iy + ih - 1, std::max(0, iw - 2 * ir), 1, color);
+    fillRect(ix, iy + ir, 1, std::max(0, ih - 2 * ir), color);
+    fillRect(ix + iw - 1, iy + ir, 1, std::max(0, ih - 2 * ir), color);
+
+    for (int yy = -ir; yy <= ir; ++yy) {
+      for (int xx = -ir; xx <= ir; ++xx) {
+        int d = xx * xx + yy * yy;
+        int outer = ir * ir;
+        int innerR = std::max(0, ir - 1);
+        int inner = innerR * innerR;
+
+        if (d > outer || d < inner) continue;
+
+        if (xx <= 0 && yy <= 0) blendPixel(ix + ir + xx, iy + ir + yy, color);
+        if (xx >= 0 && yy <= 0) blendPixel(ix + iw - ir - 1 + xx, iy + ir + yy, color);
+        if (xx <= 0 && yy >= 0) blendPixel(ix + ir + xx, iy + ih - ir - 1 + yy, color);
+        if (xx >= 0 && yy >= 0) blendPixel(ix + iw - ir - 1 + xx, iy + ih - ir - 1 + yy, color);
+      }
     }
   }
 }
+
 
 void Graphics::fillVerticalGradient(int x, int y, int w, int h, Color top, Color bottom) {
   for (int yy=0; yy<h; ++yy) {
@@ -330,17 +357,119 @@ void Graphics::drawIconBox(const std::string &kind, int x, int y, int size, Colo
 }
 
 void Graphics::drawLogoPlaceholder(const std::string &name, const std::string &logoUrl, int x, int y, int w, int h) {
-  uint32_t hsh = hashString(!logoUrl.empty() ? logoUrl : name);
-  Color c1 = rgb(40 + (hsh & 0x7f), 50 + ((hsh >> 7) & 0x7f), 90 + ((hsh >> 14) & 0x7f));
-  Color c2 = darken(c1, 45);
-  fillVerticalGradient(x,y,w,h,c1,c2);
-  fillRoundRect(x,y,w,h,9,rgba(0,0,0,0));
-  strokeRoundRect(x,y,w,h,9,rgba(255,255,255,80),1);
-  std::string letters;
-  for(char ch : normalizeAscii(name)) { if (std::isalnum((unsigned char)ch)) { letters.push_back((char)std::toupper((unsigned char)ch)); if (letters.size()==3) break; } }
-  if (letters.empty()) letters = "TV";
-  int scale = letters.size() <= 2 ? 5 : 4;
-  drawText(letters, x + (w - textWidth(letters, scale))/2, y + (h - 7*scale)/2, scale, rgb(255,255,255), true);
+  (void)logoUrl;
+  drawLogoFallback(name, x, y, w, h, w <= 52 ? 2 : 3);
 }
+
+void Graphics::drawLogoFallback(const std::string &name, int x, int y, int w, int h, int scale) {
+  (void)name;
+  (void)scale;
+
+  fillVerticalGradient(x, y, w, h, rgb(28,38,67), rgb(12,18,32));
+  fillRoundRect(x, y, w, h, 9, rgba(0,0,0,0));
+  strokeRoundRect(x, y, w, h, 9, rgba(255,255,255,55), 1);
+
+  // Generic media placeholder. Never draw numeric codes as fallback.
+  Color fg = rgb(165, 190, 230);
+  int t = std::max(2, std::min(w, h) / 14);
+  int ix = x + w / 4;
+  int iy = y + h / 3;
+  int iw = w / 2;
+  int ih = h / 3;
+
+  strokeRoundRect(ix, iy, iw, ih, 4, fg, t);
+  fillCircle(ix + iw / 2, iy + ih / 2, std::max(2, ih / 6), fg);
+  drawLine(ix + iw / 2, iy, ix + iw / 2 - iw / 5, y + h / 6, fg, t);
+  drawLine(ix + iw / 2, iy, ix + iw / 2 + iw / 5, y + h / 6, fg, t);
+}
+
+void Graphics::drawImage(const Bitmap &bitmap, int x, int y, int w, int h) {
+  if (!bitmap.valid() || w <= 0 || h <= 0) return;
+
+  fillRoundRect(x, y, w, h, 9, rgba(10, 15, 30, 255));
+
+  const float srcRatio = static_cast<float>(bitmap.width) / static_cast<float>(bitmap.height);
+  const float dstRatio = static_cast<float>(w) / static_cast<float>(h);
+
+  int drawW = w;
+  int drawH = h;
+
+  if (srcRatio > dstRatio) {
+    drawH = std::max(1, static_cast<int>(w / srcRatio));
+  } else {
+    drawW = std::max(1, static_cast<int>(h * srcRatio));
+  }
+
+  int ox = x + (w - drawW) / 2;
+  int oy = y + (h - drawH) / 2;
+
+  for (int yy = 0; yy < drawH; ++yy) {
+    int sy = std::min(bitmap.height - 1, yy * bitmap.height / drawH);
+    for (int xx = 0; xx < drawW; ++xx) {
+      int sx = std::min(bitmap.width - 1, xx * bitmap.width / drawW);
+      std::size_t idx = static_cast<std::size_t>((sy * bitmap.width + sx) * 4);
+      Color c{
+        bitmap.rgba[idx + 0],
+        bitmap.rgba[idx + 1],
+        bitmap.rgba[idx + 2],
+        bitmap.rgba[idx + 3]
+      };
+      blendPixel(ox + xx, oy + yy, c);
+    }
+  }
+
+  strokeRoundRect(x, y, w, h, 9, rgba(255,255,255,60), 1);
+}
+
+
+void Graphics::drawHeaderIcon(const std::string &name, int x, int y, int size, Color color) {
+  if (name == "config") {
+    int cx = x + size / 2;
+    int cy = y + size / 2;
+    strokeCircle(cx, cy, size / 4, color, std::max(2, size / 18));
+    for (int i = 0; i < 8; ++i) {
+      float a = float(i) * 6.2831853f / 8.0f;
+      int x0 = cx + int(std::cos(a) * size * 0.34f);
+      int y0 = cy + int(std::sin(a) * size * 0.34f);
+      int x1 = cx + int(std::cos(a) * size * 0.45f);
+      int y1 = cy + int(std::sin(a) * size * 0.45f);
+      drawLine(x0, y0, x1, y1, color, std::max(2, size / 16));
+    }
+    return;
+  }
+
+  if (name == "categories") {
+    int t = std::max(2, size / 18);
+    for (int i = 0; i < 3; ++i) {
+      int yy = y + size / 4 + i * size / 5;
+      fillCircle(x + size / 5, yy, t + 2, color);
+      drawLine(x + size / 3, yy, x + size - size / 8, yy, color, t);
+    }
+    return;
+  }
+
+  if (name == "channels") {
+    int t = std::max(2, size / 18);
+    strokeRoundRect(x + size / 7, y + size / 4, size * 5 / 7, size / 2, size / 12, color, t);
+    drawLine(x + size / 2, y + size / 4, x + size / 2 - size / 7, y + size / 10, color, t);
+    drawLine(x + size / 2, y + size / 4, x + size / 2 + size / 7, y + size / 10, color, t);
+    return;
+  }
+
+  if (name == "layers") {
+    int t = std::max(2, size / 20);
+    for (int i = 0; i < 3; ++i) {
+      int yy = y + size / 5 + i * size / 5;
+      drawLine(x + size / 2, yy, x + size - size / 6, yy + size / 8, color, t);
+      drawLine(x + size - size / 6, yy + size / 8, x + size / 2, yy + size / 4, color, t);
+      drawLine(x + size / 2, yy + size / 4, x + size / 6, yy + size / 8, color, t);
+      drawLine(x + size / 6, yy + size / 8, x + size / 2, yy, color, t);
+    }
+    return;
+  }
+
+  drawIconBox(name, x, y, size, rgba(color.r, color.g, color.b, 80), rgba(color.r, color.g, color.b, 30), color);
+}
+
 
 } // namespace nstv

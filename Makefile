@@ -8,7 +8,7 @@ INCLUDES       := include
 
 HOST_CXX       ?= g++
 HOST_CXXFLAGS  := -std=c++17 -Wall -Wextra -O2 -I$(INCLUDES)
-HOST_LDFLAGS   := $(shell pkg-config --libs libcurl 2>/dev/null || curl-config --libs)
+HOST_LDFLAGS   := $(shell pkg-config --libs libcurl 2>/dev/null || curl-config --libs) -lz
 HOST_SRCS      := $(wildcard $(SOURCES)/*.cpp)
 HOST_BIN       := $(BUILD)/$(TARGET)-host
 
