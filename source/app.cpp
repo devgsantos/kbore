@@ -397,7 +397,7 @@ void App::renderDashboardGraphic() {
   const Color muted = rgb(150,163,190);
   const Color panelTop = rgb(16,24,45);
   const Color panelBottom = rgb(7,11,22);
-  const Color panelBorder = rgb(38,52,82);
+  const Color panelBorder = rgb(30,42,68);
   const Color blue = rgb(20,132,255);
   const Color brightBlue = rgb(0,190,255);
   const Color green = rgb(57,220,35);
@@ -453,7 +453,7 @@ void App::renderDashboardGraphic() {
     int y = typeY + i * 74;
     gfx_.fillHorizontalGradient(typesPanel.x + 14, y, typesPanel.w - 28, 64, rgba(base.r,base.g,base.b, selected?110:55), rgba(12,18,34, selected?245:210));
     gfx_.fillRoundRect(typesPanel.x + 14, y, typesPanel.w - 28, 64, 13, rgba(0,0,0,0));
-    gfx_.strokeRoundRect(typesPanel.x + 14, y, typesPanel.w - 28, 64, 13, selected ? brightBlue : rgba(255,255,255,18), selected ? 3 : 1);
+    gfx_.strokeRoundRect(typesPanel.x + 14, y, typesPanel.w - 28, 64, 13, selected ? brightBlue : rgba(72,92,128,24), selected ? 3 : 1);
     gfx_.drawIconBox(toString(t.id), typesPanel.x + 26, y + 10, 44, lighten(base,25), darken(base,30), text);
     gfx_.drawText(Graphics::fitText(t.label, 12), typesPanel.x + 82, y + 15, 3, text, true);
     std::string sub = t.id == StreamType::Live ? "CANAIS AO VIVO" : (t.id == StreamType::Movies ? "FILMES" : (t.id == StreamType::Series ? "SERIES" : "RADIOS"));
@@ -477,7 +477,7 @@ void App::renderDashboardGraphic() {
     const auto &c = categories[index];
     bool selected = index == state_.selectedCategory;
     gfx_.fillRoundRect(categoriesPanel.x + 14, y, categoriesPanel.w - 30, 36, 10, selected ? rgba(18,45,94,230) : rgba(15,23,42,180));
-    gfx_.strokeRoundRect(categoriesPanel.x + 14, y, categoriesPanel.w - 30, 36, 10, selected ? brightBlue : rgba(255,255,255,18), selected ? 2 : 1);
+    gfx_.strokeRoundRect(categoriesPanel.x + 14, y, categoriesPanel.w - 30, 36, 10, selected ? brightBlue : rgba(72,92,128,24), selected ? 2 : 1);
     gfx_.drawText(Graphics::fitText(c.name, 24), categoriesPanel.x + 32, y + 10, 2, selected ? text : textSoft, true);
     gfx_.drawBadge(std::to_string(c.totalChannels), categoriesPanel.x + categoriesPanel.w - 72, y + 8, 42, 22, rgba(41,54,82,220), text);
   }
@@ -492,15 +492,14 @@ void App::renderDashboardGraphic() {
     const auto &ch = state_.loadedChannels[index];
     bool selected = index == state_.selectedChannel;
     gfx_.fillRoundRect(channelsPanel.x + 14, y, channelsPanel.w - 32, 49, 12, selected ? rgba(12,23,52,245) : rgba(10,15,29,215));
-    gfx_.strokeRoundRect(channelsPanel.x + 14, y, channelsPanel.w - 32, 49, 12, selected ? brightBlue : rgba(255,255,255,20), selected ? 2 : 1);
+    gfx_.strokeRoundRect(channelsPanel.x + 14, y, channelsPanel.w - 32, 49, 12, selected ? brightBlue : rgba(72,92,128,24), selected ? 2 : 1);
 
     // Prefer the real logo from the API. If it is missing or cannot be decoded, use a small acronym fallback.
     drawLogoOrFallback(ch, channelsPanel.x + 30, y + 7, 48, 35);
 
     const int nameX = channelsPanel.x + 94;
     gfx_.drawText(Graphics::fitText(ch.name, 35), nameX, y + 9, 3, text, true);
-    std::string sub = selectedCategory ? selectedCategory->name : toString(ch.type);
-    gfx_.drawText(Graphics::fitText(sub, 42), nameX, y + 32, 2, muted, false);
+    gfx_.drawText("EPG indisponivel", nameX, y + 32, 2, muted, false);
     gfx_.drawText(state_.favorites.count(ch.id) ? "*" : "<3", channelsPanel.x + channelsPanel.w - 42, y + 15, 2, muted, false);
   }
   if (state_.loadedChannels.empty()) {
@@ -512,11 +511,11 @@ void App::renderDashboardGraphic() {
   Rect info{18, 575, 1245, 88};
   gfx_.fillVerticalGradient(info.x, info.y, info.w, info.h, rgba(27,35,52,235), rgba(13,18,29,235));
   gfx_.fillRoundRect(info.x, info.y, info.w, info.h, 14, rgba(0,0,0,0));
-  gfx_.strokeRoundRect(info.x, info.y, info.w, info.h, 14, rgba(255,255,255,35), 1);
+  gfx_.strokeRoundRect(info.x, info.y, info.w, info.h, 14, rgba(72,92,128,35), 1);
   if (selectedChannel) {
     drawLogoOrFallback(*selectedChannel, info.x + 34, info.y + 13, 154, 62);
     gfx_.drawText(Graphics::fitText(selectedChannel->name, 42), info.x + 210, info.y + 18, 2, text, true);
-    gfx_.drawText(selectedCategory ? Graphics::fitText(selectedCategory->name, 44) : "", info.x + 210, info.y + 46, 1, muted, false);
+    gfx_.drawText("EPG indisponivel", info.x + 210, info.y + 46, 1, muted, false);
   } else {
     gfx_.drawText(state_.hasManifest ? Graphics::fitText(state_.manifest.name, 34) : "NSTV", info.x + 40, info.y + 30, 4, text, true);
   }
@@ -528,7 +527,7 @@ void App::renderDashboardGraphic() {
   // Controls footer: smaller text ------------------------------------------
   Rect foot{18, 675, 1245, 36};
   gfx_.fillRoundRect(foot.x, foot.y, foot.w, foot.h, 10, rgba(17,24,39,240));
-  gfx_.strokeRoundRect(foot.x, foot.y, foot.w, foot.h, 10, rgba(255,255,255,24), 1);
+  gfx_.strokeRoundRect(foot.x, foot.y, foot.w, foot.h, 10, rgba(72,92,128,28), 1);
   gfx_.drawText("L NAVEGAR   R TROCAR COLUNA   A SELECIONAR   B VOLTAR   X FAVORITOS   + MENU", foot.x + 26, foot.y + 13, 1, text, true);
 }
 
@@ -539,7 +538,7 @@ void App::renderAddPlaylistGraphic() {
   for (int i=0;i<3;i++) {
     int y=190+i*78; bool sel=i==state_.selectedAddOption;
     gfx_.fillRoundRect(120,y,720,58,14, sel ? rgba(37,99,235,220) : rgba(17,24,39,220));
-    gfx_.strokeRoundRect(120,y,720,58,14, sel ? rgb(0,191,255) : rgba(255,255,255,30), sel?3:1);
+    gfx_.strokeRoundRect(120,y,720,58,14, sel ? rgb(0,191,255) : rgba(72,92,128,30), sel?3:1);
     gfx_.drawText(opts[i],160,y+18,4,rgb(248,250,252),true);
   }
   gfx_.drawText("A SELECT    B BACK", 120, 500, 3, rgb(166,178,207), true);

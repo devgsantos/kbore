@@ -49,16 +49,104 @@ Color mix(Color a, Color b, float t) {
 }
 
 std::string normalizeAscii(const std::string &input) {
-  // SDL_ttf supports UTF-8. Keep the original string for TTF, but strip control bytes.
+  // Normalize display text for Switch UI:
+  // - remove emoji, variation selectors and decorative symbols that break rendering
+  // - transliterate common Latin accents to ASCII
+  // - keep only safe printable ASCII punctuation/text
   std::string out;
   out.reserve(input.size());
-  for (unsigned char c : input) {
-    if (c < 0x20 && c != '\n' && c != '\t') continue;
-    out.push_back(static_cast<char>(c));
-  }
-  return out;
-}
 
+  auto appendAscii = [&](char c) {
+    if (c < 0x20 && c != '\n' && c != '\t') return;
+    out.push_back(c);
+  };
+
+  for (std::size_t i = 0; i < input.size();) {
+    unsigned char c = static_cast<unsigned char>(input[i]);
+
+    if (c < 0x80) {
+      appendAscii(static_cast<char>(c));
+      ++i;
+      continue;
+    }
+
+    uint32_t cp = 0;
+    std::size_t len = 0;
+
+    if ((c & 0xE0) == 0xC0 && i + 1 < input.size()) {
+      cp = ((c & 0x1F) << 6) |
+           (static_cast<unsigned char>(input[i + 1]) & 0x3F);
+      len = 2;
+    } else if ((c & 0xF0) == 0xE0 && i + 2 < input.size()) {
+      cp = ((c & 0x0F) << 12) |
+           ((static_cast<unsigned char>(input[i + 1]) & 0x3F) << 6) |
+           (static_cast<unsigned char>(input[i + 2]) & 0x3F);
+      len = 3;
+    } else if ((c & 0xF8) == 0xF0 && i + 3 < input.size()) {
+      cp = ((c & 0x07) << 18) |
+           ((static_cast<unsigned char>(input[i + 1]) & 0x3F) << 12) |
+           ((static_cast<unsigned char>(input[i + 2]) & 0x3F) << 6) |
+           (static_cast<unsigned char>(input[i + 3]) & 0x3F);
+      len = 4;
+    } else {
+      ++i;
+      continue;
+    }
+
+    switch (cp) {
+      case 0x00C0: case 0x00C1: case 0x00C2: case 0x00C3: case 0x00C4: case 0x00C5:
+      case 0x00E0: case 0x00E1: case 0x00E2: case 0x00E3: case 0x00E4: case 0x00E5:
+        out.push_back('A'); break;
+      case 0x00C7: case 0x00E7:
+        out.push_back('C'); break;
+      case 0x00C8: case 0x00C9: case 0x00CA: case 0x00CB:
+      case 0x00E8: case 0x00E9: case 0x00EA: case 0x00EB:
+        out.push_back('E'); break;
+      case 0x00CC: case 0x00CD: case 0x00CE: case 0x00CF:
+      case 0x00EC: case 0x00ED: case 0x00EE: case 0x00EF:
+        out.push_back('I'); break;
+      case 0x00D1: case 0x00F1:
+        out.push_back('N'); break;
+      case 0x00D2: case 0x00D3: case 0x00D4: case 0x00D5: case 0x00D6:
+      case 0x00F2: case 0x00F3: case 0x00F4: case 0x00F5: case 0x00F6:
+        out.push_back('O'); break;
+      case 0x00D9: case 0x00DA: case 0x00DB: case 0x00DC:
+      case 0x00F9: case 0x00FA: case 0x00FB: case 0x00FC:
+        out.push_back('U'); break;
+      default:
+        // Drop symbols/emoji/dingbats/variation selectors.
+        break;
+    }
+
+    i += len;
+  }
+
+  // Collapse repeated whitespace caused by icon removal.
+  std::string cleaned;
+  cleaned.reserve(out.size());
+  bool previousSpace = false;
+
+  for (char ch : out) {
+    bool isSpace = ch == ' ' || ch == '\t' || ch == '\n';
+
+    if (isSpace) {
+      if (!previousSpace && !cleaned.empty()) {
+        cleaned.push_back(' ');
+      }
+      previousSpace = true;
+      continue;
+    }
+
+    cleaned.push_back(ch);
+    previousSpace = false;
+  }
+
+  while (!cleaned.empty() && cleaned.back() == ' ') {
+    cleaned.pop_back();
+  }
+
+  return cleaned;
+}
 
 std::array<uint8_t, 7> fallbackGlyph(char ch) {
   if (ch >= 'a' && ch <= 'z') ch = char(ch - 'a' + 'A');
@@ -429,7 +517,7 @@ std::string Graphics::fitText(const std::string &text, int maxChars) {
 
 void Graphics::drawBadge(const std::string &text, int x, int y, int w, int h, Color bg, Color fg) {
   fillRoundRect(x,y,w,h,h/2,bg);
-  strokeRoundRect(x,y,w,h,h/2,rgba(255,255,255,55),1);
+  strokeRoundRect(x,y,w,h,h/2,rgba(72,92,128,35),1);
   int tw = textWidth(text, 1);
   drawText(text, x + (w-tw)/2, y + (h-12)/2, 1, fg, true);
 }
@@ -437,7 +525,7 @@ void Graphics::drawBadge(const std::string &text, int x, int y, int w, int h, Co
 void Graphics::drawIconBox(const std::string &kind, int x, int y, int size, Color bg1, Color bg2, Color fg) {
   fillVerticalGradient(x,y,size,size,bg1,bg2);
   fillRoundRect(x,y,size,size,10,rgba(0,0,0,0));
-  strokeRoundRect(x,y,size,size,10,rgba(255,255,255,45),1);
+  strokeRoundRect(x,y,size,size,10,rgba(72,92,128,35),1);
   drawHeaderIcon(kind, x+6, y+6, size-12, fg);
 }
 
@@ -471,7 +559,7 @@ void Graphics::drawLogoFallback(const std::string &name, int x, int y, int w, in
   (void)name; (void)scale;
   fillVerticalGradient(x, y, w, h, rgb(28,38,67), rgb(12,18,32));
   fillRoundRect(x, y, w, h, 9, rgba(0,0,0,0));
-  strokeRoundRect(x, y, w, h, 9, rgba(255,255,255,55), 1);
+  strokeRoundRect(x, y, w, h, 9, rgba(72,92,128,35), 1);
   Color fg = rgb(165, 190, 230);
   drawHeaderIcon("channels", x + w/6, y + h/7, std::min(w,h)*2/3, fg);
 }
@@ -492,7 +580,7 @@ void Graphics::drawImage(const Bitmap &bitmap, int x, int y, int w, int h) {
   SDL_Rect dst{x + (w-drawW)/2, y + (h-drawH)/2, drawW, drawH};
   SDL_RenderCopy(g_renderer, texture, nullptr, &dst);
   SDL_DestroyTexture(texture);
-  strokeRoundRect(x, y, w, h, 9, rgba(255,255,255,60), 1);
+  strokeRoundRect(x, y, w, h, 9, rgba(72,92,128,40), 1);
 }
 
 } // namespace nstv
