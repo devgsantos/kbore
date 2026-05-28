@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <iostream>
 #include <stdexcept>
+#include <chrono>
 
 namespace nstv {
 
@@ -22,6 +23,13 @@ const char *BG_CARD = "\x1b[48;5;235m";
 std::string repeat(char ch, int count) {
   if (count <= 0) return {};
   return std::string(static_cast<std::size_t>(count), ch);
+}
+
+long long nowMs() {
+  using clock = std::chrono::steady_clock;
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+    clock::now().time_since_epoch()
+  ).count();
 }
 }
 
@@ -70,10 +78,16 @@ void App::handle(Button button) {
     case ScreenId::Dashboard: handleDashboard(button); break;
     case ScreenId::AddPlaylist: handleAddPlaylist(button); break;
     case ScreenId::Player:
+      if (button != Button::None) {
+        state_.playerOverlayUntilMs = nowMs() + 5000;
+      }
+
       if (button == Button::Back) {
         videoPlayer_.close();
         state_.screen = ScreenId::Dashboard;
         state_.message = "Playback stopped";
+        state_.playerStarted = false;
+        state_.playerFrameSeen = false;
       } else if (button == Button::Select) {
         videoPlayer_.togglePause();
         state_.message = videoPlayer_.isPaused() ? "Playback paused" : "Playback resumed";
@@ -328,11 +342,15 @@ void App::playSelectedChannel() {
   }
 
   state_.screen = ScreenId::Player;
-  state_.message = "Opening stream: " + channel->name;
+  state_.message = "Loading...";
+  state_.playerStarted = false;
+  state_.playerFrameSeen = false;
+  state_.playerOverlayUntilMs = nowMs() + 5000;
   render();
 
   if (videoPlayer_.open(channel->url)) {
     state_.message = "Playing: " + channel->name;
+    state_.playerStarted = true;
   } else {
     state_.message = "Player error: " + videoPlayer_.error();
   }
@@ -582,17 +600,34 @@ void App::renderPlayerGraphic() {
 
   gfx_.fillRect(0, 0, Graphics::Width, Graphics::Height, rgb(0, 0, 0));
 
-  if (videoPlayer_.isOpen()) {
-    videoPlayer_.update();
+  bool hasFrame = false;
+  bool updated = false;
 
-    if (videoPlayer_.frame().valid()) {
+  if (videoPlayer_.isOpen()) {
+    updated = videoPlayer_.update();
+    (void)updated;
+
+    if (videoPlayer_.yuvFrame().valid()) {
+      hasFrame = true;
+      gfx_.drawYuvFrame(videoPlayer_.yuvFrame(), 0, 0, Graphics::Width, Graphics::Height);
+
+      if (!state_.playerFrameSeen) {
+        state_.playerFrameSeen = true;
+        state_.playerOverlayUntilMs = nowMs() + 5000;
+      }
+    } else if (videoPlayer_.frame().valid()) {
+      hasFrame = true;
       gfx_.drawImage(videoPlayer_.frame(), 0, 0, Graphics::Width, Graphics::Height);
+
+      if (!state_.playerFrameSeen) {
+        state_.playerFrameSeen = true;
+        state_.playerOverlayUntilMs = nowMs() + 5000;
+      }
     } else {
-      gfx_.drawText("Aguardando primeiro frame...", 80, 320, 4, rgb(248,250,252), true);
+      gfx_.drawText("Loading...", 80, 320, 4, rgb(248,250,252), true);
     }
   } else {
     gfx_.fillVerticalGradient(0, 0, Graphics::Width, Graphics::Height, rgb(7,11,22), rgb(2,5,11));
-    gfx_.drawText("PLAYER", 80, 80, 7, rgb(248,250,252), true);
 
     if (channel) {
       gfx_.drawText(Graphics::fitText(channel->name, 46), 80, 168, 4, rgb(248,250,252), true);
@@ -600,37 +635,57 @@ void App::renderPlayerGraphic() {
     }
 
     std::string error = videoPlayer_.error().empty()
-      ? "Nenhum frame disponivel"
+      ? "Unable to start playback"
       : videoPlayer_.error();
 
     gfx_.drawText(Graphics::fitText(error, 88), 80, 290, 2, rgb(248, 113, 113), false);
   }
 
-  // Playback overlay.
-  gfx_.fillHorizontalGradient(0, 0, Graphics::Width, 86, rgba(0,0,0,210), rgba(0,0,0,80));
-  gfx_.fillHorizontalGradient(0, Graphics::Height - 86, Graphics::Width, 86, rgba(0,0,0,80), rgba(0,0,0,220));
+  const bool showOverlay =
+    !state_.playerFrameSeen ||
+    nowMs() < state_.playerOverlayUntilMs ||
+    videoPlayer_.isPaused() ||
+    !videoPlayer_.isOpen();
 
-  if (channel) {
-    gfx_.drawText(Graphics::fitText(channel->name, 50), 28, 22, 3, rgb(248,250,252), true);
-    gfx_.drawText(
-      videoPlayer_.isPaused() ? "PAUSADO" : (videoPlayer_.isOpen() ? "REPRODUZINDO" : "ERRO"),
-      28,
+  if (showOverlay) {
+    gfx_.fillHorizontalGradient(0, 0, Graphics::Width, 86, rgba(0,0,0,210), rgba(0,0,0,80));
+    gfx_.fillHorizontalGradient(0, Graphics::Height - 86, Graphics::Width, 86, rgba(0,0,0,80), rgba(0,0,0,220));
+
+    if (channel) {
+      gfx_.drawText(Graphics::fitText(channel->name, 50), 28, 22, 3, rgb(248,250,252), true);
+
+      std::string status;
+
+      if (videoPlayer_.isPaused()) {
+        status = "PAUSED";
+      } else if (videoPlayer_.isOpen() && hasFrame) {
+        status = "PLAYING";
+      } else if (videoPlayer_.isOpen()) {
+        status = "LOADING";
+      } else {
+        status = "ERROR";
+      }
+
+      gfx_.drawText(
+        status,
+        28,
+        Graphics::Height - 58,
+        2,
+        videoPlayer_.isOpen() ? rgb(57,220,35) : rgb(248,113,113),
+        true
+      );
+    }
+
+    gfx_.drawTextRight(
+      "A PAUSE/RESUME   B BACK",
+      Graphics::Width - 28,
       Graphics::Height - 58,
       2,
-      videoPlayer_.isOpen() ? rgb(57,220,35) : rgb(248,113,113),
+      rgb(248,250,252),
       true
     );
-  }
+  }}
 
-  gfx_.drawTextRight(
-    "A PAUSAR/RETOMAR   B VOLTAR",
-    Graphics::Width - 28,
-    Graphics::Height - 58,
-    2,
-    rgb(248,250,252),
-    true
-  );
-}
 
 void App::renderSettingsGraphic() {
   gfx_.drawText("SETTINGS", 80, 80, 7, rgb(248,250,252), true);

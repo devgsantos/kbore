@@ -20,6 +20,27 @@ struct Rect {
   int h;
 };
 
+
+struct YuvFrame {
+  int width = 0;
+  int height = 0;
+  std::vector<uint8_t> y;
+  std::vector<uint8_t> u;
+  std::vector<uint8_t> v;
+  int yPitch = 0;
+  int uPitch = 0;
+  int vPitch = 0;
+
+  bool valid() const {
+    return width > 0 && height > 0 &&
+           yPitch > 0 && uPitch > 0 && vPitch > 0 &&
+           y.size() >= static_cast<std::size_t>(yPitch * height) &&
+           u.size() >= static_cast<std::size_t>(uPitch * ((height + 1) / 2)) &&
+           v.size() >= static_cast<std::size_t>(vPitch * ((height + 1) / 2));
+  }
+};
+
+
 struct Bitmap {
   int width = 0;
   int height = 0;
@@ -55,6 +76,7 @@ public:
   void drawLogoPlaceholder(const std::string &name, const std::string &logoUrl, int x, int y, int w, int h);
   void drawLogoFallback(const std::string &name, int x, int y, int w, int h, int scale = 2);
   void drawImage(const Bitmap &bitmap, int x, int y, int w, int h);
+  void drawYuvFrame(const YuvFrame &frame, int x, int y, int w, int h);
   void drawHeaderIcon(const std::string &name, int x, int y, int size, Color color);
 
   int textWidth(const std::string &text, int scale) const;

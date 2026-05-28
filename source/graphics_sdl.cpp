@@ -285,7 +285,13 @@ TTF_Font *fontForScale(int scale, bool bold) {
 }
 #endif
 
-std::map<const uint8_t *, SDL_Texture *> g_textureCache;
+struct CachedTexture {
+  SDL_Texture *texture = nullptr;
+  int width = 0;
+  int height = 0;
+};
+
+std::map<const uint8_t *, CachedTexture> g_textureCache;
 
 } // namespace
 
@@ -303,7 +309,7 @@ Color typeColor(const std::string &type) {
 Graphics::Graphics() {
   if (g_sdlReady) return;
 
-  SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS);
+  SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_AUDIO);
 #ifdef NSTV_USE_SDL_TTF
   if (TTF_Init() == 0) g_ttfReady = true;
 #endif
@@ -315,10 +321,15 @@ Graphics::Graphics() {
     Height,
     SDL_WINDOW_SHOWN
   );
+  SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear");
+#ifdef __SWITCH__
+  g_renderer = SDL_CreateRenderer(g_window, -1, SDL_RENDERER_ACCELERATED);
+#else
   g_renderer = SDL_CreateRenderer(g_window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
   if (!g_renderer) {
     g_renderer = SDL_CreateRenderer(g_window, -1, SDL_RENDERER_SOFTWARE);
   }
+#endif
   SDL_SetRenderDrawBlendMode(g_renderer, SDL_BLENDMODE_BLEND);
   g_sdlReady = true;
 }
@@ -566,22 +577,115 @@ void Graphics::drawLogoFallback(const std::string &name, int x, int y, int w, in
 
 void Graphics::drawImage(const Bitmap &bitmap, int x, int y, int w, int h) {
   if (!bitmap.valid() || !g_renderer || w <= 0 || h <= 0) return;
-  SDL_Surface *surface = SDL_CreateRGBSurfaceWithFormatFrom(
-    const_cast<uint8_t *>(bitmap.rgba.data()), bitmap.width, bitmap.height, 32, bitmap.width * 4, SDL_PIXELFORMAT_RGBA32);
-  if (!surface) return;
-  SDL_Texture *texture = SDL_CreateTextureFromSurface(g_renderer, surface);
-  SDL_FreeSurface(surface);
-  if (!texture) return;
+
+  const uint8_t *key = bitmap.rgba.data();
+  CachedTexture &cached = g_textureCache[key];
+
+  if (!cached.texture || cached.width != bitmap.width || cached.height != bitmap.height) {
+    if (cached.texture) {
+      SDL_DestroyTexture(cached.texture);
+      cached.texture = nullptr;
+    }
+
+    cached.texture = SDL_CreateTexture(
+      g_renderer,
+      SDL_PIXELFORMAT_RGBA32,
+      SDL_TEXTUREACCESS_STREAMING,
+      bitmap.width,
+      bitmap.height
+    );
+
+    cached.width = bitmap.width;
+    cached.height = bitmap.height;
+
+    if (cached.texture) {
+      SDL_SetTextureBlendMode(cached.texture, SDL_BLENDMODE_BLEND);
+    }
+  }
+
+  if (!cached.texture) {
+    return;
+  }
+
+  SDL_UpdateTexture(
+    cached.texture,
+    nullptr,
+    bitmap.rgba.data(),
+    bitmap.width * 4
+  );
+
   float srcRatio = float(bitmap.width) / float(bitmap.height);
   float dstRatio = float(w) / float(h);
-  int drawW = w, drawH = h;
-  if (srcRatio > dstRatio) drawH = std::max(1, int(w / srcRatio));
-  else drawW = std::max(1, int(h * srcRatio));
-  SDL_Rect dst{x + (w-drawW)/2, y + (h-drawH)/2, drawW, drawH};
-  SDL_RenderCopy(g_renderer, texture, nullptr, &dst);
-  SDL_DestroyTexture(texture);
-  strokeRoundRect(x, y, w, h, 9, rgba(72,92,128,40), 1);
+
+  int drawW = w;
+  int drawH = h;
+
+  if (srcRatio > dstRatio) {
+    drawH = std::max(1, int(w / srcRatio));
+  } else {
+    drawW = std::max(1, int(h * srcRatio));
+  }
+
+  SDL_Rect dst{x + (w - drawW) / 2, y + (h - drawH) / 2, drawW, drawH};
+  SDL_RenderCopy(g_renderer, cached.texture, nullptr, &dst);
 }
+
+
+void Graphics::drawYuvFrame(const YuvFrame &frame, int x, int y, int w, int h) {
+  if (!frame.valid() || !g_renderer || w <= 0 || h <= 0) return;
+
+  const uint8_t *key = frame.y.data();
+  CachedTexture &cached = g_textureCache[key];
+
+  if (!cached.texture || cached.width != frame.width || cached.height != frame.height) {
+    if (cached.texture) {
+      SDL_DestroyTexture(cached.texture);
+      cached.texture = nullptr;
+    }
+
+    cached.texture = SDL_CreateTexture(
+      g_renderer,
+      SDL_PIXELFORMAT_IYUV,
+      SDL_TEXTUREACCESS_STREAMING,
+      frame.width,
+      frame.height
+    );
+
+    cached.width = frame.width;
+    cached.height = frame.height;
+  }
+
+  if (!cached.texture) {
+    return;
+  }
+
+  SDL_UpdateYUVTexture(
+    cached.texture,
+    nullptr,
+    frame.y.data(),
+    frame.yPitch,
+    frame.u.data(),
+    frame.uPitch,
+    frame.v.data(),
+    frame.vPitch
+  );
+
+  float srcRatio = float(frame.width) / float(frame.height);
+  float dstRatio = float(w) / float(h);
+
+  int drawW = w;
+  int drawH = h;
+
+  if (srcRatio > dstRatio) {
+    drawH = std::max(1, int(w / srcRatio));
+  } else {
+    drawW = std::max(1, int(h * srcRatio));
+  }
+
+  SDL_Rect dst{x + (w - drawW) / 2, y + (h - drawH) / 2, drawW, drawH};
+  SDL_RenderCopy(g_renderer, cached.texture, nullptr, &dst);
+}
+
 
 } // namespace nstv
 

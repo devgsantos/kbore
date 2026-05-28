@@ -37,6 +37,10 @@ struct AppState {
   std::set<std::string> favorites;
   std::string message;
   bool running = true;
+
+  long long playerOverlayUntilMs = 0;
+  bool playerStarted = false;
+  bool playerFrameSeen = false;
 };
 
 class App {

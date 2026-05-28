@@ -18,8 +18,10 @@ public:
   void togglePause();
   bool isPaused() const { return paused_; }
   bool isOpen() const { return open_; }
+  bool hasFrame() const { return frame_.valid(); }
 
   const Bitmap &frame() const { return frame_; }
+  const YuvFrame &yuvFrame() const { return yuvFrame_; }
   const std::string &error() const { return error_; }
   const std::string &url() const { return url_; }
 
@@ -29,6 +31,7 @@ private:
   std::string url_;
   std::string error_;
   Bitmap frame_;
+  YuvFrame yuvFrame_;
 
 #ifdef NSTV_USE_FFMPEG
   struct Impl;

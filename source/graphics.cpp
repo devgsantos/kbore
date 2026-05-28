@@ -473,6 +473,13 @@ void Graphics::drawHeaderIcon(const std::string &name, int x, int y, int size, C
 }
 
 
+void Graphics::drawYuvFrame(const YuvFrame &frame, int x, int y, int w, int h) {
+  (void)frame;
+  fillRect(x, y, w, h, rgb(0, 0, 0));
+  drawText("YUV video requires SDL renderer", x + 40, y + h / 2, 2, rgb(248,250,252), true);
+}
+
+
 } // namespace nstv
 
 #endif // NSTV_USE_SDL
