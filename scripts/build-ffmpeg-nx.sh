@@ -70,8 +70,8 @@ COMMON_LDFLAGS="-fPIE -specs=$DEVKITPRO/libnx/switch.specs -L$DEVKITPRO/libnx/li
   --enable-protocol=file,http,https,tcp,tls,udp,crypto \
   --enable-demuxer=hls,mpegts,mov,matroska,aac,mp3 \
   --enable-muxer=null \
-  --enable-parser=h264,hevc,aac,mpeg4video,mpegaudio,vp8,vp9 \
-  --enable-decoder=h264,hevc,aac,mp3,mpeg2video,mpeg4,vp8,vp9 \
+  --enable-parser=h264,hevc,aac,ac3,mpeg4video,mpegaudio,vp8,vp9 \
+  --enable-decoder=h264,hevc,aac,mp3,ac3,eac3,mpeg2video,mpeg4,vp8,vp9 \
   --enable-bsf=h264_mp4toannexb,hevc_mp4toannexb,aac_adtstoasc \
   --extra-cflags="$COMMON_CFLAGS" \
   --extra-cxxflags="$COMMON_CFLAGS" \

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 #include <sstream>
+#include <vector>
 
 #ifdef NSTV_USE_FFMPEG
 extern "C" {
@@ -15,7 +16,12 @@ extern "C" {
 #include <libavutil/rational.h>
 #include <libavutil/version.h>
 #include <libswscale/swscale.h>
+#include <libswresample/swresample.h>
 }
+#endif
+
+#ifdef NSTV_USE_SDL
+#include <SDL2/SDL.h>
 #endif
 
 namespace nstv {
@@ -32,6 +38,21 @@ struct NativeDecoder::Impl {
   AVFrame *videoFrame = nullptr;
   AVFrame *transferredFrame = nullptr;
   AVFrame *convertedYuvFrame = nullptr;
+
+  AVFrame *audioFrame = nullptr;
+  SwrContext *swr = nullptr;
+
+  std::vector<uint8_t> audioBuffer;
+
+  #ifdef NSTV_USE_SDL
+  SDL_AudioDeviceID audioDevice = 0;
+  SDL_AudioSpec audioSpec{};
+  #endif
+
+  bool audioStarted = false;
+  int audioOutSampleRate = 48000;
+  int audioOutChannels = 2;
+  AVSampleFormat audioOutFormat = AV_SAMPLE_FMT_S16;
 
   SwsContext *sws = nullptr;
 
@@ -64,6 +85,67 @@ int audioChannels(const AVCodecContext *ctx) {
 #else
   return ctx->channels;
 #endif
+}
+
+AVChannelLayout makeDefaultLayout(int channels) {
+  AVChannelLayout layout;
+  std::memset(&layout, 0, sizeof(layout));
+
+  if (channels <= 0) {
+    channels = 2;
+  }
+
+  av_channel_layout_default(&layout, channels);
+  return layout;
+}
+
+int safeAudioSampleRate(AVCodecContext *ctx) {
+  if (!ctx || ctx->sample_rate <= 0) {
+    return 48000;
+  }
+
+  return ctx->sample_rate;
+}
+
+AVSampleFormat safeAudioSampleFormat(AVCodecContext *ctx) {
+  if (!ctx || ctx->sample_fmt == AV_SAMPLE_FMT_NONE) {
+    return AV_SAMPLE_FMT_FLTP;
+  }
+
+  return ctx->sample_fmt;
+}
+
+int safeAudioChannels(AVCodecContext *ctx) {
+  if (!ctx) {
+    return 2;
+  }
+
+#if LIBAVUTIL_VERSION_MAJOR >= 57
+  if (ctx->ch_layout.nb_channels > 0) {
+    return ctx->ch_layout.nb_channels;
+  }
+#else
+  if (ctx->channels > 0) {
+    return ctx->channels;
+  }
+#endif
+
+  return 2;
+}
+
+AVChannelLayout safeInputLayout(AVCodecContext *ctx) {
+#if LIBAVUTIL_VERSION_MAJOR >= 57
+  if (ctx && ctx->ch_layout.nb_channels > 0) {
+    AVChannelLayout copy;
+    std::memset(&copy, 0, sizeof(copy));
+
+    if (av_channel_layout_copy(&copy, &ctx->ch_layout) == 0) {
+      return copy;
+    }
+  }
+#endif
+
+  return makeDefaultLayout(safeAudioChannels(ctx));
 }
 
 std::string pixelFormatName(AVPixelFormat format) {
@@ -559,14 +641,244 @@ bool NativeDecoder::openAudio(const NativeDemuxer &demuxer) {
   audio_.codecName = audioStream.codecName;
   audio_.decoderName = impl_->audioDecoder->name ? impl_->audioDecoder->name : "unknown";
   audio_.streamIndex = audioStream.index;
-  audio_.sampleRate = impl_->audioCodec->sample_rate;
-  audio_.channels = audioChannels(impl_->audioCodec);
+  audio_.sampleRate = safeAudioSampleRate(impl_->audioCodec);
+  audio_.channels = safeAudioChannels(impl_->audioCodec);
+
+  impl_->audioFrame = av_frame_alloc();
+
+  if (!impl_->audioFrame) {
+    error_ = "NativeDecoder could not allocate audio frame.";
+    close();
+    return false;
+  }
+
+  AVChannelLayout inLayout = safeInputLayout(impl_->audioCodec);
+  AVChannelLayout outLayout = makeDefaultLayout(impl_->audioOutChannels);
+
+  const int inSampleRate = safeAudioSampleRate(impl_->audioCodec);
+  const AVSampleFormat inSampleFormat = safeAudioSampleFormat(impl_->audioCodec);
+
+  ret = swr_alloc_set_opts2(
+    &impl_->swr,
+    &outLayout,
+    impl_->audioOutFormat,
+    impl_->audioOutSampleRate,
+    &inLayout,
+    inSampleFormat,
+    inSampleRate,
+    0,
+    nullptr
+  );
+
+  av_channel_layout_uninit(&inLayout);
+  av_channel_layout_uninit(&outLayout);
+
+  if (ret < 0 || !impl_->swr) {
+    std::ostringstream audioError;
+
+    audioError
+      << "NativeDecoder could not allocate SwrContext: "
+      << ffmpegError(ret)
+      << " | codec="
+      << audio_.codecName
+      << " decoder="
+      << audio_.decoderName
+      << " inputSampleRate="
+      << safeAudioSampleRate(impl_->audioCodec)
+      << " inputChannels="
+      << safeAudioChannels(impl_->audioCodec)
+      << " inputSampleFormat="
+      << static_cast<int>(safeAudioSampleFormat(impl_->audioCodec))
+      << " outputSampleRate="
+      << impl_->audioOutSampleRate
+      << " outputChannels="
+      << impl_->audioOutChannels;
+
+    error_ = audioError.str();
+
+    close();
+    return false;
+  }
+
+  ret = swr_init(impl_->swr);
+
+  if (ret < 0) {
+    std::ostringstream audioError;
+
+    audioError
+      << "NativeDecoder could not initialize SwrContext: "
+      << ffmpegError(ret)
+      << " | codec="
+      << audio_.codecName
+      << " decoder="
+      << audio_.decoderName
+      << " inputSampleRate="
+      << safeAudioSampleRate(impl_->audioCodec)
+      << " inputChannels="
+      << safeAudioChannels(impl_->audioCodec)
+      << " inputSampleFormat="
+      << static_cast<int>(safeAudioSampleFormat(impl_->audioCodec))
+      << " outputSampleRate="
+      << impl_->audioOutSampleRate
+      << " outputChannels="
+      << impl_->audioOutChannels;
+
+    error_ = audioError.str();
+
+    close();
+    return false;
+  }
+  #ifdef NSTV_USE_SDL
+  if (impl_->audioDevice == 0) {
+    SDL_AudioSpec wanted{};
+    SDL_AudioSpec obtained{};
+
+    wanted.freq = impl_->audioOutSampleRate;
+    wanted.format = AUDIO_S16SYS;
+    wanted.channels = static_cast<Uint8>(impl_->audioOutChannels);
+    wanted.samples = 2048;
+    wanted.callback = nullptr;
+    wanted.userdata = nullptr;
+
+    impl_->audioDevice = SDL_OpenAudioDevice(
+      nullptr,
+      0,
+      &wanted,
+      &obtained,
+      0
+    );
+
+    if (impl_->audioDevice == 0) {
+      error_ = std::string("SDL_OpenAudioDevice failed: ") + SDL_GetError();
+      close();
+      return false;
+    }
+
+    impl_->audioSpec = obtained;
+  }
+  #endif
 
   rebuildSummary();
 
   return true;
 #endif
 }
+
+void NativeDecoder::startAudio() {
+#ifdef NSTV_USE_SDL
+  if (!impl_ || impl_->audioDevice == 0) {
+    return;
+  }
+
+  SDL_PauseAudioDevice(impl_->audioDevice, 0);
+  impl_->audioStarted = true;
+#endif
+}
+
+void NativeDecoder::stopAudio() {
+#ifdef NSTV_USE_SDL
+  if (!impl_ || impl_->audioDevice == 0) {
+    return;
+  }
+
+  SDL_PauseAudioDevice(impl_->audioDevice, 1);
+  SDL_ClearQueuedAudio(impl_->audioDevice);
+  impl_->audioStarted = false;
+#endif
+}
+
+int NativeDecoder::audioQueuedBytes() const {
+#ifdef NSTV_USE_SDL
+  if (!impl_ || impl_->audioDevice == 0) {
+    return 0;
+  }
+
+  return static_cast<int>(SDL_GetQueuedAudioSize(impl_->audioDevice));
+#else
+  return 0;
+#endif
+}
+
+#ifdef NSTV_USE_FFMPEG
+bool NativeDecoder::decodeAudioPacketToSdl(AVPacket *packet) {
+  if (!impl_ || !impl_->audioCodec || !impl_->audioFrame || !impl_->swr) {
+    return true;
+  }
+
+  int ret = avcodec_send_packet(impl_->audioCodec, packet);
+
+  if (ret < 0 && ret != AVERROR(EAGAIN)) {
+    error_ = "NativeDecoder could not send audio packet: " + ffmpegError(ret);
+    return false;
+  }
+
+  while (true) {
+    ret = avcodec_receive_frame(impl_->audioCodec, impl_->audioFrame);
+
+    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+      break;
+    }
+
+    if (ret < 0) {
+      error_ = "NativeDecoder could not receive audio frame: " + ffmpegError(ret);
+      return false;
+    }
+
+    const int outSamples = av_rescale_rnd(
+      swr_get_delay(impl_->swr, impl_->audioCodec->sample_rate) + impl_->audioFrame->nb_samples,
+      impl_->audioOutSampleRate,
+      impl_->audioCodec->sample_rate,
+      AV_ROUND_UP
+    );
+
+    if (outSamples <= 0) {
+      av_frame_unref(impl_->audioFrame);
+      continue;
+    }
+
+    const int bytesPerSample = av_get_bytes_per_sample(impl_->audioOutFormat);
+    const int outBufferSize = outSamples * impl_->audioOutChannels * bytesPerSample;
+
+    impl_->audioBuffer.resize(static_cast<std::size_t>(outBufferSize));
+
+    uint8_t *outData[2] = {
+      impl_->audioBuffer.data(),
+      nullptr
+    };
+
+    ret = swr_convert(
+      impl_->swr,
+      outData,
+      outSamples,
+      const_cast<const uint8_t **>(impl_->audioFrame->extended_data),
+      impl_->audioFrame->nb_samples
+    );
+
+    if (ret < 0) {
+      error_ = "NativeDecoder swr_convert failed: " + ffmpegError(ret);
+      av_frame_unref(impl_->audioFrame);
+      return false;
+    }
+
+    const int convertedBytes =
+      ret * impl_->audioOutChannels * bytesPerSample;
+
+#ifdef NSTV_USE_SDL
+    if (impl_->audioDevice != 0 && convertedBytes > 0) {
+      SDL_QueueAudio(
+        impl_->audioDevice,
+        impl_->audioBuffer.data(),
+        static_cast<Uint32>(convertedBytes)
+      );
+    }
+#endif
+
+    av_frame_unref(impl_->audioFrame);
+  }
+
+  return true;
+}
+#endif
 
 bool NativeDecoder::decodeNextVideoFrame(NativeDemuxer &demuxer, bool outputFrame) {
 #ifndef NSTV_USE_FFMPEG
@@ -598,6 +910,16 @@ bool NativeDecoder::decodeNextVideoFrame(NativeDemuxer &demuxer, bool outputFram
     if (ret < 0) {
       error_ = "NativeDecoder could not read next video frame: " + ffmpegError(ret);
       return false;
+    }
+
+    if (audio_.opened && impl_->packet->stream_index == audio_.streamIndex) {
+      if (!decodeAudioPacketToSdl(impl_->packet)) {
+        av_packet_unref(impl_->packet);
+        return false;
+      }
+
+      av_packet_unref(impl_->packet);
+      continue;
     }
 
     if (impl_->packet->stream_index != video_.streamIndex) {
@@ -879,6 +1201,25 @@ bool NativeDecoder::dropNextVideoFrame(NativeDemuxer &demuxer) {
 void NativeDecoder::close() {
 #ifdef NSTV_USE_FFMPEG
   if (impl_) {
+    #ifdef NSTV_USE_SDL
+        if (impl_->audioDevice != 0) {
+          SDL_PauseAudioDevice(impl_->audioDevice, 1);
+          SDL_ClearQueuedAudio(impl_->audioDevice);
+          SDL_CloseAudioDevice(impl_->audioDevice);
+          impl_->audioDevice = 0;
+          impl_->audioStarted = false;
+        }
+    #endif
+
+        if (impl_->swr) {
+          swr_free(&impl_->swr);
+          impl_->swr = nullptr;
+        }
+
+        if (impl_->audioFrame) {
+          av_frame_free(&impl_->audioFrame);
+          impl_->audioFrame = nullptr;
+        }
     if (impl_->packet) {
       av_packet_free(&impl_->packet);
       impl_->packet = nullptr;
@@ -917,6 +1258,7 @@ void NativeDecoder::close() {
     impl_->videoDecoder = nullptr;
     impl_->audioDecoder = nullptr;
     impl_->convertedYuvBuffer.clear();
+    impl_->audioBuffer.clear();
 
     impl_->swsSrcWidth = 0;
     impl_->swsSrcHeight = 0;
