@@ -1,0 +1,122 @@
+ifeq ($(strip $(DEVKITPRO)),)
+$(error DEVKITPRO is not set)
+endif
+
+include $(DEVKITPRO)/libnx/switch_rules
+
+TARGET       := nstv-native
+BUILD        := build-switch
+SOURCES      := source
+DATA         := data
+INCLUDES     := include
+APP_TITLE    := NSTV Native
+APP_AUTHOR   := Gilson Santos / OpenAI
+APP_VERSION  := 0.3.0
+
+ARCH := -march=armv8-a -mtune=cortex-a57 -mtp=soft -fPIE
+CFLAGS   = -g -Wall -O2 -ffunction-sections $(ARCH) $(DEFINES) -D__SWITCH__ -DNSTV_USE_SDL -DNSTV_USE_SDL_TTF -DNSTV_USE_SDL_IMAGE $(FFMPEG_DEFINES)
+CXXFLAGS = $(CFLAGS) -std=c++17 -fno-rtti -fexceptions
+ASFLAGS  := -g $(ARCH)
+LDFLAGS  := -specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
+
+PORTLIBS := $(DEVKITPRO)/portlibs/switch
+LIBNX    := $(DEVKITPRO)/libnx
+
+FFMPEG_AVAILABLE := $(wildcard $(PORTLIBS)/lib/libavformat.a)
+ifeq ($(FFMPEG_AVAILABLE),)
+FFMPEG_DEFINES :=
+FFMPEG_LIBS :=
+else
+FFMPEG_DEFINES := -DNSTV_USE_FFMPEG
+FFMPEG_LIBS := -lavformat -lavcodec -lavutil -lswscale -lswresample -lz -lbz2 -llzma -lm
+endif
+
+LIBS := \
+  $(FFMPEG_LIBS) \
+  -lSDL2_image \
+  -lSDL2_ttf \
+  -lSDL2 \
+  -lavformat \
+  -lavcodec \
+  -ldav1d \
+  -lavutil \
+  -lswscale \
+  -lswresample \
+  -lfreetype \
+  -lharfbuzz \
+  -lass \
+  -lfribidi \
+  -lpng \
+  -ljpeg \
+  -lwebp \
+  -lbz2 \
+  -llzma \
+  -lcurl \
+  -lmbedtls \
+  -lmbedx509 \
+  -lmbedcrypto \
+  -lz \
+  -lEGL \
+  -lGLESv2 \
+  -lglad \
+  -lglapi \
+  -ldrm_nouveau \
+  -lm \
+  -lnx
+LIBDIRS := $(PORTLIBS) $(LIBNX)
+
+ifneq ($(BUILD),$(notdir $(CURDIR)))
+export OUTPUT := $(CURDIR)/$(TARGET)
+export TOPDIR := $(CURDIR)
+export VPATH := $(foreach dir,$(SOURCES),$(CURDIR)/$(dir)) \
+                $(foreach dir,$(DATA),$(CURDIR)/$(dir))
+export DEPSDIR := $(CURDIR)/$(BUILD)
+
+CFILES := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.c)))
+CPPFILES := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.cpp)))
+SFILES := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.s)))
+BINFILES := $(foreach dir,$(DATA),$(notdir $(wildcard $(dir)/*.*)))
+
+export OFILES_BIN := $(addsuffix .o,$(BINFILES))
+export OFILES_SRC := $(CPPFILES:.cpp=.o) $(CFILES:.c=.o) $(SFILES:.s=.o)
+export OFILES := $(OFILES_BIN) $(OFILES_SRC)
+export HFILES_BIN := $(addsuffix .h,$(subst .,_,$(BINFILES)))
+
+export INCLUDE := $(foreach dir,$(INCLUDES),-I$(CURDIR)/$(dir)) \
+                  $(foreach dir,$(LIBDIRS),-I$(dir)/include) \
+                  -I$(CURDIR)/$(BUILD)
+export LIBPATHS := $(foreach dir,$(LIBDIRS),-L$(dir)/lib)
+
+.PHONY: $(BUILD) clean all
+
+all: $(BUILD)
+
+$(BUILD):
+	@[ -d $@ ] || mkdir -p $@
+	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile.switch
+
+clean:
+	@echo clean ...
+	@rm -fr $(BUILD) $(TARGET).elf $(TARGET).nro $(TARGET).nacp
+
+else
+DEPENDS := $(OFILES:.o=.d)
+
+$(OUTPUT).nro: $(OUTPUT).elf
+$(OUTPUT).elf: $(OFILES)
+
+%.elf:
+	@echo linking $(notdir $@)
+	@$(CXX) $(LDFLAGS) $(OFILES) $(LIBPATHS) $(LIBS) -o $@
+
+%.nro: %.elf
+	@echo building $(notdir $@)
+	@nacptool --create "$(APP_TITLE)" "$(APP_AUTHOR)" "$(APP_VERSION)" $(OUTPUT).nacp
+	@elf2nro $< $@ --nacp=$(OUTPUT).nacp
+
+%.o: %.cpp
+	@echo $(notdir $<)
+	@$(CXX) $(CXXFLAGS) $(INCLUDE) -MMD -MP -MF $(DEPSDIR)/$*.d -c $< -o $@
+
+-include $(DEPENDS)
+endif

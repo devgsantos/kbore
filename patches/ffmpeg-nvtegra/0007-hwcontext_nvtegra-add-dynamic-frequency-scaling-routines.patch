@@ -1,0 +1,208 @@
+diff --git a/libavutil/hwcontext_nvtegra.c b/libavutil/hwcontext_nvtegra.c
+index 0f4d5a323b..6b72348082 100644
+--- a/libavutil/hwcontext_nvtegra.c
++++ b/libavutil/hwcontext_nvtegra.c
+@@ -46,6 +46,14 @@ typedef struct NVTegraDevicePriv {
+ 
+     AVNVTegraJobPool job_pool;
+     uint32_t vic_setup_off, vic_cmdbuf_off;
++
++    double framerate;
++    uint32_t dfs_lowcorner;
++    double dfs_decode_cycles_ema;
++    double dfs_ema_damping;
++    int dfs_bitrate_sum;
++    int dfs_cur_sample, dfs_num_samples;
++    int64_t dfs_sampling_start_ts, dfs_last_ts_delta;
+ } NVTegraDevicePriv;
+ 
+ static const enum AVPixelFormat supported_sw_formats[] = {
+@@ -108,6 +116,28 @@ static inline uint32_t nvtegra_surface_get_height_align(enum AVPixelFormat fmt,
+     return 32;
+ }
+ 
++static int nvtegra_channel_set_freq(AVNVTegraChannel *channel, uint32_t freq) {
++    int err;
++#ifndef __SWITCH__
++    err = av_nvtegra_channel_set_clock_rate(channel, channel->module_id, freq);
++    if (err < 0)
++        return err;
++
++    err = av_nvtegra_channel_get_clock_rate(channel, channel->module_id, &channel->clock);
++    if (err < 0)
++        return err;
++#else
++    err = AVERROR(mmuRequestSetAndWait(&channel->mmu_request, freq, -1));
++    if (err < 0)
++        return err;
++
++    err = AVERROR(mmuRequestGet(&channel->mmu_request, &channel->clock));
++    if (err < 0)
++        return err;
++#endif
++    return 0;
++}
++
+ static void nvtegra_device_uninit(AVHWDeviceContext *ctx) {
+     NVTegraDevicePriv       *priv = ctx->hwctx;
+     AVNVTegraDeviceContext *hwctx = &priv->p;
+@@ -386,6 +416,141 @@ static int nvtegra_get_buffer(AVHWFramesContext *ctx, AVFrame *frame) {
+     return 0;
+ }
+ 
++/*
++ * Possible frequencies on Icosa and Mariko+, in MHz
++ * (see tegra210-core-dvfs.c and tegra210b01-core-dvfs.c in l4t kernel sources, respectively):
++ * for NVDEC:
++ *   268.8, 384.0, 448.0, 486.4, 550.4, 576.0, 614.4, 652.8, 678.4, 691.2, 716.8
++ *   460.8, 499.2, 556.8, 633.6, 652.8, 710.4, 748.8, 787.2, 825.6, 844.8, 883.2, 902.4, 921.6, 940.8, 960.0, 979.2
++ * for NVJPG:
++ *   192.0, 307.2, 345.6, 409.6, 486.4, 524.8, 550.4, 576.0, 588.8, 614.4, 627.2
++ *   422.4, 441.6, 499.2, 518.4, 537.6, 556.8, 576.0, 595.2, 614.4, 633.6, 652.8
++ */
++
++int av_nvtegra_dfs_init(AVHWDeviceContext *ctx, AVNVTegraChannel *channel, int width, int height,
++                        double framerate_hz)
++{
++    NVTegraDevicePriv *priv = ctx->hwctx;
++
++    uint32_t max_freq, lowcorner;
++    int num_mbs, err;
++
++    priv->dfs_num_samples = 20;
++    priv->dfs_ema_damping = 0.1;
++
++    /*
++     * Initialize low-corner frequency (reproduces official code)
++     * Framerate might be unavailable (or variable), but this is official logic
++     */
++    num_mbs = width / 16 * height / 16;
++    if (num_mbs <= 3600)
++        lowcorner = 100000000;  /* 480p */
++    else if (num_mbs <= 8160)
++        lowcorner = 180000000;  /* 720p */
++    else if (num_mbs <= 32400)
++        lowcorner = 345000000;  /* 1080p */
++    else
++        lowcorner = 576000000;  /* 4k */
++
++    if (framerate_hz >= 0.1 && isfinite(framerate_hz))
++        lowcorner = FFMIN(lowcorner, lowcorner * framerate_hz / 30.0);
++
++    priv->framerate     = framerate_hz;
++    priv->dfs_lowcorner = lowcorner;
++
++    av_log(ctx, AV_LOG_DEBUG, "DFS: Initializing lowcorner to %d Hz, using %u samples\n",
++           priv->dfs_lowcorner, priv->dfs_num_samples);
++
++    /*
++     * Initialize channel to the max possible frequency (the kernel driver will clamp to an allowed value)
++     * Note: Official code passes INT_MAX kHz then multiplies by 1000 (to Hz) and converts to u32,
++     * resulting in this value.
++     */
++    max_freq = (UINT64_C(1)<<32) - 1000 & UINT32_MAX;
++
++    err = nvtegra_channel_set_freq(channel, max_freq);
++    if (err < 0)
++        return err;
++
++    priv->dfs_decode_cycles_ema = 0.0;
++    priv->dfs_bitrate_sum       = 0;
++    priv->dfs_cur_sample        = 0;
++    priv->dfs_sampling_start_ts = av_gettime_relative();
++    priv->dfs_last_ts_delta     = 0;
++
++    return 0;
++}
++
++int av_nvtegra_dfs_update(AVHWDeviceContext *ctx, AVNVTegraChannel *channel, int bitstream_len, int decode_cycles) {
++    NVTegraDevicePriv *priv = ctx->hwctx;
++
++    double frame_time, avg;
++    int64_t now, wl_dt;
++    uint32_t clock;
++    int err;
++
++    /*
++     * Official software implements DFS using a flat average of the decoder pool occupancy.
++     * We instead use the decode cycles as reported by NVDEC microcode, and the "bitrate"
++     * (bitstream bits fed to the hardware in a given clock time interval, NOT video time),
++     * to calculate a suitable frequency, and multiply it by 1.2 for good measure:
++     *   Freq = decode_cycles_per_bit * bits_per_second * 1.2
++     */
++
++    /* Convert to bits */
++    bitstream_len *= 8;
++
++    /* Exponential moving average of decode cycles per frame */
++    priv->dfs_decode_cycles_ema = priv->dfs_ema_damping * (double)decode_cycles/bitstream_len +
++        (1.0 - priv->dfs_ema_damping) * priv->dfs_decode_cycles_ema;
++
++    priv->dfs_bitrate_sum += bitstream_len;
++    priv->dfs_cur_sample   = (priv->dfs_cur_sample + 1) % priv->dfs_num_samples;
++
++    err = 0;
++
++    /* Reclock if we collected enough samples */
++    if (priv->dfs_cur_sample == 0) {
++        now   = av_gettime_relative();
++        wl_dt = now - priv->dfs_sampling_start_ts;
++
++        /*
++         * Try to filter bad sample sets caused by eg. pausing the video playback.
++         * We reject if one of these conditions is met:
++         * - the wall time is over 1.5x the framerate (10Hz is used as fallback if no framerate information is available)
++         * - the wall time is over 1.5x the ema-damped previous values
++         */
++
++        if (priv->framerate >= 0.1 && isfinite(priv->framerate))
++            frame_time = 1.0e6 / priv->framerate;
++        else
++            frame_time = 0.1e6;
++
++        if ((wl_dt < 1.5 * priv->dfs_num_samples * frame_time) ||
++                ((priv->dfs_last_ts_delta) && (wl_dt < 1.5 * priv->dfs_last_ts_delta))) {
++            avg   = priv->dfs_bitrate_sum * 1e6 / wl_dt;
++            clock = priv->dfs_decode_cycles_ema * avg * 1.2;
++            clock = FFMAX(clock, priv->dfs_lowcorner);
++
++            av_log(ctx, AV_LOG_DEBUG, "DFS: %.0f cycles/b (ema), %.0f b/s -> clock %u Hz (lowcorner %u Hz)\n",
++                priv->dfs_decode_cycles_ema, avg, clock, priv->dfs_lowcorner);
++
++            err = nvtegra_channel_set_freq(channel, clock);
++
++            priv->dfs_last_ts_delta = wl_dt;
++        }
++
++        priv->dfs_bitrate_sum       = 0;
++        priv->dfs_sampling_start_ts = now;
++    }
++
++    return err;
++}
++
++int av_nvtegra_dfs_uninit(AVHWDeviceContext *ctx, AVNVTegraChannel *channel) {
++    return nvtegra_channel_set_freq(channel, 0);
++}
++
+ static int nvtegra_transfer_get_formats(AVHWFramesContext *ctx,
+                                         enum AVHWFrameTransferDirection dir,
+                                         enum AVPixelFormat **formats)
+diff --git a/libavutil/hwcontext_nvtegra.h b/libavutil/hwcontext_nvtegra.h
+index 8a2383d304..7c845951d9 100644
+--- a/libavutil/hwcontext_nvtegra.h
++++ b/libavutil/hwcontext_nvtegra.h
+@@ -82,4 +82,11 @@ static inline AVNVTegraMap *av_nvtegra_frame_get_fbuf_map(const AVFrame *frame)
+  */
+ int av_nvtegra_pixfmt_to_vic(enum AVPixelFormat fmt);
+ 
++/*
++ * Dynamic frequency scaling routines
++ */
++int av_nvtegra_dfs_init(AVHWDeviceContext *ctx, AVNVTegraChannel *channel, int width, int height, double framerate_hz);
++int av_nvtegra_dfs_update(AVHWDeviceContext *ctx, AVNVTegraChannel *channel, int bitstream_len, int decode_cycles);
++int av_nvtegra_dfs_uninit(AVHWDeviceContext *ctx, AVNVTegraChannel *channel);
++
+ #endif /* AVUTIL_HWCONTEXT_NVTEGRA_H */
+-- 
+2.45.1

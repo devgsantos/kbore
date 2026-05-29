@@ -1,0 +1,70 @@
+diff --git a/libavutil/buffer.c b/libavutil/buffer.c
+index e4562a79b1..b8e357f540 100644
+--- a/libavutil/buffer.c
++++ b/libavutil/buffer.c
+@@ -16,9 +16,14 @@
+  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+ */
+
++#include "config.h"
++
+ #include <stdatomic.h>
+ #include <stdint.h>
+ #include <string.h>
++#if HAVE_MALLOC_H
++#include <malloc.h>
++#endif
+
+ #include "avassert.h"
+ #include "buffer_internal.h"
+@@ -100,6 +105,32 @@ AVBufferRef *av_buffer_allocz(size_t size)
+     return ret;
+ }
+
++AVBufferRef *av_buffer_aligned_alloc(size_t size, size_t align)
++{
++    AVBufferRef *ret = NULL;
++    uint8_t    *data = NULL;
++
++#if HAVE_POSIX_MEMALIGN
++    if (posix_memalign((void **)&data, align, size))
++        return NULL;
++#elif HAVE_ALIGNED_MALLOC
++    data = aligned_alloc(align, size);
++#elif HAVE_MEMALIGN
++    data = memalign(align, size);
++#else
++    return NULL;
++#endif
++
++    if (!data)
++        return NULL;
++
++    ret = av_buffer_create(data, size, av_buffer_default_free, NULL, 0);
++    if (!ret)
++        av_freep(&data);
++
++    return ret;
++}
++
+ AVBufferRef *av_buffer_ref(const AVBufferRef *buf)
+ {
+     AVBufferRef *ret = av_mallocz(sizeof(*ret));
+diff --git a/libavutil/buffer.h b/libavutil/buffer.h
+index e1ef5b7f07..8422ec3453 100644
+--- a/libavutil/buffer.h
++++ b/libavutil/buffer.h
+@@ -107,6 +107,13 @@ AVBufferRef *av_buffer_alloc(size_t size);
+  */
+ AVBufferRef *av_buffer_allocz(size_t size);
+
++/**
++ * Allocate an AVBuffer of the given size and alignment.
++ *
++ * @return an AVBufferRef of given size or NULL when out of memory
++ */
++AVBufferRef *av_buffer_aligned_alloc(size_t size, size_t align);
++
+ /**
+  * Always treat the buffer as read-only, even when it has only one
+  * reference.

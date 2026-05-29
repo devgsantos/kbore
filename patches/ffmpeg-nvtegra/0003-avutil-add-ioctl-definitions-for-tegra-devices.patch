@@ -1,0 +1,989 @@
+diff --git a/libavutil/Makefile b/libavutil/Makefile
+index 6e6fa8d800..9c112bc58a 100644
+--- a/libavutil/Makefile
++++ b/libavutil/Makefile
+@@ -52,6 +52,8 @@ HEADERS = adler32.h                                                     \
+           hwcontext_videotoolbox.h                                      \
+           hwcontext_vdpau.h                                             \
+           hwcontext_vulkan.h                                            \
++          nvhost_ioctl.h                                                \
++          nvmap_ioctl.h                                                 \
+           iamf.h                                                        \
+           imgutils.h                                                    \
+           intfloat.h                                                    \
+diff --git a/libavutil/nvhost_ioctl.h b/libavutil/nvhost_ioctl.h
+new file mode 100644
+index 0000000000..b0bf3e3ae6
+--- /dev/null
++++ b/libavutil/nvhost_ioctl.h
+@@ -0,0 +1,511 @@
++/*
++ * include/uapi/linux/nvhost_ioctl.h
++ *
++ * Tegra graphics host driver
++ *
++ * Copyright (c) 2016-2020, NVIDIA CORPORATION.  All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with this program; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
++ */
++
++#ifndef AVUTIL_NVHOST_IOCTL_H
++#define AVUTIL_NVHOST_IOCTL_H
++
++#ifndef __SWITCH__
++#   include <linux/ioctl.h>
++#   include <linux/types.h>
++#else
++#   include <switch.h>
++
++#   define _IO       _NV_IO
++#   define _IOR      _NV_IOR
++#   define _IOW      _NV_IOW
++#   define _IOWR     _NV_IOWR
++
++#   define _IOC_DIR  _NV_IOC_DIR
++#   define _IOC_TYPE _NV_IOC_TYPE
++#   define _IOC_NR   _NV_IOC_NR
++#   define _IOC_SIZE _NV_IOC_SIZE
++#endif
++
++#define __user
++
++#define NVHOST_INVALID_SYNCPOINT 0xFFFFFFFF
++#define NVHOST_NO_TIMEOUT (-1)
++#define NVHOST_NO_CONTEXT 0x0
++#define NVHOST_IOCTL_MAGIC 'H'
++#define NVHOST_PRIORITY_LOW 50
++#define NVHOST_PRIORITY_MEDIUM 100
++#define NVHOST_PRIORITY_HIGH 150
++
++#define NVHOST_TIMEOUT_FLAG_DISABLE_DUMP    0
++
++#define NVHOST_SUBMIT_VERSION_V0            0x0
++#define NVHOST_SUBMIT_VERSION_V1            0x1
++#define NVHOST_SUBMIT_VERSION_V2            0x2
++#define NVHOST_SUBMIT_VERSION_MAX_SUPPORTED NVHOST_SUBMIT_VERSION_V2
++
++struct nvhost_cmdbuf {
++    uint32_t mem;
++    uint32_t offset;
++    uint32_t words;
++} __attribute__((packed));
++
++struct nvhost_cmdbuf_ext {
++    int32_t  pre_fence;
++    uint32_t reserved;
++};
++
++struct nvhost_reloc {
++    uint32_t cmdbuf_mem;
++    uint32_t cmdbuf_offset;
++    uint32_t target;
++    uint32_t target_offset;
++};
++
++struct nvhost_reloc_shift {
++    uint32_t shift;
++} __attribute__((packed));
++
++#define NVHOST_RELOC_TYPE_DEFAULT    0
++#define NVHOST_RELOC_TYPE_PITCH_LINEAR    1
++#define NVHOST_RELOC_TYPE_BLOCK_LINEAR    2
++#define NVHOST_RELOC_TYPE_NVLINK    3
++struct nvhost_reloc_type {
++    uint32_t reloc_type;
++    uint32_t padding;
++};
++
++struct nvhost_waitchk {
++    uint32_t mem;
++    uint32_t offset;
++    uint32_t syncpt_id;
++    uint32_t thresh;
++};
++
++struct nvhost_syncpt_incr {
++    uint32_t syncpt_id;
++    uint32_t syncpt_incrs;
++};
++
++struct nvhost_get_param_args {
++    uint32_t value;
++} __attribute__((packed));
++
++struct nvhost_get_param_arg {
++    uint32_t param;
++    uint32_t value;
++};
++
++struct nvhost_get_client_managed_syncpt_arg {
++    uint64_t name;
++    uint32_t param;
++    uint32_t value;
++};
++
++struct nvhost_free_client_managed_syncpt_arg {
++    uint32_t param;
++    uint32_t value;
++};
++
++struct nvhost_channel_open_args {
++    int32_t  channel_fd;
++};
++
++struct nvhost_set_syncpt_name_args {
++    uint64_t name;
++    uint32_t syncpt_id;
++    uint32_t padding;
++};
++
++struct nvhost_set_nvmap_fd_args {
++    uint32_t fd;
++} __attribute__((packed));
++
++enum nvhost_clk_attr {
++    NVHOST_CLOCK = 0,
++    NVHOST_BW,
++    NVHOST_PIXELRATE,
++    NVHOST_BW_KHZ,
++};
++
++/*
++ * moduleid[15:0]  => module id
++ * moduleid[24:31] => nvhost_clk_attr
++ */
++#define NVHOST_MODULE_ID_BIT_POS    0
++#define NVHOST_MODULE_ID_BIT_WIDTH  16
++#define NVHOST_CLOCK_ATTR_BIT_POS   24
++#define NVHOST_CLOCK_ATTR_BIT_WIDTH 8
++struct nvhost_clk_rate_args {
++    uint32_t rate;
++    uint32_t moduleid;
++};
++
++struct nvhost_set_timeout_args {
++    uint32_t timeout;
++} __attribute__((packed));
++
++struct nvhost_set_timeout_ex_args {
++    uint32_t timeout;
++    uint32_t flags;
++};
++
++struct nvhost_set_priority_args {
++    uint32_t priority;
++} __attribute__((packed));
++
++struct nvhost_set_error_notifier {
++    uint64_t offset;
++    uint64_t size;
++    uint32_t mem;
++    uint32_t padding;
++};
++
++struct nvhost32_ctrl_module_regrdwr_args {
++    uint32_t id;
++    uint32_t num_offsets;
++    uint32_t block_size;
++    uint32_t offsets;
++    uint32_t values;
++    uint32_t write;
++};
++
++struct nvhost_ctrl_module_regrdwr_args {
++    uint32_t id;
++    uint32_t num_offsets;
++    uint32_t block_size;
++    uint32_t write;
++    uint64_t offsets;
++    uint64_t values;
++};
++
++struct nvhost32_submit_args {
++    uint32_t submit_version;
++    uint32_t num_syncpt_incrs;
++    uint32_t num_cmdbufs;
++    uint32_t num_relocs;
++    uint32_t num_waitchks;
++    uint32_t timeout;
++    uint32_t syncpt_incrs;
++    uint32_t cmdbufs;
++    uint32_t relocs;
++    uint32_t reloc_shifts;
++    uint32_t waitchks;
++    uint32_t waitbases;
++    uint32_t class_ids;
++
++    uint32_t pad[2];        /* future expansion */
++
++    uint32_t fences;
++    uint32_t fence;        /* Return value */
++} __attribute__((packed));
++
++#define NVHOST_SUBMIT_FLAG_SYNC_FENCE_FD    0
++#define NVHOST_SUBMIT_MAX_NUM_SYNCPT_INCRS    10
++
++struct nvhost_submit_args {
++    uint32_t submit_version;
++    uint32_t num_syncpt_incrs;
++    uint32_t num_cmdbufs;
++    uint32_t num_relocs;
++    uint32_t num_waitchks;
++    uint32_t timeout;
++    uint32_t flags;
++    uint32_t fence;        /* Return value */
++    uint64_t syncpt_incrs;
++    uint64_t cmdbuf_exts;
++
++    uint32_t checksum_methods;
++    uint32_t checksum_falcon_methods;
++
++    uint64_t pad[1];        /* future expansion */
++
++    uint64_t reloc_types;
++    uint64_t cmdbufs;
++    uint64_t relocs;
++    uint64_t reloc_shifts;
++    uint64_t waitchks;
++    uint64_t waitbases;
++    uint64_t class_ids;
++    uint64_t fences;
++};
++
++struct nvhost_set_ctxswitch_args {
++    uint32_t num_cmdbufs_save;
++    uint32_t num_save_incrs;
++    uint32_t save_incrs;
++    uint32_t save_waitbases;
++    uint32_t cmdbuf_save;
++    uint32_t num_cmdbufs_restore;
++    uint32_t num_restore_incrs;
++    uint32_t restore_incrs;
++    uint32_t restore_waitbases;
++    uint32_t cmdbuf_restore;
++    uint32_t num_relocs;
++    uint32_t relocs;
++    uint32_t reloc_shifts;
++
++    uint32_t pad;
++};
++
++struct nvhost_channel_buffer {
++    uint32_t dmabuf_fd;    /* in */
++    uint32_t reserved0;    /* reserved, must be 0 */
++    uint64_t reserved1[2];    /* reserved, must be 0 */
++    uint64_t address;        /* out, device view to the buffer */
++};
++
++struct nvhost_channel_unmap_buffer_args {
++    uint32_t num_buffers;    /* in, number of buffers to unmap */
++    uint32_t reserved;        /* reserved, must be 0 */
++    uint64_t table_address;    /* pointer to beginning of buffer */
++};
++
++struct nvhost_channel_map_buffer_args {
++    uint32_t num_buffers;    /* in, number of buffers to map */
++    uint32_t reserved;        /* reserved, must be 0 */
++    uint64_t table_address;    /* pointer to beginning of buffer */
++};
++
++#define NVHOST_IOCTL_CHANNEL_GET_SYNCPOINTS    \
++    _IOR(NVHOST_IOCTL_MAGIC, 2, struct nvhost_get_param_args)
++#define NVHOST_IOCTL_CHANNEL_GET_WAITBASES    \
++    _IOR(NVHOST_IOCTL_MAGIC, 3, struct nvhost_get_param_args)
++#define NVHOST_IOCTL_CHANNEL_GET_MODMUTEXES    \
++    _IOR(NVHOST_IOCTL_MAGIC, 4, struct nvhost_get_param_args)
++#define NVHOST_IOCTL_CHANNEL_SET_NVMAP_FD    \
++    _IOW(NVHOST_IOCTL_MAGIC, 5, struct nvhost_set_nvmap_fd_args)
++#define NVHOST_IOCTL_CHANNEL_NULL_KICKOFF    \
++    _IOR(NVHOST_IOCTL_MAGIC, 6, struct nvhost_get_param_args)
++#define NVHOST_IOCTL_CHANNEL_GET_CLK_RATE        \
++    _IOWR(NVHOST_IOCTL_MAGIC, 9, struct nvhost_clk_rate_args)
++#define NVHOST_IOCTL_CHANNEL_SET_CLK_RATE        \
++    _IOW(NVHOST_IOCTL_MAGIC, 10, struct nvhost_clk_rate_args)
++#define NVHOST_IOCTL_CHANNEL_SET_TIMEOUT    \
++    _IOW(NVHOST_IOCTL_MAGIC, 11, struct nvhost_set_timeout_args)
++#define NVHOST_IOCTL_CHANNEL_GET_TIMEDOUT    \
++    _IOR(NVHOST_IOCTL_MAGIC, 12, struct nvhost_get_param_args)
++#define NVHOST_IOCTL_CHANNEL_SET_PRIORITY    \
++    _IOW(NVHOST_IOCTL_MAGIC, 13, struct nvhost_set_priority_args)
++#define    NVHOST32_IOCTL_CHANNEL_MODULE_REGRDWR    \
++    _IOWR(NVHOST_IOCTL_MAGIC, 14, struct nvhost32_ctrl_module_regrdwr_args)
++#define NVHOST32_IOCTL_CHANNEL_SUBMIT        \
++    _IOWR(NVHOST_IOCTL_MAGIC, 15, struct nvhost32_submit_args)
++#define NVHOST_IOCTL_CHANNEL_GET_SYNCPOINT    \
++    _IOWR(NVHOST_IOCTL_MAGIC, 16, struct nvhost_get_param_arg)
++#define NVHOST_IOCTL_CHANNEL_GET_WAITBASE    \
++    _IOWR(NVHOST_IOCTL_MAGIC, 17, struct nvhost_get_param_arg)
++#define NVHOST_IOCTL_CHANNEL_SET_TIMEOUT_EX    \
++    _IOWR(NVHOST_IOCTL_MAGIC, 18, struct nvhost_set_timeout_ex_args)
++#define NVHOST_IOCTL_CHANNEL_GET_CLIENT_MANAGED_SYNCPOINT    \
++    _IOWR(NVHOST_IOCTL_MAGIC, 19, struct nvhost_get_client_managed_syncpt_arg)
++#define NVHOST_IOCTL_CHANNEL_FREE_CLIENT_MANAGED_SYNCPOINT    \
++    _IOWR(NVHOST_IOCTL_MAGIC, 20, struct nvhost_free_client_managed_syncpt_arg)
++#define NVHOST_IOCTL_CHANNEL_GET_MODMUTEX    \
++    _IOWR(NVHOST_IOCTL_MAGIC, 23, struct nvhost_get_param_arg)
++#define NVHOST_IOCTL_CHANNEL_SET_CTXSWITCH    \
++    _IOWR(NVHOST_IOCTL_MAGIC, 25, struct nvhost_set_ctxswitch_args)
++
++/* ioctls added for 64bit compatibility */
++#define NVHOST_IOCTL_CHANNEL_SUBMIT    \
++    _IOWR(NVHOST_IOCTL_MAGIC, 26, struct nvhost_submit_args)
++#define    NVHOST_IOCTL_CHANNEL_MODULE_REGRDWR    \
++    _IOWR(NVHOST_IOCTL_MAGIC, 27, struct nvhost_ctrl_module_regrdwr_args)
++
++#define    NVHOST_IOCTL_CHANNEL_MAP_BUFFER    \
++    _IOWR(NVHOST_IOCTL_MAGIC, 28, struct nvhost_channel_map_buffer_args)
++#define    NVHOST_IOCTL_CHANNEL_UNMAP_BUFFER    \
++    _IOWR(NVHOST_IOCTL_MAGIC, 29, struct nvhost_channel_unmap_buffer_args)
++
++#define NVHOST_IOCTL_CHANNEL_SET_SYNCPOINT_NAME    \
++    _IOW(NVHOST_IOCTL_MAGIC, 30, struct nvhost_set_syncpt_name_args)
++
++#define NVHOST_IOCTL_CHANNEL_SET_ERROR_NOTIFIER  \
++    _IOWR(NVHOST_IOCTL_MAGIC, 111, struct nvhost_set_error_notifier)
++#define NVHOST_IOCTL_CHANNEL_OPEN    \
++    _IOR(NVHOST_IOCTL_MAGIC,  112, struct nvhost_channel_open_args)
++
++#define NVHOST_IOCTL_CHANNEL_LAST    \
++    _IOC_NR(NVHOST_IOCTL_CHANNEL_OPEN)
++#define NVHOST_IOCTL_CHANNEL_MAX_ARG_SIZE sizeof(struct nvhost_submit_args)
++
++struct nvhost_ctrl_syncpt_read_args {
++    uint32_t id;
++    uint32_t value;
++};
++
++struct nvhost_ctrl_syncpt_incr_args {
++    uint32_t id;
++} __attribute__((packed));
++
++struct nvhost_ctrl_syncpt_wait_args {
++    uint32_t id;
++    uint32_t thresh;
++    int32_t  timeout;
++} __attribute__((packed));
++
++struct nvhost_ctrl_syncpt_waitex_args {
++    uint32_t id;
++    uint32_t thresh;
++    int32_t  timeout;
++    uint32_t value;
++};
++
++struct nvhost_ctrl_syncpt_waitmex_args {
++    uint32_t id;
++    uint32_t thresh;
++    int32_t  timeout;
++    uint32_t value;
++    uint32_t tv_sec;
++    uint32_t tv_nsec;
++    uint32_t clock_id;
++    uint32_t reserved;
++};
++
++struct nvhost_ctrl_sync_fence_info {
++    uint32_t id;
++    uint32_t thresh;
++};
++
++struct nvhost32_ctrl_sync_fence_create_args {
++    uint32_t num_pts;
++    uint64_t pts; /* struct nvhost_ctrl_sync_fence_info* */
++    uint64_t name; /* const char* */
++    int32_t  fence_fd; /* fd of new fence */
++};
++
++struct nvhost_ctrl_sync_fence_create_args {
++    uint32_t num_pts;
++    int32_t  fence_fd; /* fd of new fence */
++    uint64_t pts; /* struct nvhost_ctrl_sync_fence_info* */
++    uint64_t name; /* const char* */
++};
++
++struct nvhost_ctrl_sync_fence_name_args {
++    uint64_t name; /* const char* for name */
++    int32_t  fence_fd; /* fd of fence */
++};
++
++struct nvhost_ctrl_module_mutex_args {
++    uint32_t id;
++    uint32_t lock;
++};
++
++enum nvhost_module_id {
++    NVHOST_MODULE_NONE = -1,
++    NVHOST_MODULE_DISPLAY_A = 0,
++    NVHOST_MODULE_DISPLAY_B,
++    NVHOST_MODULE_VI,
++    NVHOST_MODULE_ISP,
++    NVHOST_MODULE_MPE,
++    NVHOST_MODULE_MSENC,
++    NVHOST_MODULE_TSEC,
++    NVHOST_MODULE_GPU,
++    NVHOST_MODULE_VIC,
++    NVHOST_MODULE_NVDEC,
++    NVHOST_MODULE_NVJPG,
++    NVHOST_MODULE_VII2C,
++    NVHOST_MODULE_NVENC1,
++    NVHOST_MODULE_NVDEC1,
++    NVHOST_MODULE_NVCSI,
++    NVHOST_MODULE_TSECB = (1<<16) | NVHOST_MODULE_TSEC,
++};
++
++struct nvhost_characteristics {
++#define NVHOST_CHARACTERISTICS_GFILTER (1 << 0)
++#define NVHOST_CHARACTERISTICS_RESOURCE_PER_CHANNEL_INSTANCE (1 << 1)
++#define NVHOST_CHARACTERISTICS_SUPPORT_PREFENCES (1 << 2)
++    uint64_t flags;
++
++    uint32_t num_mlocks;
++    uint32_t num_syncpts;
++
++    uint32_t syncpts_base;
++    uint32_t syncpts_limit;
++
++    uint32_t num_hw_pts;
++    uint32_t padding;
++};
++
++struct nvhost_ctrl_get_characteristics {
++    uint64_t nvhost_characteristics_buf_size;
++    uint64_t nvhost_characteristics_buf_addr;
++};
++
++struct nvhost_ctrl_check_module_support_args {
++    uint32_t module_id;
++    uint32_t value;
++};
++
++struct nvhost_ctrl_poll_fd_create_args {
++    int32_t  fd;
++    uint32_t padding;
++};
++
++struct nvhost_ctrl_poll_fd_trigger_event_args {
++    int32_t  fd;
++    uint32_t id;
++    uint32_t thresh;
++    uint32_t padding;
++};
++
++#define NVHOST_IOCTL_CTRL_SYNCPT_READ        \
++    _IOWR(NVHOST_IOCTL_MAGIC, 1, struct nvhost_ctrl_syncpt_read_args)
++#define NVHOST_IOCTL_CTRL_SYNCPT_INCR        \
++    _IOW(NVHOST_IOCTL_MAGIC, 2, struct nvhost_ctrl_syncpt_incr_args)
++#define NVHOST_IOCTL_CTRL_SYNCPT_WAIT        \
++    _IOW(NVHOST_IOCTL_MAGIC, 3, struct nvhost_ctrl_syncpt_wait_args)
++
++#define NVHOST_IOCTL_CTRL_MODULE_MUTEX        \
++    _IOWR(NVHOST_IOCTL_MAGIC, 4, struct nvhost_ctrl_module_mutex_args)
++#define NVHOST32_IOCTL_CTRL_MODULE_REGRDWR    \
++    _IOWR(NVHOST_IOCTL_MAGIC, 5, struct nvhost32_ctrl_module_regrdwr_args)
++
++#define NVHOST_IOCTL_CTRL_SYNCPT_WAITEX        \
++    _IOWR(NVHOST_IOCTL_MAGIC, 6, struct nvhost_ctrl_syncpt_waitex_args)
++
++#define NVHOST_IOCTL_CTRL_GET_VERSION    \
++    _IOR(NVHOST_IOCTL_MAGIC, 7, struct nvhost_get_param_args)
++
++#define NVHOST_IOCTL_CTRL_SYNCPT_READ_MAX    \
++    _IOWR(NVHOST_IOCTL_MAGIC, 8, struct nvhost_ctrl_syncpt_read_args)
++
++#define NVHOST_IOCTL_CTRL_SYNCPT_WAITMEX    \
++    _IOWR(NVHOST_IOCTL_MAGIC, 9, struct nvhost_ctrl_syncpt_waitmex_args)
++
++#define NVHOST32_IOCTL_CTRL_SYNC_FENCE_CREATE    \
++    _IOWR(NVHOST_IOCTL_MAGIC, 10, struct nvhost32_ctrl_sync_fence_create_args)
++#define NVHOST_IOCTL_CTRL_SYNC_FENCE_CREATE    \
++    _IOWR(NVHOST_IOCTL_MAGIC, 11, struct nvhost_ctrl_sync_fence_create_args)
++#define NVHOST_IOCTL_CTRL_MODULE_REGRDWR    \
++    _IOWR(NVHOST_IOCTL_MAGIC, 12, struct nvhost_ctrl_module_regrdwr_args)
++#define NVHOST_IOCTL_CTRL_SYNC_FENCE_SET_NAME  \
++    _IOWR(NVHOST_IOCTL_MAGIC, 13, struct nvhost_ctrl_sync_fence_name_args)
++#define NVHOST_IOCTL_CTRL_GET_CHARACTERISTICS  \
++    _IOWR(NVHOST_IOCTL_MAGIC, 14, struct nvhost_ctrl_get_characteristics)
++#define NVHOST_IOCTL_CTRL_CHECK_MODULE_SUPPORT  \
++    _IOWR(NVHOST_IOCTL_MAGIC, 15, struct nvhost_ctrl_check_module_support_args)
++#define NVHOST_IOCTL_CTRL_POLL_FD_CREATE    \
++    _IOR(NVHOST_IOCTL_MAGIC, 16, struct nvhost_ctrl_poll_fd_create_args)
++#define NVHOST_IOCTL_CTRL_POLL_FD_TRIGGER_EVENT        \
++    _IOW(NVHOST_IOCTL_MAGIC, 17, struct nvhost_ctrl_poll_fd_trigger_event_args)
++
++#define NVHOST_IOCTL_CTRL_LAST            \
++    _IOC_NR(NVHOST_IOCTL_CTRL_POLL_FD_TRIGGER_EVENT)
++#define NVHOST_IOCTL_CTRL_MAX_ARG_SIZE    \
++    sizeof(struct nvhost_ctrl_syncpt_waitmex_args)
++
++#endif /* AVUTIL_NVHOST_IOCTL_H */
+diff --git a/libavutil/nvmap_ioctl.h b/libavutil/nvmap_ioctl.h
+new file mode 100644
+index 0000000000..55e0bea4dc
+--- /dev/null
++++ b/libavutil/nvmap_ioctl.h
+@@ -0,0 +1,451 @@
++/*
++ * include/uapi/linux/nvmap.h
++ *
++ * structure declarations for nvmem and nvmap user-space ioctls
++ *
++ * Copyright (c) 2009-2020, NVIDIA CORPORATION. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ */
++
++#ifndef __SWITCH__
++#include <linux/ioctl.h>
++#include <linux/types.h>
++#else
++#   include <switch.h>
++
++#   define _IO       _NV_IO
++#   define _IOR      _NV_IOR
++#   define _IOW      _NV_IOW
++#   define _IOWR     _NV_IOWR
++
++#   define _IOC_DIR  _NV_IOC_DIR
++#   define _IOC_TYPE _NV_IOC_TYPE
++#   define _IOC_NR   _NV_IOC_NR
++#   define _IOC_SIZE _NV_IOC_SIZE
++#endif
++
++#ifndef AVUTIL_NVMAP_IOCTL_H
++#define AVUTIL_NVMAP_IOCTL_H
++
++/*
++ * From linux-headers nvidia/include/linux/nvmap.h
++ */
++#define NVMAP_HEAP_IOVMM   (1ul<<30)
++
++/* common carveout heaps */
++#define NVMAP_HEAP_CARVEOUT_IRAM    (1ul<<29)
++#define NVMAP_HEAP_CARVEOUT_VPR     (1ul<<28)
++#define NVMAP_HEAP_CARVEOUT_TSEC    (1ul<<27)
++#define NVMAP_HEAP_CARVEOUT_VIDMEM  (1ul<<26)
++#define NVMAP_HEAP_CARVEOUT_IVM     (1ul<<1)
++#define NVMAP_HEAP_CARVEOUT_GENERIC (1ul<<0)
++
++#define NVMAP_HEAP_CARVEOUT_MASK    (NVMAP_HEAP_IOVMM - 1)
++
++/* allocation flags */
++#define NVMAP_HANDLE_UNCACHEABLE     (0x0ul << 0)
++#define NVMAP_HANDLE_WRITE_COMBINE   (0x1ul << 0)
++#define NVMAP_HANDLE_INNER_CACHEABLE (0x2ul << 0)
++#define NVMAP_HANDLE_CACHEABLE       (0x3ul << 0)
++#define NVMAP_HANDLE_CACHE_FLAG      (0x3ul << 0)
++
++#define NVMAP_HANDLE_SECURE          (0x1ul << 2)
++#define NVMAP_HANDLE_KIND_SPECIFIED  (0x1ul << 3)
++#define NVMAP_HANDLE_COMPR_SPECIFIED (0x1ul << 4)
++#define NVMAP_HANDLE_ZEROED_PAGES    (0x1ul << 5)
++#define NVMAP_HANDLE_PHYS_CONTIG     (0x1ul << 6)
++#define NVMAP_HANDLE_CACHE_SYNC      (0x1ul << 7)
++#define NVMAP_HANDLE_CACHE_SYNC_AT_RESERVE      (0x1ul << 8)
++#define NVMAP_HANDLE_RO	             (0x1ul << 9)
++
++/*
++ * DOC: NvMap Userspace API
++ *
++ * create a client by opening /dev/nvmap
++ * most operations handled via following ioctls
++ *
++ */
++enum {
++    NVMAP_HANDLE_PARAM_SIZE = 1,
++    NVMAP_HANDLE_PARAM_ALIGNMENT,
++    NVMAP_HANDLE_PARAM_BASE,
++    NVMAP_HANDLE_PARAM_HEAP,
++    NVMAP_HANDLE_PARAM_KIND,
++    NVMAP_HANDLE_PARAM_COMPR, /* ignored, to be removed */
++};
++
++enum {
++    NVMAP_CACHE_OP_WB = 0,
++    NVMAP_CACHE_OP_INV,
++    NVMAP_CACHE_OP_WB_INV,
++};
++
++enum {
++    NVMAP_PAGES_UNRESERVE = 0,
++    NVMAP_PAGES_RESERVE,
++    NVMAP_INSERT_PAGES_ON_UNRESERVE,
++    NVMAP_PAGES_PROT_AND_CLEAN,
++};
++
++#define NVMAP_ELEM_SIZE_U64 (1 << 31)
++
++struct nvmap_create_handle {
++    union {
++        struct {
++            union {
++                /* size will be overwritten */
++                uint32_t size; /* CreateHandle */
++                int32_t  fd;   /* DmaBufFd or FromFd */
++            };
++            uint32_t handle;   /* returns nvmap handle */
++        };
++        struct {
++            /* one is input parameter, and other is output parameter
++             * since its a union please note that input parameter
++             * will be overwritten once ioctl returns
++             */
++            union {
++                uint64_t ivm_id;     /* CreateHandle from ivm*/
++                int32_t  ivm_handle; /* Get ivm_id from handle */
++            };
++        };
++        struct {
++            union {
++                /* size64 will be overwritten */
++                uint64_t size64;   /* CreateHandle */
++                uint32_t handle64; /* returns nvmap handle */
++            };
++        };
++    };
++};
++
++struct nvmap_create_handle_from_va {
++    uint64_t va;                /* FromVA*/
++    uint32_t size;              /* non-zero for partial memory VMA. zero for end of VMA */
++    uint32_t flags;             /* wb/wc/uc/iwb, tag etc. */
++    union {
++        uint32_t handle;        /* returns nvmap handle */
++        uint64_t size64;        /* used when size is 0 */
++    };
++};
++
++struct nvmap_gup_test {
++    uint64_t va;       /* FromVA*/
++    uint32_t handle;   /* returns nvmap handle */
++    uint32_t result;   /* result=1 for pass, result=-err for failure */
++};
++
++struct nvmap_alloc_handle {
++    uint32_t handle;       /* nvmap handle */
++    uint32_t heap_mask;    /* heaps to allocate from */
++    uint32_t flags;        /* wb/wc/uc/iwb etc. */
++    uint32_t align;        /* min alignment necessary */
++};
++
++struct nvmap_alloc_ivm_handle {
++    uint32_t handle;       /* nvmap handle */
++    uint32_t heap_mask;    /* heaps to allocate from */
++    uint32_t flags;        /* wb/wc/uc/iwb etc. */
++    uint32_t align;        /* min alignment necessary */
++    uint32_t peer;         /* peer with whom handle must be shared. Used
++                           *  only for NVMAP_HEAP_CARVEOUT_IVM
++                           */
++};
++
++struct nvmap_alloc_kind_handle {
++    uint32_t handle;       /* nvmap handle */
++    uint32_t heap_mask;
++    uint32_t flags;
++    uint32_t align;
++    uint8_t  kind;
++    uint8_t  comp_tags;
++};
++
++struct nvmap_map_caller {
++    uint32_t handle;       /* nvmap handle */
++    uint32_t offset;       /* offset into hmem; should be page-aligned */
++    uint32_t length;       /* number of bytes to map */
++    uint32_t flags;        /* maps as wb/iwb etc. */
++    unsigned long addr;    /* user pointer */
++};
++
++#ifdef CONFIG_COMPAT
++struct nvmap_map_caller_32 {
++    uint32_t handle;       /* nvmap handle */
++    uint32_t offset;       /* offset into hmem; should be page-aligned */
++    uint32_t length;       /* number of bytes to map */
++    uint32_t flags;        /* maps as wb/iwb etc. */
++    uint32_t addr;         /* user pointer*/
++};
++#endif
++
++struct nvmap_rw_handle {
++    unsigned long addr;    /* user pointer*/
++    uint32_t handle;       /* nvmap handle */
++    uint32_t offset;       /* offset into hmem */
++    uint32_t elem_size;    /* individual atom size */
++    uint32_t hmem_stride;  /* delta in bytes between atoms in hmem */
++    uint32_t user_stride;  /* delta in bytes between atoms in user */
++    uint32_t count;        /* number of atoms to copy */
++};
++
++struct nvmap_rw_handle_64 {
++    unsigned long addr;    /* user pointer*/
++    uint32_t handle;       /* nvmap handle */
++    uint64_t offset;       /* offset into hmem */
++    uint64_t elem_size;    /* individual atom size */
++    uint64_t hmem_stride;  /* delta in bytes between atoms in hmem */
++    uint64_t user_stride;  /* delta in bytes between atoms in user */
++    uint64_t count;        /* number of atoms to copy */
++};
++
++#ifdef CONFIG_COMPAT
++struct nvmap_rw_handle_32 {
++    uint32_t addr;         /* user pointer */
++    uint32_t handle;       /* nvmap handle */
++    uint32_t offset;       /* offset into hmem */
++    uint32_t elem_size;    /* individual atom size */
++    uint32_t hmem_stride;  /* delta in bytes between atoms in hmem */
++    uint32_t user_stride;  /* delta in bytes between atoms in user */
++    uint32_t count;        /* number of atoms to copy */
++};
++#endif
++
++struct nvmap_pin_handle {
++    uint32_t *handles;         /* array of handles to pin/unpin */
++    unsigned long *addr;       /* array of addresses to return */
++    uint32_t count;            /* number of entries in handles */
++};
++
++#ifdef CONFIG_COMPAT
++struct nvmap_pin_handle_32 {
++    uint32_t handles;          /* array of handles to pin/unpin */
++    uint32_t addr;             /*  array of addresses to return */
++    uint32_t count;            /* number of entries in handles */
++};
++#endif
++
++struct nvmap_handle_param {
++    uint32_t handle;           /* nvmap handle */
++    uint32_t param;            /* size/align/base/heap etc. */
++    unsigned long result;      /* returns requested info*/
++};
++
++#ifdef CONFIG_COMPAT
++struct nvmap_handle_param_32 {
++    uint32_t handle;           /* nvmap handle */
++    uint32_t param;            /* size/align/base/heap etc. */
++    uint32_t result;           /* returns requested info*/
++};
++#endif
++
++struct nvmap_cache_op {
++    unsigned long addr;    /* user pointer*/
++    uint32_t handle;       /* nvmap handle */
++    uint32_t len;          /* bytes to flush */
++    int32_t  op;           /* wb/wb_inv/inv */
++};
++
++struct nvmap_cache_op_64 {
++    unsigned long addr;    /* user pointer*/
++    uint32_t handle;       /* nvmap handle */
++    uint64_t len;          /* bytes to flush */
++    int32_t  op;           /* wb/wb_inv/inv */
++};
++
++#ifdef CONFIG_COMPAT
++struct nvmap_cache_op_32 {
++    uint32_t addr;         /* user pointer*/
++    uint32_t handle;       /* nvmap handle */
++    uint32_t len;          /* bytes to flush */
++    int32_t  op;           /* wb/wb_inv/inv */
++};
++#endif
++
++struct nvmap_cache_op_list {
++    uint64_t handles;      /* Ptr to u32 type array, holding handles */
++    uint64_t offsets;      /* Ptr to u32 type array, holding offsets
++                           * into handle mem */
++    uint64_t sizes;        /* Ptr to u32 type array, holindg sizes of memory
++                           * regions within each handle */
++    uint32_t nr;           /* Number of handles */
++    int32_t  op;           /* wb/wb_inv/inv */
++};
++
++struct nvmap_debugfs_handles_header {
++    uint8_t version;
++};
++
++struct nvmap_debugfs_handles_entry {
++    uint64_t base;
++    uint64_t size;
++    uint32_t flags;
++    uint32_t share_count;
++    uint64_t mapped_size;
++};
++
++struct nvmap_set_tag_label {
++    uint32_t tag;
++    uint32_t len;          /* in: label length
++                           out: number of characters copied */
++    uint64_t addr;         /* in: pointer to label or NULL to remove */
++};
++
++struct nvmap_available_heaps {
++    uint64_t heaps;        /* heaps bitmask */
++};
++
++struct nvmap_heap_size {
++    uint32_t heap;
++    uint64_t size;
++};
++
++/**
++ * Struct used while querying heap parameters
++ */
++struct nvmap_query_heap_params {
++    uint32_t heap_mask;
++    uint32_t flags;
++    uint8_t contig;
++    uint64_t total;
++    uint64_t free;
++    uint64_t largest_free_block;
++};
++
++struct nvmap_handle_parameters {
++    uint8_t contig;
++    uint32_t import_id;
++    uint32_t handle;
++    uint32_t heap_number;
++    uint32_t access_flags;
++    uint64_t heap;
++    uint64_t align;
++    uint64_t coherency;
++    uint64_t size;
++};
++
++#define NVMAP_IOC_MAGIC 'N'
++
++/* Creates a new memory handle. On input, the argument is the size of the new
++ * handle; on return, the argument is the name of the new handle
++ */
++#define NVMAP_IOC_CREATE  _IOWR(NVMAP_IOC_MAGIC, 0, struct nvmap_create_handle)
++#define NVMAP_IOC_CREATE_64 \
++    _IOWR(NVMAP_IOC_MAGIC, 1, struct nvmap_create_handle)
++#define NVMAP_IOC_FROM_ID _IOWR(NVMAP_IOC_MAGIC, 2, struct nvmap_create_handle)
++
++/* Actually allocates memory for the specified handle */
++#define NVMAP_IOC_ALLOC    _IOW(NVMAP_IOC_MAGIC, 3, struct nvmap_alloc_handle)
++
++/* Frees a memory handle, unpinning any pinned pages and unmapping any mappings
++ */
++#define NVMAP_IOC_FREE       _IO(NVMAP_IOC_MAGIC, 4)
++
++/* Maps the region of the specified handle into a user-provided virtual address
++ * that was previously created via an mmap syscall on this fd */
++#define NVMAP_IOC_MMAP       _IOWR(NVMAP_IOC_MAGIC, 5, struct nvmap_map_caller)
++#ifdef CONFIG_COMPAT
++#define NVMAP_IOC_MMAP_32    _IOWR(NVMAP_IOC_MAGIC, 5, struct nvmap_map_caller_32)
++#endif
++
++/* Reads/writes data (possibly strided) from a user-provided buffer into the
++ * hmem at the specified offset */
++#define NVMAP_IOC_WRITE      _IOW(NVMAP_IOC_MAGIC, 6, struct nvmap_rw_handle)
++#define NVMAP_IOC_READ       _IOW(NVMAP_IOC_MAGIC, 7, struct nvmap_rw_handle)
++#ifdef CONFIG_COMPAT
++#define NVMAP_IOC_WRITE_32   _IOW(NVMAP_IOC_MAGIC, 6, struct nvmap_rw_handle_32)
++#define NVMAP_IOC_READ_32    _IOW(NVMAP_IOC_MAGIC, 7, struct nvmap_rw_handle_32)
++#endif
++#define NVMAP_IOC_WRITE_64 \
++    _IOW(NVMAP_IOC_MAGIC, 6, struct nvmap_rw_handle_64)
++#define NVMAP_IOC_READ_64 \
++    _IOW(NVMAP_IOC_MAGIC, 7, struct nvmap_rw_handle_64)
++
++#define NVMAP_IOC_PARAM _IOWR(NVMAP_IOC_MAGIC, 8, struct nvmap_handle_param)
++#ifdef CONFIG_COMPAT
++#define NVMAP_IOC_PARAM_32 _IOWR(NVMAP_IOC_MAGIC, 8, struct nvmap_handle_param_32)
++#endif
++
++/* Pins a list of memory handles into IO-addressable memory (either IOVMM
++ * space or physical memory, depending on the allocation), and returns the
++ * address. Handles may be pinned recursively. */
++#define NVMAP_IOC_PIN_MULT      _IOWR(NVMAP_IOC_MAGIC, 10, struct nvmap_pin_handle)
++#define NVMAP_IOC_UNPIN_MULT    _IOW(NVMAP_IOC_MAGIC, 11, struct nvmap_pin_handle)
++#ifdef CONFIG_COMPAT
++#define NVMAP_IOC_PIN_MULT_32   _IOWR(NVMAP_IOC_MAGIC, 10, struct nvmap_pin_handle_32)
++#define NVMAP_IOC_UNPIN_MULT_32 _IOW(NVMAP_IOC_MAGIC, 11, struct nvmap_pin_handle_32)
++#endif
++
++#define NVMAP_IOC_CACHE      _IOW(NVMAP_IOC_MAGIC, 12, struct nvmap_cache_op)
++#define NVMAP_IOC_CACHE_64   _IOW(NVMAP_IOC_MAGIC, 12, struct nvmap_cache_op_64)
++#ifdef CONFIG_COMPAT
++#define NVMAP_IOC_CACHE_32  _IOW(NVMAP_IOC_MAGIC, 12, struct nvmap_cache_op_32)
++#endif
++
++/* Returns a global ID usable to allow a remote process to create a handle
++ * reference to the same handle */
++#define NVMAP_IOC_GET_ID  _IOWR(NVMAP_IOC_MAGIC, 13, struct nvmap_create_handle)
++
++/* Returns a dma-buf fd usable to allow a remote process to create a handle
++ * reference to the same handle */
++#define NVMAP_IOC_SHARE  _IOWR(NVMAP_IOC_MAGIC, 14, struct nvmap_create_handle)
++
++/* Returns a file id that allows a remote process to create a handle
++ * reference to the same handle */
++#define NVMAP_IOC_GET_FD  _IOWR(NVMAP_IOC_MAGIC, 15, struct nvmap_create_handle)
++
++/* Create a new memory handle from file id passed */
++#define NVMAP_IOC_FROM_FD _IOWR(NVMAP_IOC_MAGIC, 16, struct nvmap_create_handle)
++
++/* Perform cache maintenance on a list of handles. */
++#define NVMAP_IOC_CACHE_LIST _IOW(NVMAP_IOC_MAGIC, 17,    \
++                  struct nvmap_cache_op_list)
++/* Perform reserve operation on a list of handles. */
++#define NVMAP_IOC_RESERVE _IOW(NVMAP_IOC_MAGIC, 18,    \
++                  struct nvmap_cache_op_list)
++
++#define NVMAP_IOC_FROM_IVC_ID _IOWR(NVMAP_IOC_MAGIC, 19, struct nvmap_create_handle)
++#define NVMAP_IOC_GET_IVC_ID _IOWR(NVMAP_IOC_MAGIC, 20, struct nvmap_create_handle)
++#define NVMAP_IOC_GET_IVM_HEAPS _IOR(NVMAP_IOC_MAGIC, 21, unsigned int)
++
++/* Create a new memory handle from VA passed */
++#define NVMAP_IOC_FROM_VA _IOWR(NVMAP_IOC_MAGIC, 22, struct nvmap_create_handle_from_va)
++
++#define NVMAP_IOC_GUP_TEST _IOWR(NVMAP_IOC_MAGIC, 23, struct nvmap_gup_test)
++
++/* Define a label for allocation tag */
++#define NVMAP_IOC_SET_TAG_LABEL    _IOW(NVMAP_IOC_MAGIC, 24, struct nvmap_set_tag_label)
++
++#define NVMAP_IOC_GET_AVAILABLE_HEAPS \
++    _IOR(NVMAP_IOC_MAGIC, 25, struct nvmap_available_heaps)
++
++#define NVMAP_IOC_GET_HEAP_SIZE \
++    _IOR(NVMAP_IOC_MAGIC, 26, struct nvmap_heap_size)
++
++#define NVMAP_IOC_PARAMETERS \
++    _IOR(NVMAP_IOC_MAGIC, 27, struct nvmap_handle_parameters)
++/* START of T124 IOCTLS */
++/* Actually allocates memory for the specified handle, with kind */
++#define NVMAP_IOC_ALLOC_KIND _IOW(NVMAP_IOC_MAGIC, 100, struct nvmap_alloc_kind_handle)
++
++/* Actually allocates memory from IVM heaps */
++#define NVMAP_IOC_ALLOC_IVM _IOW(NVMAP_IOC_MAGIC, 101, struct nvmap_alloc_ivm_handle)
++
++/* Allocate seperate memory for VPR */
++#define NVMAP_IOC_VPR_FLOOR_SIZE _IOW(NVMAP_IOC_MAGIC, 102, uint32_t)
++
++/* Get heap parameters such as total and frre size */
++#define NVMAP_IOC_QUERY_HEAP_PARAMS _IOR(NVMAP_IOC_MAGIC, 105, \
++        struct nvmap_query_heap_params)
++
++#define NVMAP_IOC_MAXNR (_IOC_NR(NVMAP_IOC_QUERY_HEAP_PARAMS))
++
++#endif /* AVUTIL_NVMAP_IOCTL_H */
+-- 
+2.45.1

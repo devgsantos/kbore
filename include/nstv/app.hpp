@@ -7,9 +7,12 @@
 #include "nstv/storage.hpp"
 #include "nstv/graphics.hpp"
 #include "nstv/image_cache.hpp"
+#include "nstv/player_backend.hpp"
+#include "nstv/player_backend_factory.hpp"
 #include "nstv/video_player.hpp"
 #include <set>
 #include <string>
+#include <memory>
 
 namespace nstv {
 
@@ -98,7 +101,7 @@ private:
   AppState state_;
   Graphics gfx_;
   ImageCache imageCache_;
-  VideoPlayer videoPlayer_;
+  std::unique_ptr<IPlayerBackend> player_;
 };
 
 } // namespace nstv

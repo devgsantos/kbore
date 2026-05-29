@@ -1,0 +1,21 @@
+[binaries]
+c = 'aarch64-none-elf-gcc'
+cpp = 'aarch64-none-elf-g++'
+ar = 'aarch64-none-elf-ar'
+strip = 'aarch64-none-elf-strip'
+pkgconfig = 'pkg-config'
+
+[host_machine]
+system = 'none'
+cpu_family = 'aarch64'
+cpu = 'cortex-a57'
+endian = 'little'
+
+[properties]
+needs_exe_wrapper = true
+
+[built-in options]
+c_args = ['-D__SWITCH__', '-I/opt/devkitpro/libnx/include', '-I/opt/devkitpro/portlibs/switch/include']
+cpp_args = ['-D__SWITCH__', '-I/opt/devkitpro/libnx/include', '-I/opt/devkitpro/portlibs/switch/include']
+c_link_args = ['-L/opt/devkitpro/libnx/lib', '-L/opt/devkitpro/portlibs/switch/lib', '-lnx']
+cpp_link_args = ['-L/opt/devkitpro/libnx/lib', '-L/opt/devkitpro/portlibs/switch/lib', '-lnx']

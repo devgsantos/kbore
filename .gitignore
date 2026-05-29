@@ -151,3 +151,5 @@ compile_commands.json
 
 *.bmp
 *.ppm
+
+external/ffmpeg-nx/

@@ -5,5 +5,8 @@
   "defaultXtreamUrl": "http://bmnew26.site?username=ven2xlvnpm02&password=55859910428",
   "pageSize": 30,
   "preloadThreshold": 8,
-  "useUnicodeIcons": false
+  "useUnicodeIcons": false,
+  "playerBackend": "native",
+  "fallbackPlayerBackend": "software",
+  "preferHardwareDecode": true
 }
