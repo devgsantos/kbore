@@ -69,6 +69,10 @@ public:
 
   bool openAudio(const NativeDemuxer &demuxer);
 
+  void startAudio();
+  void stopAudio();
+  int audioQueuedBytes() const;
+
   bool decodeFirstVideoFrame(NativeDemuxer &demuxer);
   bool decodeNextVideoFrame(NativeDemuxer &demuxer, bool outputFrame = true);
   bool dropNextVideoFrame(NativeDemuxer &demuxer);
@@ -118,7 +122,9 @@ private:
     AVPixelFormat hwPixelFormat,
     bool useHardware
   );
+  bool decodeAudioPacketToSdl(AVPacket *packet);
 #endif
+
 };
 
 } // namespace nstv

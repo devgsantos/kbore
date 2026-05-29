@@ -269,6 +269,8 @@ bool NativeHwPlayerBackend::open(const std::string &url) {
 
   syncClockFromLatestFrame();
 
+  decoder_.startAudio();
+
   error_.clear();
   open_ = true;
 
@@ -278,6 +280,7 @@ bool NativeHwPlayerBackend::open(const std::string &url) {
 
 void NativeHwPlayerBackend::close() {
 #ifdef NSTV_ENABLE_NATIVE_HW_PLAYER
+  decoder_.stopAudio();
   decoder_.close();
   demuxer_.close();
   hwProbe_.closeDevice();
@@ -366,8 +369,11 @@ void NativeHwPlayerBackend::togglePause() {
     Ao retomar, reinicia a base de tempo no frame atual.
     Isso evita que o player tente compensar o tempo parado.
   */
-  if (!paused_) {
+  if (paused_) {
+    decoder_.stopAudio();
+  } else {
     resetClockToCurrentFrame(nowMs());
+    decoder_.startAudio();
   }
 }
 
