@@ -53,13 +53,19 @@ private:
 
   long long playbackStartMs_ = 0;
   long long lastFrameWallMs_ = 0;
+  long long nextFrameDueMs_ = 0;
 
-  int fallbackFrameIntervalMs_ = 33;
+  int fallbackFrameIntervalMs_ = 40;
+  int currentFrameIntervalMs_ = 40;
+
+  int decodedFrames_ = 0;
 
   void resetClock();
   void syncClockFromLatestFrame();
   bool shouldDecodeNow(long long now) const;
-  bool isVideoLate(long long now) const;
+  void resetClockToCurrentFrame(long long now);
+  long long playbackDelayMs(long long now) const;
+  bool shouldDropFrames(long long now) const;
 };
 
 } // namespace nstv

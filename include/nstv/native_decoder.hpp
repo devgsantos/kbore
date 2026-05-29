@@ -70,7 +70,8 @@ public:
   bool openAudio(const NativeDemuxer &demuxer);
 
   bool decodeFirstVideoFrame(NativeDemuxer &demuxer);
-  bool decodeNextVideoFrame(NativeDemuxer &demuxer);
+  bool decodeNextVideoFrame(NativeDemuxer &demuxer, bool outputFrame = true);
+  bool dropNextVideoFrame(NativeDemuxer &demuxer);
 
   void close();
 

@@ -568,7 +568,7 @@ bool NativeDecoder::openAudio(const NativeDemuxer &demuxer) {
 #endif
 }
 
-bool NativeDecoder::decodeNextVideoFrame(NativeDemuxer &demuxer) {
+bool NativeDecoder::decodeNextVideoFrame(NativeDemuxer &demuxer, bool outputFrame) {
 #ifndef NSTV_USE_FFMPEG
   error_ = "NativeDecoder requires NSTV_USE_FFMPEG.";
   return false;
@@ -633,13 +633,66 @@ bool NativeDecoder::decodeNextVideoFrame(NativeDemuxer &demuxer) {
 
       AVStream *videoStream = format->streams[video_.streamIndex];
 
-      AVFrame *frameForProcessing = impl_->videoFrame;
       AVPixelFormat originalFormat = static_cast<AVPixelFormat>(impl_->videoFrame->format);
 
-      bool hardwareFrame = impl_->usingHardware && originalFormat == impl_->selectedHwPixelFormat;
+      bool hardwareFrame =
+        impl_->usingHardware &&
+        originalFormat == impl_->selectedHwPixelFormat;
+
+      bool hasHardwareContext =
+        hardwareFrame ||
+        impl_->videoFrame->hw_frames_ctx != nullptr;
+
+      /*
+        Frame info inicial usando o frame original.
+
+        Importante:
+        Se outputFrame=false, vamos atualizar o relógio/PTS e descartar
+        o frame SEM chamar av_hwframe_transfer_data().
+      */
+      NativeFrameInfo currentFrameInfo;
+
+      currentFrameInfo.decoded = true;
+      currentFrameInfo.streamIndex = video_.streamIndex;
+      currentFrameInfo.width = impl_->videoFrame->width;
+      currentFrameInfo.height = impl_->videoFrame->height;
+      currentFrameInfo.outputWidth = impl_->videoFrame->width;
+      currentFrameInfo.outputHeight = impl_->videoFrame->height;
+      currentFrameInfo.pixelFormat = pixelFormatName(originalFormat);
+      currentFrameInfo.ptsMs = framePtsMs(impl_->videoFrame, videoStream);
+      currentFrameInfo.hardwareFrame = hardwareFrame;
+      currentFrameInfo.transferredFromHardware = false;
+
+      latestFrameInfo_ = currentFrameInfo;
+
+      if (!firstVideoFrame_.decoded) {
+        firstVideoFrame_ = currentFrameInfo;
+      }
+
+      /*
+        Modo drop real.
+
+        Se outputFrame=false, este frame só serve para avançar o decoder.
+        Não fazemos:
+          - av_hwframe_transfer_data()
+          - sws_scale()
+          - cópia para YuvFrame
+
+        Isso é essencial para HD/FHD.
+      */
+      if (!outputFrame) {
+        av_frame_unref(impl_->videoFrame);
+        av_frame_unref(impl_->transferredFrame);
+
+        rebuildSummary();
+
+        return true;
+      }
+
+      AVFrame *frameForProcessing = impl_->videoFrame;
       bool transferredFromHardware = false;
 
-      if (hardwareFrame || impl_->videoFrame->hw_frames_ctx) {
+      if (hasHardwareContext) {
         av_frame_unref(impl_->transferredFrame);
 
         ret = av_hwframe_transfer_data(
@@ -662,7 +715,16 @@ bool NativeDecoder::decodeNextVideoFrame(NativeDemuxer &demuxer) {
       const int inputHeight = frameForProcessing->height;
       const AVPixelFormat inputFormat = static_cast<AVPixelFormat>(frameForProcessing->format);
 
-      NativeFrameInfo currentFrameInfo;
+      /*
+        Atualiza info depois da transferência.
+        Aqui o pixel format normalmente deve virar yuv420p/nv12/etc.
+      */
+      latestFrameInfo_.width = inputWidth;
+      latestFrameInfo_.height = inputHeight;
+      latestFrameInfo_.outputWidth = inputWidth;
+      latestFrameInfo_.outputHeight = inputHeight;
+      latestFrameInfo_.pixelFormat = pixelFormatName(inputFormat);
+      latestFrameInfo_.transferredFromHardware = transferredFromHardware;
 
       currentFrameInfo.decoded = true;
       currentFrameInfo.streamIndex = video_.streamIndex;
@@ -674,12 +736,6 @@ bool NativeDecoder::decodeNextVideoFrame(NativeDemuxer &demuxer) {
       currentFrameInfo.ptsMs = framePtsMs(impl_->videoFrame, videoStream);
       currentFrameInfo.hardwareFrame = hardwareFrame;
       currentFrameInfo.transferredFromHardware = transferredFromHardware;
-
-      latestFrameInfo_ = currentFrameInfo;
-
-      if (!firstVideoFrame_.decoded) {
-        firstVideoFrame_ = currentFrameInfo;
-      }
 
       AVFrame *frameForCopy = frameForProcessing;
 
@@ -813,7 +869,11 @@ bool NativeDecoder::decodeFirstVideoFrame(NativeDemuxer &demuxer) {
     return true;
   }
 
-  return decodeNextVideoFrame(demuxer);
+  return decodeNextVideoFrame(demuxer, true);
+}
+
+bool NativeDecoder::dropNextVideoFrame(NativeDemuxer &demuxer) {
+  return decodeNextVideoFrame(demuxer, false);
 }
 
 void NativeDecoder::close() {
