@@ -1,6 +1,6 @@
 #pragma once
 
-#include "nstv/graphics.hpp"
+#include "graphics.hpp"
 #include <string>
 
 namespace nstv {

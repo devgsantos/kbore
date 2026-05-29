@@ -33,7 +33,7 @@ long long nowMs() {
 }
 }
 
-App::App() : api_(loadConfig()), player_(std::make_unique<VideoPlayer>()) {
+App::App() : api_(loadConfig()), player_(createPlayerBackend()) {
   state_.config = loadConfig();
   api_ = ParserApiClient(state_.config);
   if (loadManifest(state_.manifest)) {
@@ -355,7 +355,7 @@ void App::playSelectedChannel() {
   render();
 
   if (!player_) {
-    player_ = std::make_unique<VideoPlayer>();
+    player_ = createPlayerBackend();
   }
 
   if (player_->open(channel->url)) {
