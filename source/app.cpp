@@ -33,7 +33,7 @@ long long nowMs() {
 }
 }
 
-App::App() : api_(loadConfig()) {
+App::App() : api_(loadConfig()), player_(std::make_unique<VideoPlayer>()) {
   state_.config = loadConfig();
   api_ = ParserApiClient(state_.config);
   if (loadManifest(state_.manifest)) {
@@ -83,14 +83,19 @@ void App::handle(Button button) {
       }
 
       if (button == Button::Back) {
-        videoPlayer_.close();
+        if (player_) {
+          player_->close();
+        }
+
         state_.screen = ScreenId::Dashboard;
         state_.message = "Playback stopped";
         state_.playerStarted = false;
         state_.playerFrameSeen = false;
       } else if (button == Button::Select) {
-        videoPlayer_.togglePause();
-        state_.message = videoPlayer_.isPaused() ? "Playback paused" : "Playback resumed";
+        if (player_) {
+          player_->togglePause();
+          state_.message = player_->isPaused() ? "Playback paused" : "Playback resumed";
+        }
       }
       break;
     case ScreenId::Settings:
@@ -346,13 +351,18 @@ void App::playSelectedChannel() {
   state_.playerStarted = false;
   state_.playerFrameSeen = false;
   state_.playerOverlayUntilMs = nowMs() + 5000;
+
   render();
 
-  if (videoPlayer_.open(channel->url)) {
+  if (!player_) {
+    player_ = std::make_unique<VideoPlayer>();
+  }
+
+  if (player_->open(channel->url)) {
     state_.message = "Playing: " + channel->name;
     state_.playerStarted = true;
   } else {
-    state_.message = "Player error: " + videoPlayer_.error();
+    state_.message = "Player error: " + player_->error();
   }
 }
 
@@ -601,66 +611,142 @@ void App::renderPlayerGraphic() {
   gfx_.fillRect(0, 0, Graphics::Width, Graphics::Height, rgb(0, 0, 0));
 
   bool hasFrame = false;
-  bool updated = false;
+  const bool isOpen = player_ && player_->isOpen();
+  const bool isPaused = player_ && player_->isPaused();
 
-  if (videoPlayer_.isOpen()) {
-    updated = videoPlayer_.update();
-    (void)updated;
+  if (isOpen) {
+    player_->update();
 
-    if (videoPlayer_.yuvFrame().valid()) {
+    if (player_->yuvFrame().valid()) {
       hasFrame = true;
-      gfx_.drawYuvFrame(videoPlayer_.yuvFrame(), 0, 0, Graphics::Width, Graphics::Height);
+
+      gfx_.drawYuvFrame(
+        player_->yuvFrame(),
+        0,
+        0,
+        Graphics::Width,
+        Graphics::Height
+      );
 
       if (!state_.playerFrameSeen) {
         state_.playerFrameSeen = true;
         state_.playerOverlayUntilMs = nowMs() + 5000;
       }
-    } else if (videoPlayer_.frame().valid()) {
+    } else if (player_->frame().valid()) {
       hasFrame = true;
-      gfx_.drawImage(videoPlayer_.frame(), 0, 0, Graphics::Width, Graphics::Height);
+
+      gfx_.drawImage(
+        player_->frame(),
+        0,
+        0,
+        Graphics::Width,
+        Graphics::Height
+      );
 
       if (!state_.playerFrameSeen) {
         state_.playerFrameSeen = true;
         state_.playerOverlayUntilMs = nowMs() + 5000;
       }
     } else {
-      gfx_.drawText("Loading...", 80, 320, 4, rgb(248,250,252), true);
+      gfx_.drawText("Loading...", 80, 320, 4, rgb(248, 250, 252), true);
     }
   } else {
-    gfx_.fillVerticalGradient(0, 0, Graphics::Width, Graphics::Height, rgb(7,11,22), rgb(2,5,11));
+    gfx_.fillVerticalGradient(
+      0,
+      0,
+      Graphics::Width,
+      Graphics::Height,
+      rgb(7, 11, 22),
+      rgb(2, 5, 11)
+    );
 
     if (channel) {
-      gfx_.drawText(Graphics::fitText(channel->name, 46), 80, 168, 4, rgb(248,250,252), true);
-      gfx_.drawText(Graphics::fitText(channel->url, 78), 80, 218, 2, rgb(150,163,190), false);
+      gfx_.drawText(
+        Graphics::fitText(channel->name, 46),
+        80,
+        168,
+        4,
+        rgb(248, 250, 252),
+        true
+      );
+
+      gfx_.drawText(
+        Graphics::fitText(channel->url, 78),
+        80,
+        218,
+        2,
+        rgb(150, 163, 190),
+        false
+      );
     }
 
-    std::string error = videoPlayer_.error().empty()
-      ? "Unable to start playback"
-      : videoPlayer_.error();
+    std::string error = player_ && !player_->error().empty()
+      ? player_->error()
+      : "Unable to start playback";
 
-    gfx_.drawText(Graphics::fitText(error, 88), 80, 290, 2, rgb(248, 113, 113), false);
+    gfx_.drawText(
+      Graphics::fitText(error, 88),
+      80,
+      290,
+      2,
+      rgb(248, 113, 113),
+      false
+    );
   }
 
   const bool showOverlay =
     !state_.playerFrameSeen ||
     nowMs() < state_.playerOverlayUntilMs ||
-    videoPlayer_.isPaused() ||
-    !videoPlayer_.isOpen();
+    isPaused ||
+    !isOpen;
 
   if (showOverlay) {
-    gfx_.fillHorizontalGradient(0, 0, Graphics::Width, 86, rgba(0,0,0,210), rgba(0,0,0,80));
-    gfx_.fillHorizontalGradient(0, Graphics::Height - 86, Graphics::Width, 86, rgba(0,0,0,80), rgba(0,0,0,220));
+    gfx_.fillHorizontalGradient(
+      0,
+      0,
+      Graphics::Width,
+      86,
+      rgba(0, 0, 0, 210),
+      rgba(0, 0, 0, 80)
+    );
+
+    gfx_.fillHorizontalGradient(
+      0,
+      Graphics::Height - 86,
+      Graphics::Width,
+      86,
+      rgba(0, 0, 0, 80),
+      rgba(0, 0, 0, 220)
+    );
 
     if (channel) {
-      gfx_.drawText(Graphics::fitText(channel->name, 50), 28, 22, 3, rgb(248,250,252), true);
+      gfx_.drawText(
+        Graphics::fitText(channel->name, 50),
+        28,
+        22,
+        3,
+        rgb(248, 250, 252),
+        true
+      );
+
+      if (player_) {
+        gfx_.drawText(
+          std::string("Backend: ") + player_->name(),
+          28,
+          52,
+          1,
+          rgb(150, 163, 190),
+          false
+        );
+      }
 
       std::string status;
 
-      if (videoPlayer_.isPaused()) {
+      if (isPaused) {
         status = "PAUSED";
-      } else if (videoPlayer_.isOpen() && hasFrame) {
+      } else if (isOpen && hasFrame) {
         status = "PLAYING";
-      } else if (videoPlayer_.isOpen()) {
+      } else if (isOpen) {
         status = "LOADING";
       } else {
         status = "ERROR";
@@ -671,7 +757,7 @@ void App::renderPlayerGraphic() {
         28,
         Graphics::Height - 58,
         2,
-        videoPlayer_.isOpen() ? rgb(57,220,35) : rgb(248,113,113),
+        isOpen ? rgb(57, 220, 35) : rgb(248, 113, 113),
         true
       );
     }
@@ -681,11 +767,11 @@ void App::renderPlayerGraphic() {
       Graphics::Width - 28,
       Graphics::Height - 58,
       2,
-      rgb(248,250,252),
+      rgb(248, 250, 252),
       true
     );
-  }}
-
+  }
+}
 
 void App::renderSettingsGraphic() {
   gfx_.drawText("SETTINGS", 80, 80, 7, rgb(248,250,252), true);
