@@ -14,7 +14,7 @@ APP_AUTHOR   := Gilson Santos / OpenAI
 APP_VERSION  := 0.3.0
 
 ARCH := -march=armv8-a -mtune=cortex-a57 -mtp=soft -fPIE
-CFLAGS   = -g -Wall -O2 -ffunction-sections $(ARCH) $(DEFINES) -D__SWITCH__ -DNSTV_USE_SDL -DNSTV_USE_SDL_TTF -DNSTV_USE_SDL_IMAGE $(FFMPEG_DEFINES)
+CFLAGS   = -g -Wall -O2 -ffunction-sections $(ARCH) $(DEFINES) -D__SWITCH__ -DNSTV_USE_SDL -DNSTV_USE_SDL_TTF -DNSTV_USE_SDL_IMAGE -DNSTV_ENABLE_NATIVE_HW_PLAYER $(FFMPEG_DEFINES)
 CXXFLAGS = $(CFLAGS) -std=c++17 -fno-rtti -fexceptions
 ASFLAGS  := -g $(ARCH)
 LDFLAGS  := -specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
@@ -22,13 +22,21 @@ LDFLAGS  := -specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir 
 PORTLIBS := $(DEVKITPRO)/portlibs/switch
 LIBNX    := $(DEVKITPRO)/libnx
 
+PLAYER_SDK := $(CURDIR)/external/player-sdk
+PLAYER_SDK_INC := $(PLAYER_SDK)/include
+PLAYER_SDK_LIB := $(PLAYER_SDK)/lib
+
 FFMPEG_AVAILABLE := $(wildcard $(PORTLIBS)/lib/libavformat.a)
 ifeq ($(FFMPEG_AVAILABLE),)
 FFMPEG_DEFINES :=
 FFMPEG_LIBS :=
 else
 FFMPEG_DEFINES := -DNSTV_USE_FFMPEG
-FFMPEG_LIBS := -lavformat -lavcodec -lavutil -lswscale -lswresample -lz -lbz2 -llzma -lm
+FFMPEG_LIBS := -lavformat -lavcodec -lswscale -lswresample -lavutil \
+        -lSDL2_image -lSDL2_ttf -lSDL2 \
+        -lfreetype -lpng -ljpeg -lwebp \
+        -lcurl -lmbedtls -lmbedx509 -lmbedcrypto \
+        -lz -lbz2 -llzma -lnx
 endif
 
 LIBS := \
@@ -82,10 +90,12 @@ export OFILES_SRC := $(CPPFILES:.cpp=.o) $(CFILES:.c=.o) $(SFILES:.s=.o)
 export OFILES := $(OFILES_BIN) $(OFILES_SRC)
 export HFILES_BIN := $(addsuffix .h,$(subst .,_,$(BINFILES)))
 
-export INCLUDE := $(foreach dir,$(INCLUDES),-I$(CURDIR)/$(dir)) \
+export INCLUDE := -I$(PLAYER_SDK_INC) \
+                  $(foreach dir,$(INCLUDES),-I$(CURDIR)/$(dir)) \
                   $(foreach dir,$(LIBDIRS),-I$(dir)/include) \
                   -I$(CURDIR)/$(BUILD)
-export LIBPATHS := $(foreach dir,$(LIBDIRS),-L$(dir)/lib)
+export LIBPATHS := -L$(PLAYER_SDK_LIB) \
+                   $(foreach dir,$(LIBDIRS),-L$(dir)/lib)
 
 .PHONY: $(BUILD) clean all
 

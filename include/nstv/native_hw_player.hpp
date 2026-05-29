@@ -3,7 +3,9 @@
 #include "nstv/player_backend.hpp"
 #include "nstv/native_demuxer.hpp"
 #include "nstv/native_decoder.hpp"
+#include "nstv/native_hw_device.hpp"
 
+#include <cstdint>
 #include <string>
 
 namespace nstv {
@@ -28,7 +30,7 @@ public:
   const std::string &error() const override { return error_; }
   const std::string &url() const override { return url_; }
 
-  const char *name() const override { return "Native Video Loop Player"; }
+  const char *name() const override { return "Native NVTEGRA HW Player"; }
 
 private:
   bool open_ = false;
@@ -42,6 +44,22 @@ private:
 
   NativeDemuxer demuxer_;
   NativeDecoder decoder_;
+  NativeHwDeviceProbe hwProbe_;
+
+  bool clockStarted_ = false;
+
+  int64_t firstPtsMs_ = -1;
+  int64_t lastPtsMs_ = -1;
+
+  long long playbackStartMs_ = 0;
+  long long lastFrameWallMs_ = 0;
+
+  int fallbackFrameIntervalMs_ = 33;
+
+  void resetClock();
+  void syncClockFromLatestFrame();
+  bool shouldDecodeNow(long long now) const;
+  bool isVideoLate(long long now) const;
 };
 
 } // namespace nstv

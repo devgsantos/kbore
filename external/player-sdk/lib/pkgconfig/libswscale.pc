@@ -1,0 +1,14 @@
+prefix=/home/gilson/Documentos/Repos/nstv-native/apps/nstv-native/external/player-sdk
+exec_prefix=${prefix}
+libdir=/home/gilson/Documentos/Repos/nstv-native/apps/nstv-native/external/player-sdk/lib
+includedir=/home/gilson/Documentos/Repos/nstv-native/apps/nstv-native/external/player-sdk/include
+
+Name: libswscale
+Description: FFmpeg image rescaling library
+Version: 8.1.100
+Requires: libavutil >= 59.8.100
+Requires.private: 
+Conflicts:
+Libs: -L${libdir}  -lswscale -lm
+Libs.private: 
+Cflags: -I${includedir}
