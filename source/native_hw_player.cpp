@@ -13,70 +13,93 @@ bool NativeHwPlayerBackend::open(const std::string &url) {
 
   url_ = url;
   paused_ = false;
+  error_.clear();
+  yuvFrame_ = YuvFrame{};
 
 #ifndef NSTV_ENABLE_NATIVE_HW_PLAYER
   error_ =
     "Native hardware player is not enabled. "
-    "Build with NSTV_ENABLE_NATIVE_HW_PLAYER after the native backend is implemented.";
+    "Build with NSTV_ENABLE_NATIVE_HW_PLAYER to run the native video loop.";
 
   open_ = false;
   return false;
 #else
-  /*
-    Próxima etapa real:
+  if (!demuxer_.open(url)) {
+    error_ = demuxer_.error();
+    open_ = false;
+    return false;
+  }
 
-    Aqui entra o pipeline nativo:
+  if (!decoder_.openVideo(demuxer_)) {
+    error_ = decoder_.error();
+    open_ = false;
+    return false;
+  }
 
-    1. Abrir URL
-    2. Inicializar FFmpeg custom / demuxer
-    3. Inicializar decoder hardware
-    4. Inicializar deko3d renderer
-    5. Inicializar audio sink nativo ou SDL fallback
-    6. Iniciar playback
+  if (!decoder_.openAudio(demuxer_)) {
+    error_ = decoder_.error();
+    open_ = false;
+    return false;
+  }
 
-    Por enquanto este backend existe apenas como ponto seguro
-    de integração, sem quebrar o player atual.
-  */
+  if (!decoder_.decodeFirstVideoFrame(demuxer_)) {
+    error_ = decoder_.error();
+    open_ = false;
+    return false;
+  }
 
-  error_ =
-    "Native hardware player backend is enabled, but the implementation is not connected yet.";
+  yuvFrame_ = decoder_.latestYuvFrame();
 
-  open_ = false;
-  return false;
+  if (!yuvFrame_.valid()) {
+    error_ = "Native first frame was decoded, but YuvFrame is invalid: " + decoder_.summary();
+    open_ = false;
+    return false;
+  }
+
+  error_.clear();
+  open_ = true;
+
+  return true;
 #endif
 }
 
 void NativeHwPlayerBackend::close() {
 #ifdef NSTV_ENABLE_NATIVE_HW_PLAYER
-  /*
-    Futuro cleanup:
-
-    - parar thread de demux/decode
-    - liberar decoder hardware
-    - liberar texturas/surfaces deko3d
-    - parar audio sink
-    - fechar input
-  */
+  decoder_.close();
+  demuxer_.close();
 #endif
 
   open_ = false;
   paused_ = false;
   url_.clear();
+  error_.clear();
+  yuvFrame_ = YuvFrame{};
 }
 
 bool NativeHwPlayerBackend::update() {
-#ifdef NSTV_ENABLE_NATIVE_HW_PLAYER
-  /*
-    Futuro update:
-
-    - bombear eventos do player
-    - atualizar estado
-    - processar fim de stream
-    - processar erros assíncronos
-  */
-#endif
-
+#ifndef NSTV_ENABLE_NATIVE_HW_PLAYER
   return false;
+#else
+  if (!open_ || paused_) {
+    return hasFrame();
+  }
+
+  if (decoder_.decodeNextVideoFrame(demuxer_)) {
+    yuvFrame_ = decoder_.latestYuvFrame();
+    error_.clear();
+    return true;
+  }
+
+  /*
+    Não derruba o player imediatamente se falhar um frame.
+    IPTV pode ter pequenos buracos de leitura.
+    Mantemos o último frame na tela.
+  */
+
+  error_ = decoder_.error();
+
+  return hasFrame();
+#endif
 }
 
 void NativeHwPlayerBackend::togglePause() {
@@ -85,16 +108,6 @@ void NativeHwPlayerBackend::togglePause() {
   }
 
   paused_ = !paused_;
-
-#ifdef NSTV_ENABLE_NATIVE_HW_PLAYER
-  /*
-    Futuro pause/resume:
-
-    - pausar decoder/demux
-    - pausar audio sink
-    - manter último frame renderizado
-  */
-#endif
 }
 
 } // namespace nstv

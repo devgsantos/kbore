@@ -1,6 +1,9 @@
 #pragma once
 
 #include "nstv/player_backend.hpp"
+#include "nstv/native_demuxer.hpp"
+#include "nstv/native_decoder.hpp"
+
 #include <string>
 
 namespace nstv {
@@ -17,15 +20,15 @@ public:
 
   bool isOpen() const override { return open_; }
   bool isPaused() const override { return paused_; }
-  bool hasFrame() const override { return false; }
+  bool hasFrame() const override { return yuvFrame_.valid(); }
 
   const Bitmap &frame() const override { return emptyFrame_; }
-  const YuvFrame &yuvFrame() const override { return emptyYuvFrame_; }
+  const YuvFrame &yuvFrame() const override { return yuvFrame_; }
 
   const std::string &error() const override { return error_; }
   const std::string &url() const override { return url_; }
 
-  const char *name() const override { return "Native HW Player"; }
+  const char *name() const override { return "Native Video Loop Player"; }
 
 private:
   bool open_ = false;
@@ -35,7 +38,10 @@ private:
   std::string error_;
 
   Bitmap emptyFrame_;
-  YuvFrame emptyYuvFrame_;
+  YuvFrame yuvFrame_;
+
+  NativeDemuxer demuxer_;
+  NativeDecoder decoder_;
 };
 
 } // namespace nstv

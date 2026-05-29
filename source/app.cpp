@@ -31,6 +31,102 @@ long long nowMs() {
     clock::now().time_since_epoch()
   ).count();
 }
+
+std::vector<std::string> wrapText(const std::string &text, std::size_t maxCharsPerLine) {
+  std::vector<std::string> lines;
+
+  if (text.empty()) {
+    return lines;
+  }
+
+  std::string current;
+  std::string word;
+
+  auto flushWord = [&]() {
+    if (word.empty()) {
+      return;
+    }
+
+    if (word.size() > maxCharsPerLine) {
+      if (!current.empty()) {
+        lines.push_back(current);
+        current.clear();
+      }
+
+      for (std::size_t i = 0; i < word.size(); i += maxCharsPerLine) {
+        lines.push_back(word.substr(i, maxCharsPerLine));
+      }
+
+      word.clear();
+      return;
+    }
+
+    if (current.empty()) {
+      current = word;
+    } else if (current.size() + 1 + word.size() <= maxCharsPerLine) {
+      current += " ";
+      current += word;
+    } else {
+      lines.push_back(current);
+      current = word;
+    }
+
+    word.clear();
+  };
+
+  for (char ch : text) {
+    if (ch == ' ' || ch == '\n' || ch == '\t') {
+      flushWord();
+
+      if (ch == '\n' && !current.empty()) {
+        lines.push_back(current);
+        current.clear();
+      }
+
+      continue;
+    }
+
+    word.push_back(ch);
+  }
+
+  flushWord();
+
+  if (!current.empty()) {
+    lines.push_back(current);
+  }
+
+  return lines;
+}
+
+void drawWrappedText(
+  Graphics &gfx,
+  const std::string &text,
+  int x,
+  int y,
+  int maxLines,
+  std::size_t maxCharsPerLine,
+  int scale,
+  Color color,
+  bool bold = false
+) {
+  const std::vector<std::string> lines = wrapText(text, maxCharsPerLine);
+
+  const int lineHeight = scale <= 1 ? 14 : 18;
+
+  for (int i = 0; i < maxLines && i < static_cast<int>(lines.size()); ++i) {
+    std::string line = lines[static_cast<std::size_t>(i)];
+
+    if (i == maxLines - 1 && static_cast<int>(lines.size()) > maxLines) {
+      if (line.size() > 3) {
+        line = line.substr(0, line.size() - 3) + "...";
+      } else {
+        line += "...";
+      }
+    }
+
+    gfx.drawText(line, x, y + i * lineHeight, scale, color, bold);
+  }
+}
 }
 
 App::App() : api_(loadConfig()), player_(createPlayerBackend()) {
@@ -648,7 +744,7 @@ void App::renderPlayerGraphic() {
         state_.playerOverlayUntilMs = nowMs() + 5000;
       }
     } else {
-      gfx_.drawText("Loading...", 80, 320, 4, rgb(248, 250, 252), true);
+      gfx_.drawText("Loading...", 80, 320, 3, rgb(248, 250, 252), true);
     }
   } else {
     gfx_.fillVerticalGradient(
@@ -662,19 +758,19 @@ void App::renderPlayerGraphic() {
 
     if (channel) {
       gfx_.drawText(
-        Graphics::fitText(channel->name, 46),
-        80,
-        168,
-        4,
+        Graphics::fitText(channel->name, 44),
+        64,
+        92,
+        3,
         rgb(248, 250, 252),
         true
       );
 
       gfx_.drawText(
-        Graphics::fitText(channel->url, 78),
-        80,
-        218,
-        2,
+        Graphics::fitText(channel->url, 92),
+        64,
+        136,
+        1,
         rgb(150, 163, 190),
         false
       );
@@ -684,12 +780,52 @@ void App::renderPlayerGraphic() {
       ? player_->error()
       : "Unable to start playback";
 
+    gfx_.fillRoundRect(
+      56,
+      190,
+      Graphics::Width - 112,
+      330,
+      18,
+      rgba(15, 23, 42, 210)
+    );
+
+    gfx_.strokeRoundRect(
+      56,
+      190,
+      Graphics::Width - 112,
+      330,
+      18,
+      rgba(72, 92, 128, 50),
+      1
+    );
+
     gfx_.drawText(
-      Graphics::fitText(error, 88),
+      "Player diagnostic",
       80,
-      290,
+      214,
       2,
-      rgb(248, 113, 113),
+      rgb(248, 250, 252),
+      true
+    );
+
+    drawWrappedText(
+      gfx_,
+      error,
+      80,
+      252,
+      10,
+      112,
+      1,
+      rgb(203, 213, 225),
+      false
+    );
+
+    gfx_.drawText(
+      "Tip: this screen is currently showing decoder probe information.",
+      80,
+      548,
+      1,
+      rgb(148, 163, 184),
       false
     );
   }
@@ -700,31 +836,31 @@ void App::renderPlayerGraphic() {
     isPaused ||
     !isOpen;
 
-  if (showOverlay) {
+  if (showOverlay && isOpen) {
     gfx_.fillHorizontalGradient(
       0,
       0,
       Graphics::Width,
-      86,
+      76,
       rgba(0, 0, 0, 210),
       rgba(0, 0, 0, 80)
     );
 
     gfx_.fillHorizontalGradient(
       0,
-      Graphics::Height - 86,
+      Graphics::Height - 76,
       Graphics::Width,
-      86,
+      76,
       rgba(0, 0, 0, 80),
       rgba(0, 0, 0, 220)
     );
 
     if (channel) {
       gfx_.drawText(
-        Graphics::fitText(channel->name, 50),
+        Graphics::fitText(channel->name, 54),
         28,
-        22,
-        3,
+        18,
+        2,
         rgb(248, 250, 252),
         true
       );
@@ -733,7 +869,7 @@ void App::renderPlayerGraphic() {
         gfx_.drawText(
           std::string("Backend: ") + player_->name(),
           28,
-          52,
+          46,
           1,
           rgb(150, 163, 190),
           false
@@ -755,8 +891,8 @@ void App::renderPlayerGraphic() {
       gfx_.drawText(
         status,
         28,
-        Graphics::Height - 58,
-        2,
+        Graphics::Height - 50,
+        1,
         isOpen ? rgb(57, 220, 35) : rgb(248, 113, 113),
         true
       );
@@ -765,8 +901,8 @@ void App::renderPlayerGraphic() {
     gfx_.drawTextRight(
       "A PAUSE/RESUME   B BACK",
       Graphics::Width - 28,
-      Graphics::Height - 58,
-      2,
+      Graphics::Height - 50,
+      1,
       rgb(248, 250, 252),
       true
     );
