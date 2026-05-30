@@ -6,7 +6,7 @@ APP_ROOT := $(abspath $(dir $(firstword $(MAKEFILE_LIST))))
 
 include $(DEVKITPRO)/libnx/switch_rules
 
-TARGET       := nstv-native
+TARGET       := kbore
 BUILD        := build-switch
 SOURCES      := source
 DATA         := data

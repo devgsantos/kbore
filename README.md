@@ -502,6 +502,7 @@ CFLAGS := -g -Wall -O2 -ffunction-sections $(ARCH) $(DEFINES) -D__SWITCH__ -DNST
 ```bash
 cd ~/nstv-native
 
+find . -exec touch {} \;
 make clean
 make switch
 ```
@@ -572,7 +573,7 @@ confira:
 Para a fonte Open Sans funcionar no Switch:
 
 ```text
-sdmc:/switch/nstv/fonts/OpenSans-Regular.ttf
+sdmc:/switch/kbore/fonts/OpenSans-Regular.ttf
 ```
 
 ou:

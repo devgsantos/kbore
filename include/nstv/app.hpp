@@ -17,7 +17,7 @@
 namespace nstv {
 
 enum class ScreenId { Dashboard, Playlists, AddPlaylist, Player, Settings };
-enum class FocusColumn { Types, Categories, Channels };
+enum class FocusColumn { Playlist, Types, Categories, Channels };
 
 struct AppState {
   ScreenId screen = ScreenId::Dashboard;
@@ -39,6 +39,8 @@ struct AppState {
 
   std::set<std::string> favorites;
   std::string message;
+  bool loading = false;
+  std::string loadingMessage;
   bool running = true;
 
   long long playerOverlayUntilMs = 0;
@@ -59,12 +61,21 @@ private:
   void renderAddPlaylistGraphic();
   void renderPlayerGraphic();
   void renderSettingsGraphic();
+  void renderLoadingOverlay(const std::string &message);
   void renderAddPlaylist();
   void renderPlayer();
   void renderSettings();
   void handle(Button button);
   void handleDashboard(Button button);
   void handleAddPlaylist(Button button);
+
+  const PlaylistConfig *activePlaylist() const;
+  std::string activePlaylistName() const;
+  void activatePlaylist(int index);
+  void importPlaylist(const PlaylistConfig &playlist);
+  void addM3uPlaylist();
+  void addXtreamPlaylist();
+  void deletePlaylist(int index);
 
   void importM3u();
   void importXtream();

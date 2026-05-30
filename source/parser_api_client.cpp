@@ -8,7 +8,7 @@ ParserApiClient::ParserApiClient(Config config) : config_(std::move(config)) {}
 
 std::string ParserApiClient::endpoint(const std::string &path) const {
   if (config_.parserApiBaseUrl.empty()) {
-    throw std::runtime_error("Parser API base URL is empty. Configure /switch/nstv/config.json");
+    throw std::runtime_error("Internal parser API base URL is empty.");
   }
   return config_.parserApiBaseUrl + path;
 }

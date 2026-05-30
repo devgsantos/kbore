@@ -13,6 +13,7 @@ bool loadManifest(Manifest &manifest);
 
 std::string cacheDir();
 std::string channelPageCachePath(
+  const std::string &playlistId,
   Provider provider,
   StreamType type,
   const std::string &categoryId,
@@ -20,6 +21,7 @@ std::string channelPageCachePath(
 );
 
 bool saveChannelPage(
+  const std::string &playlistId,
   Provider provider,
   StreamType type,
   const std::string &categoryId,
@@ -27,6 +29,7 @@ bool saveChannelPage(
 );
 
 bool loadChannelPage(
+  const std::string &playlistId,
   Provider provider,
   StreamType type,
   const std::string &categoryId,

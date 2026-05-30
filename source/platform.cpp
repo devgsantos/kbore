@@ -1,6 +1,7 @@
 #include "nstv/platform.hpp"
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <iostream>
 #include <thread>
 #include <chrono>
@@ -173,5 +174,74 @@ void presentScreen() {
 void sleepMs(int ms) {
   std::this_thread::sleep_for(std::chrono::milliseconds(ms));
 }
+
+
+std::string requestTextInput(const std::string &title, const std::string &initialValue, int maxLength) {
+  if (maxLength < 1) {
+    maxLength = 1;
+  }
+
+#ifdef __SWITCH__
+  SwkbdConfig swkbd;
+  char buffer[1024] = {};
+
+  std::string initial = initialValue;
+  if (static_cast<int>(initial.size()) >= static_cast<int>(sizeof(buffer))) {
+    initial = initial.substr(0, sizeof(buffer) - 1);
+  }
+
+  std::strncpy(buffer, initial.c_str(), sizeof(buffer) - 1);
+
+  if (R_FAILED(swkbdCreate(&swkbd, 0))) {
+    return initialValue;
+  }
+
+  swkbdConfigMakePresetDefault(&swkbd);
+  swkbdConfigSetHeaderText(&swkbd, title.c_str());
+  swkbdConfigSetGuideText(&swkbd, title.c_str());
+  swkbdConfigSetInitialText(&swkbd, initial.c_str());
+  swkbdConfigSetStringLenMax(&swkbd, static_cast<u32>(std::min(maxLength, 1023)));
+
+  Result rc = swkbdShow(&swkbd, buffer, sizeof(buffer));
+
+  swkbdClose(&swkbd);
+
+  if (R_FAILED(rc)) {
+    return "";
+  }
+
+  return std::string(buffer);
+#else
+#ifdef NSTV_USE_SDL
+  // Host preview fallback. Input is typed in the terminal running the app.
+  std::cout << title;
+
+  if (!initialValue.empty()) {
+    std::cout << " [" << initialValue << "]";
+  }
+
+  std::cout << ": " << std::flush;
+
+  std::string value;
+  std::getline(std::cin, value);
+
+  if (value.empty()) {
+    return initialValue;
+  }
+
+  if (static_cast<int>(value.size()) > maxLength) {
+    value = value.substr(0, static_cast<std::size_t>(maxLength));
+  }
+
+  return value;
+#else
+  std::cout << title << ": " << std::flush;
+  std::string value;
+  std::getline(std::cin, value);
+  return value.empty() ? initialValue : value;
+#endif
+#endif
+}
+
 
 } // namespace nstv

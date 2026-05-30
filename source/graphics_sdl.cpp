@@ -238,11 +238,11 @@ const char *firstExistingFont() {
     "sdmc:/switch/nstv-native/fonts/Roboto-Medium.ttf",
     "sdmc:/switch/nstv-native/fonts/DejaVuSans.ttf",
 
-    "sdmc:/switch/nstv/fonts/OpenSans-Regular.ttf",
-    "sdmc:/switch/nstv/fonts/OpenSans-SemiBold.ttf",
-    "sdmc:/switch/nstv/fonts/Roboto-Regular.ttf",
-    "sdmc:/switch/nstv/fonts/Roboto-Medium.ttf",
-    "sdmc:/switch/nstv/fonts/DejaVuSans.ttf",
+    "sdmc:/switch/kbore/fonts/OpenSans-Regular.ttf",
+    "sdmc:/switch/kbore/fonts/OpenSans-SemiBold.ttf",
+    "sdmc:/switch/kbore/fonts/Roboto-Regular.ttf",
+    "sdmc:/switch/kbore/fonts/Roboto-Medium.ttf",
+    "sdmc:/switch/kbore/fonts/DejaVuSans.ttf",
 #else
     "./romfs/fonts/OpenSans-Regular.ttf",
     "./romfs/fonts/OpenSans-SemiBold.ttf",

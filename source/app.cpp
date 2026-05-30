@@ -1,8 +1,11 @@
 #include "nstv/app.hpp"
 #include <algorithm>
+#include <cctype>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <chrono>
+#include <cstdio>
 
 namespace nstv {
 
@@ -127,18 +130,94 @@ void drawWrappedText(
     gfx.drawText(line, x, y + i * lineHeight, scale, color, bold);
   }
 }
+
+std::string safePlaylistId(const std::string &name, Provider provider) {
+  std::string out = toString(provider);
+
+  for (char ch : name) {
+    unsigned char c = static_cast<unsigned char>(ch);
+
+    if (std::isalnum(c)) {
+      out.push_back('-');
+      out.push_back(static_cast<char>(std::tolower(c)));
+    } else if ((ch == '-' || ch == '_') && !out.empty() && out.back() != '-') {
+      out.push_back('-');
+    }
+  }
+
+  while (!out.empty() && out.back() == '-') {
+    out.pop_back();
+  }
+
+  return out + "-" + std::to_string(nowMs());
+}
+
+std::string trimText(std::string value) {
+  while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) {
+    value.erase(value.begin());
+  }
+
+  while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back()))) {
+    value.pop_back();
+  }
+
+  return value;
+}
+
+std::string trimTrailingSlashLocal(std::string value) {
+  while (!value.empty() && value.back() == '/') {
+    value.pop_back();
+  }
+
+  return value;
+}
+
 }
 
 App::App() : api_(loadConfig()), player_(createPlayerBackend()) {
   splashStartedAtMs_ = nowMs();
   splashVisible_ = true;
+
   state_.config = loadConfig();
   api_ = ParserApiClient(state_.config);
-  if (loadManifest(state_.manifest)) {
+
+  const PlaylistConfig *playlist = activePlaylist();
+
+  if (playlist) {
+    bool usedCache = false;
+
+    if (loadManifest(state_.manifest)) {
+      const bool cachedMatchesActive =
+        state_.manifest.id == playlist->id &&
+        !state_.manifest.types.empty();
+
+      if (cachedMatchesActive) {
+        state_.hasManifest = true;
+        usedCache = true;
+        normalizeIndexes();
+
+        if (selectedCategoryPtr()) {
+          loadCategory(false);
+        }
+
+        state_.message =
+          "Loaded cached manifest: " +
+          std::to_string(state_.manifest.totalChannels) +
+          " channels";
+      }
+    }
+
+    if (!usedCache) {
+      importPlaylist(*playlist);
+    }
+  } else if (loadManifest(state_.manifest) && !state_.manifest.types.empty()) {
     state_.hasManifest = true;
-    state_.message = "Loaded cached manifest: " + std::to_string(state_.manifest.totalChannels) + " channels";
+    state_.message =
+      "Loaded cached manifest: " +
+      std::to_string(state_.manifest.totalChannels) +
+      " channels";
   } else {
-    state_.message = "Configure /switch/nstv/config.json, then use Add Playlist.";
+    state_.message = "Press + to add an M3U or Xtream playlist";
   }
 }
 
@@ -226,34 +305,118 @@ void App::handleDashboard(Button button) {
   }
 
   if (button == Button::Back) {
-    if (state_.focus == FocusColumn::Channels) state_.focus = FocusColumn::Categories;
-    else if (state_.focus == FocusColumn::Categories) state_.focus = FocusColumn::Types;
+    if (state_.focus == FocusColumn::Playlist) {
+      state_.focus = FocusColumn::Types;
+    } else if (state_.focus == FocusColumn::Channels) {
+      state_.focus = FocusColumn::Categories;
+    } else if (state_.focus == FocusColumn::Categories) {
+      state_.focus = FocusColumn::Types;
+    }
     return;
   }
 
   if (button == Button::Left) {
-    if (state_.focus == FocusColumn::Channels) state_.focus = FocusColumn::Categories;
-    else if (state_.focus == FocusColumn::Categories) state_.focus = FocusColumn::Types;
+    if (state_.focus == FocusColumn::Playlist) {
+      const int count = static_cast<int>(state_.config.playlists.size());
+      if (count > 1) {
+        int activeIndex = 0;
+
+        for (int i = 0; i < count; ++i) {
+          if (state_.config.playlists[static_cast<std::size_t>(i)].id == state_.config.activePlaylistId) {
+            activeIndex = i;
+            break;
+          }
+        }
+
+        activeIndex = (activeIndex + count - 1) % count;
+        activatePlaylist(activeIndex);
+      }
+      return;
+    }
+
+    if (state_.focus == FocusColumn::Channels) {
+      state_.focus = FocusColumn::Categories;
+    } else if (state_.focus == FocusColumn::Categories) {
+      state_.focus = FocusColumn::Types;
+    }
     return;
   }
 
   if (button == Button::Right) {
-    if (state_.focus == FocusColumn::Types) state_.focus = FocusColumn::Categories;
-    else if (state_.focus == FocusColumn::Categories) state_.focus = FocusColumn::Channels;
+    if (state_.focus == FocusColumn::Playlist) {
+      const int count = static_cast<int>(state_.config.playlists.size());
+      if (count > 1) {
+        int activeIndex = 0;
+
+        for (int i = 0; i < count; ++i) {
+          if (state_.config.playlists[static_cast<std::size_t>(i)].id == state_.config.activePlaylistId) {
+            activeIndex = i;
+            break;
+          }
+        }
+
+        activeIndex = (activeIndex + 1) % count;
+        activatePlaylist(activeIndex);
+      }
+      return;
+    }
+
+    if (state_.focus == FocusColumn::Types) {
+      state_.focus = FocusColumn::Categories;
+    } else if (state_.focus == FocusColumn::Categories) {
+      state_.focus = FocusColumn::Channels;
+    }
     return;
   }
 
   if (button == Button::Up) {
-    if (state_.focus == FocusColumn::Types) { state_.selectedType--; resetLoadedChannels(); }
-    else if (state_.focus == FocusColumn::Categories) { state_.selectedCategory--; resetLoadedChannels(); }
-    else state_.selectedChannel--;
-    return;
+    if (state_.focus == FocusColumn::Playlist) {
+      return;
+    }
+
+    if (state_.focus == FocusColumn::Types) {
+      if (state_.selectedType <= 0) {
+        state_.focus = FocusColumn::Playlist;
+      } else {
+        state_.selectedType--;
+        resetLoadedChannels();
+      }
+      return;
+    }
+
+    if (state_.focus == FocusColumn::Categories) {
+      if (state_.selectedCategory <= 0) {
+        state_.focus = FocusColumn::Playlist;
+      } else {
+        state_.selectedCategory--;
+        resetLoadedChannels();
+      }
+      return;
+    }
+
+    if (state_.focus == FocusColumn::Channels) {
+      if (state_.selectedChannel <= 0) {
+        state_.focus = FocusColumn::Playlist;
+      } else {
+        state_.selectedChannel--;
+      }
+      return;
+    }
   }
 
   if (button == Button::Down) {
-    if (state_.focus == FocusColumn::Types) { state_.selectedType++; resetLoadedChannels(); }
-    else if (state_.focus == FocusColumn::Categories) { state_.selectedCategory++; resetLoadedChannels(); }
-    else {
+    if (state_.focus == FocusColumn::Playlist) {
+      state_.focus = FocusColumn::Types;
+      return;
+    }
+
+    if (state_.focus == FocusColumn::Types) {
+      state_.selectedType++;
+      resetLoadedChannels();
+    } else if (state_.focus == FocusColumn::Categories) {
+      state_.selectedCategory++;
+      resetLoadedChannels();
+    } else {
       state_.selectedChannel++;
       normalizeIndexes();
       maybePreloadNextPage();
@@ -275,68 +438,323 @@ void App::handleDashboard(Button button) {
   }
 
   if (button == Button::Select) {
+    if (state_.focus == FocusColumn::Playlist) {
+      state_.screen = ScreenId::AddPlaylist;
+      return;
+    }
+
     if (state_.focus == FocusColumn::Types) {
       state_.focus = FocusColumn::Categories;
       return;
     }
+
     if (state_.focus == FocusColumn::Categories) {
       loadCategory(false);
       state_.focus = FocusColumn::Channels;
       return;
     }
+
     playSelectedChannel();
   }
 }
 
 void App::handleAddPlaylist(Button button) {
+  const int playlistCount = static_cast<int>(state_.config.playlists.size());
+  const int addM3uIndex = playlistCount;
+  const int addXtreamIndex = playlistCount + 1;
+  const int backIndex = playlistCount + 2;
+  const int maxIndex = backIndex;
+
   if (button == Button::Back) {
     state_.screen = ScreenId::Dashboard;
     return;
   }
-  if (button == Button::Up) state_.selectedAddOption--;
-  if (button == Button::Down) state_.selectedAddOption++;
-  if (state_.selectedAddOption < 0) state_.selectedAddOption = 0;
-  if (state_.selectedAddOption > 2) state_.selectedAddOption = 2;
+
+  if (button == Button::Up) {
+    state_.selectedAddOption--;
+  } else if (button == Button::Down) {
+    state_.selectedAddOption++;
+  }
+
+  if (state_.selectedAddOption < 0) {
+    state_.selectedAddOption = 0;
+  }
+
+  if (state_.selectedAddOption > maxIndex) {
+    state_.selectedAddOption = maxIndex;
+  }
+
+  if (button == Button::Favorite) {
+    if (state_.selectedAddOption < playlistCount) {
+      deletePlaylist(state_.selectedAddOption);
+    }
+    return;
+  }
 
   if (button == Button::Select) {
-    if (state_.selectedAddOption == 0) importM3u();
-    else if (state_.selectedAddOption == 1) importXtream();
-    else state_.screen = ScreenId::Dashboard;
+    if (state_.selectedAddOption < playlistCount) {
+      activatePlaylist(state_.selectedAddOption);
+      return;
+    }
+
+
+    if (state_.selectedAddOption == addM3uIndex) {
+      addM3uPlaylist();
+      return;
+    }
+
+    if (state_.selectedAddOption == addXtreamIndex) {
+      addXtreamPlaylist();
+      return;
+    }
+
+    if (state_.selectedAddOption == backIndex) {
+      state_.screen = ScreenId::Dashboard;
+      return;
+    }
+  }
+}
+
+
+const PlaylistConfig *App::activePlaylist() const {
+  return state_.config.activePlaylist();
+}
+
+std::string App::activePlaylistName() const {
+  const PlaylistConfig *playlist = activePlaylist();
+
+  if (!playlist) {
+    return "ADD LIST";
+  }
+
+  if (!playlist->name.empty()) {
+    return playlist->name;
+  }
+
+  return playlist->provider == Provider::Xtream ? "Xtream" : "M3U";
+}
+
+void App::activatePlaylist(int index) {
+  if (index < 0 || index >= static_cast<int>(state_.config.playlists.size())) {
+    return;
+  }
+
+  PlaylistConfig playlist = state_.config.playlists[static_cast<std::size_t>(index)];
+  state_.config.activePlaylistId = playlist.id;
+  saveConfig(state_.config);
+
+  importPlaylist(playlist);
+}
+
+void App::importPlaylist(const PlaylistConfig &playlist) {
+  try {
+    const std::string sourceUrl = playlist.sourceUrl();
+
+    // Recreate the API client with the latest config. This matters after the
+    // user adds/saves a playlist from inside the app.
+    api_ = ParserApiClient(state_.config);
+
+    if (state_.config.parserApiBaseUrl.empty()) {
+      throw std::runtime_error("Internal parser API base URL is empty");
+    }
+
+    if (sourceUrl.empty()) {
+      throw std::runtime_error("Playlist URL/source is empty");
+    }
+
+    state_.loading = true;
+    state_.loadingMessage = "Loading";
+    state_.message = "Loading " + playlist.name + "...";
+    render();
+
+    Manifest imported;
+
+    if (playlist.provider == Provider::Xtream) {
+      imported = api_.loadXtreamManifest(sourceUrl);
+    } else {
+      imported = api_.loadM3uManifest(sourceUrl);
+    }
+
+    imported.id = playlist.id;
+    imported.name = playlist.name.empty() ? imported.name : playlist.name;
+    imported.source = sourceUrl;
+    imported.provider = playlist.provider;
+
+    if (imported.types.empty()) {
+      throw std::runtime_error("Parser returned an empty manifest");
+    }
+
+    state_.manifest = imported;
+    state_.hasManifest = true;
+    state_.screen = ScreenId::Dashboard;
+    state_.focus = FocusColumn::Types;
+    state_.selectedType = 0;
+    state_.selectedCategory = 0;
+    state_.selectedChannel = 0;
+
+    resetLoadedChannels();
+    saveManifest(state_.manifest);
+
+    // Load the first category immediately so the dashboard is populated after
+    // adding or switching playlists. If the selected type has no categories,
+    // the type/category panels still remain visible and the user can navigate.
+    normalizeIndexes();
+
+    const Category *category = selectedCategoryPtr();
+
+    if (category) {
+      loadCategory(false);
+      state_.focus = FocusColumn::Types;
+    }
+
+    state_.loading = false;
+    state_.loadingMessage.clear();
+    state_.message =
+      "Loaded " +
+      playlist.name +
+      ": " +
+      std::to_string(state_.manifest.totalChannels) +
+      " channels";
+  } catch (const std::exception &ex) {
+    state_.loading = false;
+    state_.loadingMessage.clear();
+    state_.hasManifest = false;
+    resetLoadedChannels();
+    state_.screen = ScreenId::AddPlaylist;
+    state_.message = "Failed to load stream data. Check the playlist info and add it again.";
+  }
+}
+
+
+void App::addM3uPlaylist() {
+  std::string name = trimText(requestTextInput("Playlist name", "M3U", 80));
+
+  if (name.empty()) {
+    state_.message = "Playlist name is required";
+    return;
+  }
+
+  std::string url = trimText(requestTextInput("M3U URL", "", 900));
+
+  if (url.empty()) {
+    state_.message = "M3U URL is required";
+    return;
+  }
+
+  PlaylistConfig playlist;
+  playlist.id = safePlaylistId(name, Provider::M3u);
+  playlist.name = name;
+  playlist.provider = Provider::M3u;
+  playlist.m3uUrl = url;
+
+  state_.config.playlists.push_back(playlist);
+  state_.config.activePlaylistId = playlist.id;
+  state_.config.defaultPlaylistUrl = playlist.m3uUrl;
+
+  if (!saveConfig(state_.config)) {
+    state_.message = "Could not save config.json";
+    return;
+  }
+
+  importPlaylist(playlist);
+}
+
+void App::addXtreamPlaylist() {
+  std::string name = trimText(requestTextInput("Playlist name", "Xtream", 80));
+
+  if (name.empty()) {
+    state_.message = "Playlist name is required";
+    return;
+  }
+
+  std::string server = trimTrailingSlashLocal(trimText(requestTextInput("Xtream server URL", "http://", 500)));
+
+  if (server.empty() || server == "http://" || server == "https://") {
+    state_.message = "Xtream server URL is required";
+    return;
+  }
+
+  std::string username = trimText(requestTextInput("Xtream username", "", 180));
+
+  if (username.empty()) {
+    state_.message = "Xtream username is required";
+    return;
+  }
+
+  std::string password = trimText(requestTextInput("Xtream password", "", 180));
+
+  if (password.empty()) {
+    state_.message = "Xtream password is required";
+    return;
+  }
+
+  PlaylistConfig playlist;
+  playlist.id = safePlaylistId(name, Provider::Xtream);
+  playlist.name = name;
+  playlist.provider = Provider::Xtream;
+  playlist.serverUrl = server;
+  playlist.username = username;
+  playlist.password = password;
+
+  state_.config.playlists.push_back(playlist);
+  state_.config.activePlaylistId = playlist.id;
+  state_.config.defaultXtreamUrl = playlist.sourceUrl();
+
+  if (!saveConfig(state_.config)) {
+    state_.message = "Could not save config.json";
+    return;
+  }
+
+  importPlaylist(playlist);
+}
+
+
+void App::deletePlaylist(int index) {
+  if (index < 0 || index >= static_cast<int>(state_.config.playlists.size())) {
+    return;
+  }
+
+  const PlaylistConfig removed = state_.config.playlists[static_cast<std::size_t>(index)];
+  state_.config.playlists.erase(state_.config.playlists.begin() + index);
+
+  if (state_.config.activePlaylistId == removed.id) {
+    if (!state_.config.playlists.empty()) {
+      const int nextIndex = std::min(index, static_cast<int>(state_.config.playlists.size()) - 1);
+      state_.config.activePlaylistId = state_.config.playlists[static_cast<std::size_t>(nextIndex)].id;
+    } else {
+      state_.config.activePlaylistId.clear();
+    }
+  }
+
+  if (state_.selectedAddOption >= static_cast<int>(state_.config.playlists.size())) {
+    state_.selectedAddOption = std::max(0, static_cast<int>(state_.config.playlists.size()) - 1);
+  }
+
+  saveConfig(state_.config);
+
+  if (state_.config.playlists.empty()) {
+    state_.hasManifest = false;
+    state_.manifest = Manifest{};
+    resetLoadedChannels();
+    state_.message = "Playlist deleted. Add a new list to continue.";
+    return;
+  }
+
+  state_.message = "Playlist deleted: " + removed.name;
+
+  const PlaylistConfig *playlist = activePlaylist();
+
+  if (playlist) {
+    importPlaylist(*playlist);
   }
 }
 
 void App::importM3u() {
-  try {
-    if (state_.config.defaultPlaylistUrl.empty()) throw std::runtime_error("defaultPlaylistUrl is empty in config.json");
-    state_.message = "Loading M3U manifest...";
-    render();
-    state_.manifest = api_.loadM3uManifest(state_.config.defaultPlaylistUrl);
-    state_.hasManifest = true;
-    state_.screen = ScreenId::Dashboard;
-    state_.focus = FocusColumn::Types;
-    resetLoadedChannels();
-    saveManifest(state_.manifest);
-    state_.message = "Loaded M3U manifest: " + std::to_string(state_.manifest.totalChannels) + " channels";
-  } catch (const std::exception &ex) {
-    state_.message = std::string("M3U import failed: ") + ex.what();
-  }
+  addM3uPlaylist();
 }
 
 void App::importXtream() {
-  try {
-    if (state_.config.defaultXtreamUrl.empty()) throw std::runtime_error("defaultXtreamUrl is empty in config.json");
-    state_.message = "Loading Xtream manifest...";
-    render();
-    state_.manifest = api_.loadXtreamManifest(state_.config.defaultXtreamUrl);
-    state_.hasManifest = true;
-    state_.screen = ScreenId::Dashboard;
-    state_.focus = FocusColumn::Types;
-    resetLoadedChannels();
-    saveManifest(state_.manifest);
-    state_.message = "Loaded Xtream manifest: " + std::to_string(state_.manifest.totalChannels) + " channels";
-  } catch (const std::exception &ex) {
-    state_.message = std::string("Xtream import failed: ") + ex.what();
-  }
+  addXtreamPlaylist();
 }
 
 void App::loadCategory(bool append) {
@@ -365,6 +783,7 @@ void App::loadCategory(bool append) {
 
     ChannelPage result;
     bool fromCache = loadChannelPage(
+      state_.manifest.id,
       state_.manifest.provider,
       category->type,
       category->id,
@@ -373,6 +792,8 @@ void App::loadCategory(bool append) {
     );
 
     if (!fromCache) {
+      state_.loading = true;
+      state_.loadingMessage = "Loading";
       state_.message = append
         ? "Loading more channels from API..."
         : "Loading channels from API...";
@@ -387,6 +808,7 @@ void App::loadCategory(bool append) {
       );
 
       saveChannelPage(
+        state_.manifest.id,
         state_.manifest.provider,
         category->type,
         category->id,
@@ -413,6 +835,8 @@ void App::loadCategory(bool append) {
     state_.loadedTotal = result.totalChannels;
     state_.loadedTotalPages = result.totalPages;
     state_.loadedCategoryKey = key;
+    state_.loading = false;
+    state_.loadingMessage.clear();
 
     const std::string origin = fromCache ? "cache" : "API";
 
@@ -423,7 +847,13 @@ void App::loadCategory(bool append) {
       ", page " + std::to_string(result.page) +
       "/" + std::to_string(result.totalPages);
   } catch (const std::exception &ex) {
-    state_.message = std::string("Load channels failed: ") + ex.what();
+    std::printf("[KBORE] importPlaylist failed: %s\n", ex.what());
+    state_.loading = false;
+    state_.loadingMessage.clear();
+    state_.hasManifest = false;
+    state_.manifest = Manifest{};
+    resetLoadedChannels();
+    state_.message = "Failed to load stream data. Check the playlist info and add it again.";
   }
 }
 
@@ -619,6 +1049,45 @@ void App::renderDashboardGraphic() {
     280,
     66
   );
+
+  // Active playlist switcher. It intentionally shows only the user-defined
+  // playlist name, keeping the header clean.
+  Rect playlistSwitch{322, 22, 250, 42};
+  gfx_.fillRoundRect(
+    playlistSwitch.x,
+    playlistSwitch.y,
+    playlistSwitch.w,
+    playlistSwitch.h,
+    13,
+    rgba(15, 23, 42, 210)
+  );
+  const bool playlistFocused = state_.focus == FocusColumn::Playlist;
+  gfx_.strokeRoundRect(
+    playlistSwitch.x,
+    playlistSwitch.y,
+    playlistSwitch.w,
+    playlistSwitch.h,
+    13,
+    playlistFocused ? brightBlue : rgba(72, 92, 128, 42),
+    playlistFocused ? 3 : 1
+  );
+  gfx_.drawText(
+    Graphics::fitText(activePlaylistName(), 18),
+    playlistSwitch.x + 18,
+    playlistSwitch.y + 14,
+    2,
+    text,
+    true
+  );
+  gfx_.drawTextRight(
+    "v",
+    playlistSwitch.x + playlistSwitch.w - 16,
+    playlistSwitch.y + 14,
+    2,
+    playlistFocused ? brightBlue : muted,
+    true
+  );
+
   gfx_.fillCircle(984, 43, 6, green);
   gfx_.drawTextRight("ONLINE", 1080, 36, 3, text, true);
   gfx_.drawTextRight("21:45", 1190, 30, 5, text, false);
@@ -727,21 +1196,131 @@ void App::renderDashboardGraphic() {
   Rect foot{18, 675, 1245, 36};
   gfx_.fillRoundRect(foot.x, foot.y, foot.w, foot.h, 10, rgba(17,24,39,240));
   gfx_.strokeRoundRect(foot.x, foot.y, foot.w, foot.h, 10, rgba(72,92,128,28), 1);
-  gfx_.drawText("L NAVEGAR   R TROCAR COLUNA   A SELECIONAR   B VOLTAR   X FAVORITOS   + MENU", foot.x + 26, foot.y + 13, 1, text, true);
+  gfx_.drawText("UP LISTAS   LEFT/RIGHT COLUNAS   A SELECIONAR   B VOLTAR   X FAVORITOS   + LISTAS", foot.x + 26, foot.y + 13, 1, text, true);
+
+  if (state_.loading) {
+    renderLoadingOverlay(state_.loadingMessage.empty() ? "Loading" : state_.loadingMessage);
+  }
+}
+
+
+void App::renderLoadingOverlay(const std::string &message) {
+  const Color text = rgb(248, 250, 252);
+  const Color muted = rgb(148, 163, 184);
+  const Color blue = rgb(0, 191, 255);
+
+  gfx_.fillRoundRect(
+    0,
+    0,
+    Graphics::Width,
+    Graphics::Height,
+    0,
+    rgba(2, 6, 18, 180)
+  );
+
+  const int cx = Graphics::Width / 2;
+  const int cy = Graphics::Height / 2 - 18;
+
+  const char spinnerChars[4] = {'|', '/', '-', '\\'};
+  const int index = static_cast<int>((nowMs() / 140) % 4);
+  std::string spinner(1, spinnerChars[index]);
+
+  gfx_.fillRoundRect(cx - 170, cy - 74, 340, 170, 22, rgba(15, 23, 42, 235));
+  gfx_.strokeRoundRect(cx - 170, cy - 74, 340, 170, 22, rgba(72, 92, 128, 70), 1);
+
+  gfx_.drawText(spinner, cx - 10, cy - 36, 5, blue, true);
+  gfx_.drawText(message.empty() ? "Loading" : message, cx - 58, cy + 22, 3, text, true);
+  gfx_.drawText("Please wait", cx - 56, cy + 56, 1, muted, false);
 }
 
 void App::renderAddPlaylistGraphic() {
-  gfx_.drawText("NSTV", 64, 48, 8, rgb(248,250,252), true);
-  gfx_.drawText("ADD PLAYLIST", 64, 118, 5, rgb(166,178,207), true);
-  const char* opts[] = {"ADD FROM M3U URL", "ADD XTREAM", "BACK"};
-  for (int i=0;i<3;i++) {
-    int y=190+i*78; bool sel=i==state_.selectedAddOption;
-    gfx_.fillRoundRect(120,y,720,58,14, sel ? rgba(37,99,235,220) : rgba(17,24,39,220));
-    gfx_.strokeRoundRect(120,y,720,58,14, sel ? rgb(0,191,255) : rgba(72,92,128,30), sel?3:1);
-    gfx_.drawText(opts[i],160,y+18,4,rgb(248,250,252),true);
+  const Color text = rgb(248, 250, 252);
+  const Color muted = rgb(166, 178, 207);
+  const Color blue = rgb(37, 99, 235);
+  const Color brightBlue = rgb(0, 191, 255);
+  const Color panel = rgba(17, 24, 39, 225);
+
+  gfx_.drawImageFileCentered(
+    "romfs:/logo/logo-horizontal.png",
+    64,
+    42,
+    260,
+    62
+  );
+
+  gfx_.drawText("PLAYLISTS", 64, 124, 5, muted, true);
+  gfx_.drawText("Select a saved list or add a new source", 64, 166, 2, muted, false);
+
+  const int playlistCount = static_cast<int>(state_.config.playlists.size());
+  const int addM3uIndex = playlistCount;
+  const int addXtreamIndex = playlistCount + 1;
+  const int backIndex = playlistCount + 2;
+  const int totalOptions = playlistCount + 3;
+
+  const int rows = 6;
+  const int start = windowStart(state_.selectedAddOption, totalOptions, rows);
+
+  for (int i = 0; i < rows; ++i) {
+    const int optionIndex = start + i;
+
+    if (optionIndex >= totalOptions) {
+      break;
+    }
+
+    const int y = 210 + i * 66;
+    const bool selected = optionIndex == state_.selectedAddOption;
+
+    gfx_.fillRoundRect(
+      96,
+      y,
+      900,
+      54,
+      14,
+      selected ? rgba(37, 99, 235, 225) : panel
+    );
+
+    gfx_.strokeRoundRect(
+      96,
+      y,
+      900,
+      54,
+      14,
+      selected ? brightBlue : rgba(72, 92, 128, 30),
+      selected ? 3 : 1
+    );
+
+    std::string title;
+    std::string subtitle;
+
+    if (optionIndex < playlistCount) {
+      const PlaylistConfig &playlist = state_.config.playlists[static_cast<std::size_t>(optionIndex)];
+      const bool active = playlist.id == state_.config.activePlaylistId;
+
+      title = (active ? "* " : "  ") + playlist.name;
+      subtitle =
+        std::string(active ? "ACTIVE • " : "") +
+        (playlist.provider == Provider::Xtream ? "XTREAM" : "M3U");
+    } else if (optionIndex == addM3uIndex) {
+      title = "+ ADD M3U URL";
+      subtitle = "Add a playlist using an M3U link";
+    } else if (optionIndex == addXtreamIndex) {
+      title = "+ ADD XTREAM";
+      subtitle = "Add server, username and password";
+    } else {
+      title = "BACK";
+      subtitle = "Return to dashboard";
+    }
+
+    gfx_.drawText(Graphics::fitText(title, 36), 134, y + 11, 3, text, true);
+    gfx_.drawText(Graphics::fitText(subtitle, 60), 134, y + 34, 1, selected ? text : muted, false);
   }
-  gfx_.drawText("A SELECT    B BACK", 120, 500, 3, rgb(166,178,207), true);
-  gfx_.drawText(Graphics::fitText(state_.message, 80), 120, 545, 3, rgb(0,145,255), false);
+
+  gfx_.drawText("A SELECT    X DELETE SELECTED    B BACK", 96, 632, 2, muted, true);
+  gfx_.drawText(Graphics::fitText(state_.message, 86), 96, 666, 2, rgb(0, 145, 255), false);
+
+  if (state_.loading) {
+    renderLoadingOverlay(state_.loadingMessage.empty() ? "Loading" : state_.loadingMessage);
+  }
 }
 
 void App::renderPlayerGraphic() {
@@ -1088,7 +1667,7 @@ std::string App::channelIcon(const Channel &channel, bool unicodeIcons) {
 
 std::string App::providerLabel(Provider provider) {
   switch (provider) {
-    case Provider::M3u: return "M3U Parser API";
+    case Provider::M3u: return "M3U";
     case Provider::Xtream: return "Xtream API";
     case Provider::Local: return "Local";
   }
