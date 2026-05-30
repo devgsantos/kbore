@@ -2,8 +2,6 @@ ifeq ($(strip $(DEVKITPRO)),)
 $(error DEVKITPRO is not set)
 endif
 
-APP_ROOT := $(abspath $(dir $(firstword $(MAKEFILE_LIST))))
-
 include $(DEVKITPRO)/libnx/switch_rules
 
 TARGET       := nstv-native
@@ -15,6 +13,7 @@ APP_TITLE    := NSTV Native
 APP_AUTHOR   := Gilson Santos / OpenAI
 APP_VERSION  := 0.3.0
 
+APP_ROOT := $(abspath $(dir $(firstword $(MAKEFILE_LIST))))
 ARCH := -march=armv8-a -mtune=cortex-a57 -mtp=soft -fPIE
 CFLAGS   = -g -Wall -O2 -ffunction-sections $(ARCH) $(DEFINES) -D__SWITCH__ -DNSTV_USE_SDL -DNSTV_USE_SDL_TTF -DNSTV_USE_SDL_IMAGE -DNSTV_ENABLE_NATIVE_HW_PLAYER $(FFMPEG_DEFINES)
 CXXFLAGS = $(CFLAGS) -std=c++17 -fno-rtti -fexceptions
@@ -22,12 +21,10 @@ ASFLAGS  := -g $(ARCH)
 LDFLAGS  := -specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
 
 ROMFS    := $(APP_ROOT)/romfs
-APP_ICON := $(APP_ROOT)/romfs/logo/icon.jpg
-NRO_ICON_ARG := $(if $(wildcard $(APP_ICON)),--icon="$(APP_ICON)",)
 PORTLIBS := $(DEVKITPRO)/portlibs/switch
 LIBNX    := $(DEVKITPRO)/libnx
 
-PLAYER_SDK := $(APP_ROOT)/external/player-sdk
+PLAYER_SDK := $(CURDIR)/external/player-sdk
 PLAYER_SDK_INC := $(PLAYER_SDK)/include
 PLAYER_SDK_LIB := $(PLAYER_SDK)/lib
 
@@ -127,7 +124,7 @@ $(OUTPUT).elf: $(OFILES)
 %.nro: %.elf
 	@echo building $(notdir $@)
 	@nacptool --create "$(APP_TITLE)" "$(APP_AUTHOR)" "$(APP_VERSION)" $(OUTPUT).nacp
-	@elf2nro $< $@ --nacp=$(OUTPUT).nacp --romfsdir="$(ROMFS)" $(NRO_ICON_ARG)
+	@elf2nro $< $@ --nacp=$(OUTPUT).nacp --romfsdir=$(ROMFS)
 
 %.o: %.cpp
 	@echo $(notdir $<)

@@ -130,6 +130,8 @@ void drawWrappedText(
 }
 
 App::App() : api_(loadConfig()), player_(createPlayerBackend()) {
+  splashStartedAtMs_ = nowMs();
+  splashVisible_ = true;
   state_.config = loadConfig();
   api_ = ParserApiClient(state_.config);
   if (loadManifest(state_.manifest)) {
@@ -144,6 +146,19 @@ int App::run() {
   render();
 
   while (state_.running) {
+    if (splashVisible_) {
+      Button button = pollButton();
+
+      if (button == Button::Quit) {
+        state_.running = false;
+        break;
+      }
+
+      render();
+      sleepMs(16);
+      continue;
+    }
+
     if (state_.screen == ScreenId::Player) {
       Button button = pollButton();
 
@@ -522,6 +537,19 @@ static int windowStart(int selected, int size, int maxRows) {
 
 void App::render() {
   gfx_.beginFrame();
+
+  if (splashVisible_) {
+    const long long elapsed = nowMs() - splashStartedAtMs_;
+
+    if (elapsed < splashDurationMs_) {
+      renderSplashGraphic();
+      gfx_.present();
+      return;
+    }
+
+    splashVisible_ = false;
+  }
+
   switch (state_.screen) {
     case ScreenId::Dashboard: renderDashboardGraphic(); break;
     case ScreenId::AddPlaylist: renderAddPlaylistGraphic(); break;
@@ -530,6 +558,17 @@ void App::render() {
     case ScreenId::Playlists: renderAddPlaylistGraphic(); break;
   }
   gfx_.present();
+}
+
+void App::renderSplashGraphic() {
+  gfx_.drawImageFile(
+    "romfs:/logo/splash.png",
+    0,
+    0,
+    Graphics::Width,
+    Graphics::Height,
+    true
+  );
 }
 
 void App::renderDashboard() {
@@ -573,9 +612,13 @@ void App::renderDashboardGraphic() {
 
 
   // Header -----------------------------------------------------------------
-  gfx_.drawIconBox("live", 24, 18, 54, rgb(239,68,68), rgb(127,29,29), rgb(255,255,255));
-  gfx_.drawText("NSTV", 92, 18, 7, text, true);
-  gfx_.drawText("IPTV PLAYER", 96, 62, 2, text, true);
+  gfx_.drawImageFileCentered(
+    "romfs:/logo/logo-horizontal.png",
+    24,
+    14,
+    280,
+    66
+  );
   gfx_.fillCircle(984, 43, 6, green);
   gfx_.drawTextRight("ONLINE", 1080, 36, 3, text, true);
   gfx_.drawTextRight("21:45", 1190, 30, 5, text, false);
