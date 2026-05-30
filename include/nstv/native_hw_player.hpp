@@ -4,8 +4,10 @@
 #include "nstv/native_demuxer.hpp"
 #include "nstv/native_decoder.hpp"
 #include "nstv/native_hw_device.hpp"
+#include "nstv/native_video_renderer.hpp"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 
 namespace nstv {
@@ -45,6 +47,12 @@ private:
   NativeDemuxer demuxer_;
   NativeDecoder decoder_;
   NativeHwDeviceProbe hwProbe_;
+  std::unique_ptr<INativeVideoRenderer> nativeRenderer_;
+
+  bool nativeRendererReady_ = false;
+  bool preferNativeRenderer_ = true;
+  bool nativeRendererFailed_ = false;
+  std::string nativeRendererStatus_;
 
   bool clockStarted_ = false;
 

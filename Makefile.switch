@@ -69,6 +69,7 @@ LIBS := \
   -lmbedx509 \
   -lmbedcrypto \
   -lz \
+  -ldeko3d \
   -lEGL \
   -lGLESv2 \
   -lglad \

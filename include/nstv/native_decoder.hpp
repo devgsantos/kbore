@@ -2,6 +2,7 @@
 
 #include "nstv/graphics.hpp"
 #include "nstv/native_demuxer.hpp"
+#include "nstv/native_video_surface.hpp"
 
 #include <cstdint>
 #include <string>
@@ -48,6 +49,8 @@ struct NativeFrameInfo {
 
   bool hardwareFrame = false;
   bool transferredFromHardware = false;
+  bool nativeSurfaceAvailable = false;
+  std::string nativeSurfaceSummary;
 
   int64_t ptsMs = -1;
 };
@@ -77,6 +80,12 @@ public:
   bool decodeNextVideoFrame(NativeDemuxer &demuxer, bool outputFrame = true);
   bool dropNextVideoFrame(NativeDemuxer &demuxer);
 
+#ifdef NSTV_USE_FFMPEG
+  bool decodeNextHardwareFrame(NativeDemuxer &demuxer);
+  const AVFrame *latestHardwareFrame() const;
+  void releaseLatestHardwareFrame();
+#endif
+
   void close();
 
   bool hasVideoDecoder() const { return video_.opened; }
@@ -89,6 +98,10 @@ public:
 
   const NativeFrameInfo &firstVideoFrame() const { return firstVideoFrame_; }
   const NativeFrameInfo &latestFrameInfo() const { return latestFrameInfo_; }
+
+#ifdef NSTV_USE_FFMPEG
+  const NativeVideoSurfaceInfo &latestNativeSurfaceInfo() const;
+#endif
 
   const YuvFrame &firstYuvFrame() const { return firstYuvFrame_; }
   const YuvFrame &latestYuvFrame() const { return latestYuvFrame_; }

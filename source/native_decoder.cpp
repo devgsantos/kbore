@@ -1,6 +1,7 @@
 #include "nstv/native_decoder.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <sstream>
 #include <vector>
@@ -66,6 +67,9 @@ struct NativeDecoder::Impl {
 
   bool usingHardware = false;
   AVPixelFormat selectedHwPixelFormat = AV_PIX_FMT_NONE;
+
+  NativeVideoSurfaceInfo latestNativeSurfaceInfo;
+  bool latestHardwareFrameRetained = false;
 };
 #endif
 
@@ -303,6 +307,9 @@ void NativeDecoder::resetState() {
 
   firstVideoFrame_ = NativeFrameInfo{};
   latestFrameInfo_ = NativeFrameInfo{};
+  if (impl_) {
+    impl_->latestNativeSurfaceInfo = NativeVideoSurfaceInfo{};
+  }
 
   firstYuvFrame_ = YuvFrame{};
   latestYuvFrame_ = YuvFrame{};
@@ -328,6 +335,8 @@ void NativeDecoder::rebuildSummary() {
       << firstVideoFrame_.pixelFormat
       << " hwFrame="
       << (firstVideoFrame_.hardwareFrame ? "yes" : "no")
+      << " nativeSurface="
+      << (firstVideoFrame_.nativeSurfaceAvailable ? "yes" : "no")
       << " transferred="
       << (firstVideoFrame_.transferredFromHardware ? "yes" : "no")
       << " ptsMs="
@@ -345,6 +354,8 @@ void NativeDecoder::rebuildSummary() {
       << latestFrameInfo_.pixelFormat
       << " hwFrame="
       << (latestFrameInfo_.hardwareFrame ? "yes" : "no")
+      << " nativeSurface="
+      << (latestFrameInfo_.nativeSurfaceAvailable ? "yes" : "no")
       << " transferred="
       << (latestFrameInfo_.transferredFromHardware ? "yes" : "no")
       << " | ";
@@ -414,6 +425,18 @@ bool NativeDecoder::openVideoHardware(
   AVPixelFormat hwPixelFormat
 ) {
   return openVideoInternal(demuxer, deviceContext, hwPixelFormat, true);
+}
+#endif
+
+#ifdef NSTV_USE_FFMPEG
+const NativeVideoSurfaceInfo &NativeDecoder::latestNativeSurfaceInfo() const {
+  static const NativeVideoSurfaceInfo empty;
+
+  if (!impl_) {
+    return empty;
+  }
+
+  return impl_->latestNativeSurfaceInfo;
 }
 #endif
 
@@ -890,6 +913,8 @@ bool NativeDecoder::decodeNextVideoFrame(NativeDemuxer &demuxer, bool outputFram
     return false;
   }
 
+  releaseLatestHardwareFrame();
+
   if (!video_.opened || !impl_->videoCodec || !impl_->packet || !impl_->videoFrame) {
     error_ = "NativeDecoder requires an open video decoder before decoding frames.";
     return false;
@@ -985,6 +1010,19 @@ bool NativeDecoder::decodeNextVideoFrame(NativeDemuxer &demuxer, bool outputFram
       currentFrameInfo.hardwareFrame = hardwareFrame;
       currentFrameInfo.transferredFromHardware = false;
 
+      if (hasHardwareContext) {
+        impl_->latestNativeSurfaceInfo = inspectNativeVideoSurface(impl_->videoFrame);
+        currentFrameInfo.nativeSurfaceAvailable = impl_->latestNativeSurfaceInfo.valid;
+        currentFrameInfo.nativeSurfaceSummary = impl_->latestNativeSurfaceInfo.summary;
+
+        std::printf(
+          "[KBORE][NVTEGRA] %s\n",
+          impl_->latestNativeSurfaceInfo.summary.c_str()
+        );
+      } else {
+        impl_->latestNativeSurfaceInfo = NativeVideoSurfaceInfo{};
+      }
+
       latestFrameInfo_ = currentFrameInfo;
 
       if (!firstVideoFrame_.decoded) {
@@ -1058,6 +1096,8 @@ bool NativeDecoder::decodeNextVideoFrame(NativeDemuxer &demuxer, bool outputFram
       currentFrameInfo.ptsMs = framePtsMs(impl_->videoFrame, videoStream);
       currentFrameInfo.hardwareFrame = hardwareFrame;
       currentFrameInfo.transferredFromHardware = transferredFromHardware;
+      currentFrameInfo.nativeSurfaceAvailable = latestFrameInfo_.nativeSurfaceAvailable;
+      currentFrameInfo.nativeSurfaceSummary = latestFrameInfo_.nativeSurfaceSummary;
 
       AVFrame *frameForCopy = frameForProcessing;
 
@@ -1198,9 +1238,157 @@ bool NativeDecoder::dropNextVideoFrame(NativeDemuxer &demuxer) {
   return decodeNextVideoFrame(demuxer, false);
 }
 
+#ifdef NSTV_USE_FFMPEG
+bool NativeDecoder::decodeNextHardwareFrame(NativeDemuxer &demuxer) {
+  if (!impl_) {
+    error_ = "NativeDecoder internal state is unavailable.";
+    return false;
+  }
+
+  releaseLatestHardwareFrame();
+
+  if (!video_.opened || !impl_->videoCodec || !impl_->packet || !impl_->videoFrame) {
+    error_ = "NativeDecoder requires an open video decoder before decoding hardware frames.";
+    return false;
+  }
+
+  AVFormatContext *format = demuxer.formatContext();
+
+  if (!format) {
+    error_ = "NativeDecoder could not access AVFormatContext while decoding hardware frame.";
+    return false;
+  }
+
+  const int maxPackets = 80;
+
+  for (int i = 0; i < maxPackets; ++i) {
+    int ret = av_read_frame(format, impl_->packet);
+
+    if (ret < 0) {
+      error_ = "NativeDecoder could not read next hardware frame: " + ffmpegError(ret);
+      return false;
+    }
+
+    if (audio_.opened && impl_->packet->stream_index == audio_.streamIndex) {
+      if (!decodeAudioPacketToSdl(impl_->packet)) {
+        av_packet_unref(impl_->packet);
+        return false;
+      }
+
+      av_packet_unref(impl_->packet);
+      continue;
+    }
+
+    if (impl_->packet->stream_index != video_.streamIndex) {
+      av_packet_unref(impl_->packet);
+      continue;
+    }
+
+    ret = avcodec_send_packet(impl_->videoCodec, impl_->packet);
+
+    av_packet_unref(impl_->packet);
+
+    if (ret < 0 && ret != AVERROR(EAGAIN)) {
+      error_ = "NativeDecoder could not send video packet for hardware frame: " + ffmpegError(ret);
+      return false;
+    }
+
+    while (true) {
+      ret = avcodec_receive_frame(impl_->videoCodec, impl_->videoFrame);
+
+      if (ret == AVERROR(EAGAIN)) {
+        break;
+      }
+
+      if (ret == AVERROR_EOF) {
+        error_ = "NativeDecoder reached EOF while decoding hardware frame.";
+        return false;
+      }
+
+      if (ret < 0) {
+        error_ = "NativeDecoder could not receive hardware frame: " + ffmpegError(ret);
+        return false;
+      }
+
+      AVStream *videoStream = format->streams[video_.streamIndex];
+      AVPixelFormat originalFormat = static_cast<AVPixelFormat>(impl_->videoFrame->format);
+      const bool hardwareFrame =
+        impl_->usingHardware &&
+        originalFormat == impl_->selectedHwPixelFormat;
+      const bool hasHardwareContext =
+        hardwareFrame ||
+        impl_->videoFrame->hw_frames_ctx != nullptr;
+
+      NativeFrameInfo currentFrameInfo;
+      currentFrameInfo.decoded = true;
+      currentFrameInfo.streamIndex = video_.streamIndex;
+      currentFrameInfo.width = impl_->videoFrame->width;
+      currentFrameInfo.height = impl_->videoFrame->height;
+      currentFrameInfo.outputWidth = impl_->videoFrame->width;
+      currentFrameInfo.outputHeight = impl_->videoFrame->height;
+      currentFrameInfo.pixelFormat = pixelFormatName(originalFormat);
+      currentFrameInfo.ptsMs = framePtsMs(impl_->videoFrame, videoStream);
+      currentFrameInfo.hardwareFrame = hardwareFrame;
+      currentFrameInfo.transferredFromHardware = false;
+
+      if (hasHardwareContext) {
+        impl_->latestNativeSurfaceInfo = inspectNativeVideoSurface(impl_->videoFrame);
+        currentFrameInfo.nativeSurfaceAvailable = impl_->latestNativeSurfaceInfo.valid;
+        currentFrameInfo.nativeSurfaceSummary = impl_->latestNativeSurfaceInfo.summary;
+        latestFrameInfo_ = currentFrameInfo;
+
+        if (!firstVideoFrame_.decoded) {
+          firstVideoFrame_ = currentFrameInfo;
+        }
+
+        impl_->latestHardwareFrameRetained = true;
+
+        std::printf(
+          "[KBORE][NVTEGRA] retained hardware frame without CPU transfer: %s\n",
+          impl_->latestNativeSurfaceInfo.summary.c_str()
+        );
+
+        rebuildSummary();
+        return true;
+      }
+
+      latestFrameInfo_ = currentFrameInfo;
+      impl_->latestNativeSurfaceInfo = NativeVideoSurfaceInfo{};
+      av_frame_unref(impl_->videoFrame);
+      rebuildSummary();
+
+      error_ = "NativeDecoder received a software frame while hardware frame was requested.";
+      return false;
+    }
+  }
+
+  error_ = "NativeDecoder reached packet limit before next hardware frame.";
+  return false;
+}
+
+const AVFrame *NativeDecoder::latestHardwareFrame() const {
+  if (!impl_ || !impl_->latestHardwareFrameRetained) {
+    return nullptr;
+  }
+
+  return impl_->videoFrame;
+}
+
+void NativeDecoder::releaseLatestHardwareFrame() {
+  if (!impl_ || !impl_->latestHardwareFrameRetained) {
+    return;
+  }
+
+  av_frame_unref(impl_->videoFrame);
+  impl_->latestHardwareFrameRetained = false;
+}
+#endif
+
 void NativeDecoder::close() {
 #ifdef NSTV_USE_FFMPEG
   if (impl_) {
+    releaseLatestHardwareFrame();
+
     #ifdef NSTV_USE_SDL
         if (impl_->audioDevice != 0) {
           SDL_PauseAudioDevice(impl_->audioDevice, 1);

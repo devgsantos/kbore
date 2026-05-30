@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 
 namespace nstv {
 
@@ -182,6 +183,10 @@ bool NativeHwPlayerBackend::open(const std::string &url) {
   paused_ = false;
   error_.clear();
   yuvFrame_ = YuvFrame{};
+  nativeRenderer_.reset();
+  nativeRendererReady_ = false;
+  nativeRendererFailed_ = false;
+  nativeRendererStatus_.clear();
   resetClock();
 
 #ifndef NSTV_ENABLE_NATIVE_HW_PLAYER
@@ -243,6 +248,34 @@ bool NativeHwPlayerBackend::open(const std::string &url) {
     return false;
   }
 
+  if (preferNativeRenderer_) {
+    nativeRenderer_ = createDeko3dVideoRenderer();
+
+    if (nativeRenderer_ && nativeRenderer_->initialize()) {
+      nativeRendererReady_ = true;
+      nativeRendererStatus_ = std::string(nativeRenderer_->name()) + " initialized";
+      std::printf("[KBORE][DEKO3D] %s\n", nativeRendererStatus_.c_str());
+    } else {
+      nativeRendererReady_ = false;
+      nativeRendererFailed_ = true;
+      nativeRendererStatus_ =
+        nativeRenderer_
+          ? nativeRenderer_->error()
+          : "Deko3D renderer is unavailable for this build.";
+
+      std::printf(
+        "[KBORE][DEKO3D] unavailable: %s\n",
+        nativeRendererStatus_.c_str()
+      );
+      std::printf("[KBORE][DEKO3D] fallback to SDL/YUV\n");
+
+      if (nativeRenderer_) {
+        nativeRenderer_->shutdown();
+        nativeRenderer_.reset();
+      }
+    }
+  }
+
   if (!decoder_.decodeFirstVideoFrame(demuxer_)) {
     error_ =
       "Native HW decoder opened, but first frame decode failed: " +
@@ -280,6 +313,11 @@ bool NativeHwPlayerBackend::open(const std::string &url) {
 
 void NativeHwPlayerBackend::close() {
 #ifdef NSTV_ENABLE_NATIVE_HW_PLAYER
+  if (nativeRenderer_) {
+    nativeRenderer_->shutdown();
+    nativeRenderer_.reset();
+  }
+
   decoder_.stopAudio();
   decoder_.close();
   demuxer_.close();
@@ -291,6 +329,9 @@ void NativeHwPlayerBackend::close() {
   url_.clear();
   error_.clear();
   yuvFrame_ = YuvFrame{};
+  nativeRendererReady_ = false;
+  nativeRendererFailed_ = false;
+  nativeRendererStatus_.clear();
   resetClock();
 }
 
