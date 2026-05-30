@@ -53,6 +53,7 @@ public:
 
 private:
   void render();
+  void renderSplashGraphic();
   void renderDashboard();
   void renderDashboardGraphic();
   void renderAddPlaylistGraphic();
@@ -102,6 +103,10 @@ private:
   Graphics gfx_;
   ImageCache imageCache_;
   std::unique_ptr<IPlayerBackend> player_;
+
+  bool splashVisible_ = true;
+  long long splashStartedAtMs_ = 0;
+  long long splashDurationMs_ = 1800;
 };
 
 } // namespace nstv

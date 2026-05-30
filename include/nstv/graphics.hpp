@@ -76,6 +76,8 @@ public:
   void drawLogoPlaceholder(const std::string &name, const std::string &logoUrl, int x, int y, int w, int h);
   void drawLogoFallback(const std::string &name, int x, int y, int w, int h, int scale = 2);
   void drawImage(const Bitmap &bitmap, int x, int y, int w, int h);
+  void drawImageFile(const std::string &path, int x, int y, int w, int h, bool cover = false);
+  void drawImageFileCentered(const std::string &path, int x, int y, int w, int h);
   void drawYuvFrame(const YuvFrame &frame, int x, int y, int w, int h);
   void drawHeaderIcon(const std::string &name, int x, int y, int size, Color color);
 

@@ -12,6 +12,9 @@
 #include <vector>
 
 #include <SDL2/SDL.h>
+#ifdef NSTV_USE_SDL_IMAGE
+#include <SDL2/SDL_image.h>
+#endif
 #ifdef NSTV_USE_SDL_TTF
 #include <SDL2/SDL_ttf.h>
 #endif
@@ -323,6 +326,50 @@ struct CachedTexture {
 };
 
 std::map<const uint8_t *, CachedTexture> g_textureCache;
+std::map<std::string, CachedTexture> g_fileTextureCache;
+
+#ifdef NSTV_USE_SDL_IMAGE
+SDL_Texture *loadTextureFromFile(const std::string &path, int &outW, int &outH) {
+  auto found = g_fileTextureCache.find(path);
+
+  if (found != g_fileTextureCache.end() && found->second.texture) {
+    outW = found->second.width;
+    outH = found->second.height;
+    return found->second.texture;
+  }
+
+  SDL_Surface *surface = IMG_Load(path.c_str());
+
+  if (!surface) {
+    std::printf("[NSTV] IMG_Load failed: %s | path=%s\n", IMG_GetError(), path.c_str());
+    return nullptr;
+  }
+
+  SDL_Texture *texture = SDL_CreateTextureFromSurface(g_renderer, surface);
+
+  if (!texture) {
+    std::printf("[NSTV] SDL_CreateTextureFromSurface failed: %s | path=%s\n", SDL_GetError(), path.c_str());
+    SDL_FreeSurface(surface);
+    return nullptr;
+  }
+
+  SDL_SetTextureBlendMode(texture, SDL_BLENDMODE_BLEND);
+
+  CachedTexture cached;
+  cached.texture = texture;
+  cached.width = surface->w;
+  cached.height = surface->h;
+
+  outW = surface->w;
+  outH = surface->h;
+
+  SDL_FreeSurface(surface);
+
+  g_fileTextureCache[path] = cached;
+
+  return texture;
+}
+#endif
 
 } // namespace
 
@@ -354,6 +401,14 @@ Graphics::Graphics() {
   #endif
 
   SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_AUDIO);
+
+#ifdef NSTV_USE_SDL_IMAGE
+  int imgFlags = IMG_INIT_PNG;
+
+  if ((IMG_Init(imgFlags) & imgFlags) != imgFlags) {
+    std::printf("[NSTV] IMG_Init PNG failed: %s\n", IMG_GetError());
+  }
+#endif
 
 #ifdef NSTV_USE_SDL_TTF
   if (TTF_Init() == 0) g_ttfReady = true;
@@ -731,6 +786,79 @@ void Graphics::drawYuvFrame(const YuvFrame &frame, int x, int y, int w, int h) {
   SDL_RenderCopy(g_renderer, cached.texture, nullptr, &dst);
 }
 
+
+
+void Graphics::drawImageFile(
+  const std::string &path,
+  int x,
+  int y,
+  int w,
+  int h,
+  bool cover
+) {
+  if (!g_renderer || w <= 0 || h <= 0) {
+    return;
+  }
+
+#ifndef NSTV_USE_SDL_IMAGE
+  (void)path;
+  (void)x;
+  (void)y;
+  return;
+#else
+  int imageW = 0;
+  int imageH = 0;
+
+  SDL_Texture *texture = loadTextureFromFile(path, imageW, imageH);
+
+  if (!texture || imageW <= 0 || imageH <= 0) {
+    return;
+  }
+
+  const float srcRatio = static_cast<float>(imageW) / static_cast<float>(imageH);
+  const float dstRatio = static_cast<float>(w) / static_cast<float>(h);
+
+  int drawW = w;
+  int drawH = h;
+
+  if (cover) {
+    if (srcRatio > dstRatio) {
+      drawW = std::max(1, static_cast<int>(h * srcRatio));
+      drawH = h;
+    } else {
+      drawW = w;
+      drawH = std::max(1, static_cast<int>(w / srcRatio));
+    }
+  } else {
+    if (srcRatio > dstRatio) {
+      drawW = w;
+      drawH = std::max(1, static_cast<int>(w / srcRatio));
+    } else {
+      drawW = std::max(1, static_cast<int>(h * srcRatio));
+      drawH = h;
+    }
+  }
+
+  SDL_Rect dst{
+    x + (w - drawW) / 2,
+    y + (h - drawH) / 2,
+    drawW,
+    drawH
+  };
+
+  SDL_RenderCopy(g_renderer, texture, nullptr, &dst);
+#endif
+}
+
+void Graphics::drawImageFileCentered(
+  const std::string &path,
+  int x,
+  int y,
+  int w,
+  int h
+) {
+  drawImageFile(path, x, y, w, h, false);
+}
 
 } // namespace nstv
 
