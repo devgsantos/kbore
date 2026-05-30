@@ -1110,7 +1110,7 @@ void App::renderDashboardGraphic() {
   std::string chTitle = "CHANNELS";
   if (type) chTitle += " (" + type->label + ")";
   drawPanel(channelsPanel, chTitle, "channels", state_.focus == FocusColumn::Channels);
-  gfx_.drawTextRight(std::to_string(state_.loadedTotal > 0 ? state_.loadedTotal : (type ? type->totalChannels : 0)) + " CANAIS", channelsPanel.x + channelsPanel.w - 28, channelsPanel.y + 25, 2, muted, false);
+  gfx_.drawTextRight(std::to_string(state_.loadedTotal > 0 ? state_.loadedTotal : (type ? type->totalChannels : 0)) + " CHANNELS", channelsPanel.x + channelsPanel.w - 28, channelsPanel.y + 25, 2, muted, false);
 
   // Stream type cards -------------------------------------------------------
   int typeY = typesPanel.y + 70;
@@ -1124,15 +1124,16 @@ void App::renderDashboardGraphic() {
     gfx_.strokeRoundRect(typesPanel.x + 14, y, typesPanel.w - 28, 64, 13, selected ? brightBlue : rgba(72,92,128,24), selected ? 3 : 1);
     gfx_.drawIconBox(toString(t.id), typesPanel.x + 26, y + 10, 44, lighten(base,25), darken(base,30), text);
     gfx_.drawText(Graphics::fitText(t.label, 12), typesPanel.x + 82, y + 15, 3, text, true);
-    std::string sub = t.id == StreamType::Live ? "CANAIS AO VIVO" : (t.id == StreamType::Movies ? "FILMES" : (t.id == StreamType::Series ? "SERIES" : "RADIOS"));
-    gfx_.drawText(sub, typesPanel.x + 82, y + 42, 2, muted, false);
+    // Stream types sub label
+    // std::string sub = t.id == StreamType::Live ? "LIVE CHANNELS" : (t.id == StreamType::Movies ? "MOVIES" : (t.id == StreamType::Series ? "SERIES" : "RADIOS"));
+    // gfx_.drawText(sub, typesPanel.x + 82, y + 42, 2, muted, false);
     if (t.totalChannels > 0) gfx_.drawBadge(std::to_string(t.totalChannels), typesPanel.x + typesPanel.w - 68, y + 21, 42, 24, rgba(30,41,59,210), text);
   }
 
   int cy = typesPanel.y + typesPanel.h - 74;
   gfx_.fillRoundRect(typesPanel.x + 14, cy, typesPanel.w - 28, 56, 13, rgba(15,23,42,220));
   gfx_.drawIconBox("OK", typesPanel.x+26, cy+9, 38, rgb(22,101,52), rgb(20,83,45), green);
-  gfx_.drawText("CONEXAO", typesPanel.x+78, cy+12, 3, text, true);
+  gfx_.drawText("CONNECTED", typesPanel.x+78, cy+12, 3, text, true);
   gfx_.drawText((provider + " ONLINE"), typesPanel.x+78, cy+37, 2, green, false);
 
   // Categories: no side acronym/icon, smaller text -------------------------
@@ -1167,12 +1168,12 @@ void App::renderDashboardGraphic() {
 
     const int nameX = channelsPanel.x + 94;
     gfx_.drawText(Graphics::fitText(ch.name, 35), nameX, y + 9, 3, text, true);
-    gfx_.drawText("EPG indisponivel", nameX, y + 32, 2, muted, false);
+    gfx_.drawText("EPG unavailable", nameX, y + 32, 2, muted, false);
     gfx_.drawText(state_.favorites.count(ch.id) ? "*" : "<3", channelsPanel.x + channelsPanel.w - 42, y + 15, 2, muted, false);
   }
   if (state_.loadedChannels.empty()) {
-    gfx_.drawText("SELECIONE UMA CATEGORIA", channelsPanel.x + 40, channelsPanel.y + 178, 3, muted, false);
-    gfx_.drawText("PRESSIONE A PARA CARREGAR", channelsPanel.x + 40, channelsPanel.y + 206, 2, blue, true);
+    gfx_.drawText("SELECT A CATEGORY", channelsPanel.x + 40, channelsPanel.y + 178, 3, muted, false);
+    gfx_.drawText("PRESS A TO LOAD", channelsPanel.x + 40, channelsPanel.y + 206, 2, blue, true);
   }
 
   // Info panel: smaller footer text ----------------------------------------
@@ -1183,20 +1184,20 @@ void App::renderDashboardGraphic() {
   if (selectedChannel) {
     drawLogoOrFallback(*selectedChannel, info.x + 34, info.y + 13, 154, 62);
     gfx_.drawText(Graphics::fitText(selectedChannel->name, 42), info.x + 210, info.y + 18, 2, text, true);
-    gfx_.drawText("EPG indisponivel", info.x + 210, info.y + 46, 1, muted, false);
+    gfx_.drawText("EPG unavailable", info.x + 210, info.y + 46, 1, muted, false);
   } else {
     gfx_.drawText(state_.hasManifest ? Graphics::fitText(state_.manifest.name, 34) : "NSTV", info.x + 40, info.y + 30, 4, text, true);
   }
-  gfx_.drawText("PAGINA " + std::to_string(state_.loadedPage) + " / " + std::to_string(state_.loadedTotalPages), info.x + 610, info.y + 24, 2, text, true);
-  gfx_.drawText("CARREGADOS: " + std::to_string(state_.loadedChannels.size()) + " / " + std::to_string(state_.loadedTotal) + " CANAIS", info.x + 610, info.y + 50, 1, blue, true);
+  gfx_.drawText("PAGE " + std::to_string(state_.loadedPage) + " / " + std::to_string(state_.loadedTotalPages), info.x + 610, info.y + 24, 2, text, true);
+  gfx_.drawText("LOADED: " + std::to_string(state_.loadedChannels.size()) + " / " + std::to_string(state_.loadedTotal) + " CHANNELS", info.x + 610, info.y + 50, 1, blue, true);
   gfx_.drawText(provider + ": " + Graphics::fitText(state_.hasManifest ? state_.manifest.name : "CONFIGURE", 38), info.x + 940, info.y + 24, 2, text, false);
-  gfx_.drawText("ATUALIZADO", info.x + 978, info.y + 54, 1, green, false);
+  gfx_.drawText("UPDATED", info.x + 978, info.y + 54, 1, green, false);
 
   // Controls footer: smaller text ------------------------------------------
   Rect foot{18, 675, 1245, 36};
   gfx_.fillRoundRect(foot.x, foot.y, foot.w, foot.h, 10, rgba(17,24,39,240));
   gfx_.strokeRoundRect(foot.x, foot.y, foot.w, foot.h, 10, rgba(72,92,128,28), 1);
-  gfx_.drawText("UP LISTAS   LEFT/RIGHT COLUNAS   A SELECIONAR   B VOLTAR   X FAVORITOS   + LISTAS", foot.x + 26, foot.y + 13, 1, text, true);
+  gfx_.drawText("UP - PLAYLISTS   |    LEFT/RIGHT - COLUMNS   |    A  - SELECT   |    B - BACK   |    X - FAVORITES   |    + - PLAYLISTS", foot.x + 26, foot.y + 13, 1, text, true);
 
   if (state_.loading) {
     renderLoadingOverlay(state_.loadingMessage.empty() ? "Loading" : state_.loadingMessage);
