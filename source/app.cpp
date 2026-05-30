@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <chrono>
 #include <cstdio>
+#include <ctime>
 
 namespace nstv {
 
@@ -33,6 +34,39 @@ long long nowMs() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
     clock::now().time_since_epoch()
   ).count();
+}
+
+std::string formatSystemClockTime() {
+  std::time_t rawTime = std::time(nullptr);
+
+  if (rawTime <= 0) {
+    return "--:--";
+  }
+
+  std::tm localTime{};
+
+#if defined(_WIN32)
+  localtime_s(&localTime, &rawTime);
+#else
+  std::tm *result = std::localtime(&rawTime);
+
+  if (!result) {
+    return "--:--";
+  }
+
+  localTime = *result;
+#endif
+
+  char buffer[8] = {};
+  std::snprintf(
+    buffer,
+    sizeof(buffer),
+    "%02d:%02d",
+    localTime.tm_hour,
+    localTime.tm_min
+  );
+
+  return buffer;
 }
 
 std::vector<std::string> wrapText(const std::string &text, std::size_t maxCharsPerLine) {
@@ -281,6 +315,9 @@ void App::handle(Button button) {
         state_.message = "Playback stopped";
         state_.playerStarted = false;
         state_.playerFrameSeen = false;
+        state_.playerLoading = false;
+        state_.playerLoadFailed = false;
+        state_.playerErrorMessage.clear();
       } else if (button == Button::Select) {
         if (player_) {
           player_->togglePause();
@@ -888,9 +925,12 @@ void App::playSelectedChannel() {
   }
 
   state_.screen = ScreenId::Player;
-  state_.message = "Loading...";
+  state_.message = "Loading video";
   state_.playerStarted = false;
   state_.playerFrameSeen = false;
+  state_.playerLoading = true;
+  state_.playerLoadFailed = false;
+  state_.playerErrorMessage.clear();
   state_.playerOverlayUntilMs = nowMs() + 5000;
 
   render();
@@ -902,8 +942,15 @@ void App::playSelectedChannel() {
   if (player_->open(channel->url)) {
     state_.message = "Playing: " + channel->name;
     state_.playerStarted = true;
+    state_.playerLoading = false;
+    state_.playerLoadFailed = false;
+    state_.playerErrorMessage.clear();
   } else {
-    state_.message = "Player error: " + player_->error();
+    state_.message = "Failed to load video";
+    state_.playerStarted = false;
+    state_.playerLoading = false;
+    state_.playerLoadFailed = true;
+    state_.playerErrorMessage = player_->error();
   }
 }
 
@@ -1090,7 +1137,7 @@ void App::renderDashboardGraphic() {
 
   gfx_.fillCircle(984, 43, 6, green);
   gfx_.drawTextRight("ONLINE", 1080, 36, 3, text, true);
-  gfx_.drawTextRight("21:45", 1190, 30, 5, text, false);
+  gfx_.drawTextRight(formatSystemClockTime(), 1190, 30, 5, text, false);
   gfx_.drawHeaderIcon("config", 1216, 20, 38, text);
 
   auto drawPanel = [&](Rect r, const std::string &title, const std::string &icon, bool focused){
@@ -1110,7 +1157,7 @@ void App::renderDashboardGraphic() {
   std::string chTitle = "CHANNELS";
   if (type) chTitle += " (" + type->label + ")";
   drawPanel(channelsPanel, chTitle, "channels", state_.focus == FocusColumn::Channels);
-  gfx_.drawTextRight(std::to_string(state_.loadedTotal > 0 ? state_.loadedTotal : (type ? type->totalChannels : 0)) + " CANAIS", channelsPanel.x + channelsPanel.w - 28, channelsPanel.y + 25, 2, muted, false);
+  gfx_.drawTextRight(std::to_string(state_.loadedTotal > 0 ? state_.loadedTotal : (type ? type->totalChannels : 0)) + " CHANNELS", channelsPanel.x + channelsPanel.w - 28, channelsPanel.y + 25, 2, muted, false);
 
   // Stream type cards -------------------------------------------------------
   int typeY = typesPanel.y + 70;
@@ -1124,15 +1171,16 @@ void App::renderDashboardGraphic() {
     gfx_.strokeRoundRect(typesPanel.x + 14, y, typesPanel.w - 28, 64, 13, selected ? brightBlue : rgba(72,92,128,24), selected ? 3 : 1);
     gfx_.drawIconBox(toString(t.id), typesPanel.x + 26, y + 10, 44, lighten(base,25), darken(base,30), text);
     gfx_.drawText(Graphics::fitText(t.label, 12), typesPanel.x + 82, y + 15, 3, text, true);
-    std::string sub = t.id == StreamType::Live ? "CANAIS AO VIVO" : (t.id == StreamType::Movies ? "FILMES" : (t.id == StreamType::Series ? "SERIES" : "RADIOS"));
-    gfx_.drawText(sub, typesPanel.x + 82, y + 42, 2, muted, false);
+    // Stream types sub label
+    // std::string sub = t.id == StreamType::Live ? "LIVE CHANNELS" : (t.id == StreamType::Movies ? "MOVIES" : (t.id == StreamType::Series ? "SERIES" : "RADIOS"));
+    // gfx_.drawText(sub, typesPanel.x + 82, y + 42, 2, muted, false);
     if (t.totalChannels > 0) gfx_.drawBadge(std::to_string(t.totalChannels), typesPanel.x + typesPanel.w - 68, y + 21, 42, 24, rgba(30,41,59,210), text);
   }
 
   int cy = typesPanel.y + typesPanel.h - 74;
   gfx_.fillRoundRect(typesPanel.x + 14, cy, typesPanel.w - 28, 56, 13, rgba(15,23,42,220));
   gfx_.drawIconBox("OK", typesPanel.x+26, cy+9, 38, rgb(22,101,52), rgb(20,83,45), green);
-  gfx_.drawText("CONEXAO", typesPanel.x+78, cy+12, 3, text, true);
+  gfx_.drawText("CONNECTED", typesPanel.x+78, cy+12, 3, text, true);
   gfx_.drawText((provider + " ONLINE"), typesPanel.x+78, cy+37, 2, green, false);
 
   // Categories: no side acronym/icon, smaller text -------------------------
@@ -1167,12 +1215,12 @@ void App::renderDashboardGraphic() {
 
     const int nameX = channelsPanel.x + 94;
     gfx_.drawText(Graphics::fitText(ch.name, 35), nameX, y + 9, 3, text, true);
-    gfx_.drawText("EPG indisponivel", nameX, y + 32, 2, muted, false);
+    gfx_.drawText("EPG unavailable", nameX, y + 32, 2, muted, false);
     gfx_.drawText(state_.favorites.count(ch.id) ? "*" : "<3", channelsPanel.x + channelsPanel.w - 42, y + 15, 2, muted, false);
   }
   if (state_.loadedChannels.empty()) {
-    gfx_.drawText("SELECIONE UMA CATEGORIA", channelsPanel.x + 40, channelsPanel.y + 178, 3, muted, false);
-    gfx_.drawText("PRESSIONE A PARA CARREGAR", channelsPanel.x + 40, channelsPanel.y + 206, 2, blue, true);
+    gfx_.drawText("SELECT A CATEGORY", channelsPanel.x + 40, channelsPanel.y + 178, 3, muted, false);
+    gfx_.drawText("PRESS A TO LOAD", channelsPanel.x + 40, channelsPanel.y + 206, 2, blue, true);
   }
 
   // Info panel: smaller footer text ----------------------------------------
@@ -1183,20 +1231,20 @@ void App::renderDashboardGraphic() {
   if (selectedChannel) {
     drawLogoOrFallback(*selectedChannel, info.x + 34, info.y + 13, 154, 62);
     gfx_.drawText(Graphics::fitText(selectedChannel->name, 42), info.x + 210, info.y + 18, 2, text, true);
-    gfx_.drawText("EPG indisponivel", info.x + 210, info.y + 46, 1, muted, false);
+    gfx_.drawText("EPG unavailable", info.x + 210, info.y + 46, 1, muted, false);
   } else {
     gfx_.drawText(state_.hasManifest ? Graphics::fitText(state_.manifest.name, 34) : "NSTV", info.x + 40, info.y + 30, 4, text, true);
   }
-  gfx_.drawText("PAGINA " + std::to_string(state_.loadedPage) + " / " + std::to_string(state_.loadedTotalPages), info.x + 610, info.y + 24, 2, text, true);
-  gfx_.drawText("CARREGADOS: " + std::to_string(state_.loadedChannels.size()) + " / " + std::to_string(state_.loadedTotal) + " CANAIS", info.x + 610, info.y + 50, 1, blue, true);
+  gfx_.drawText("PAGE " + std::to_string(state_.loadedPage) + " / " + std::to_string(state_.loadedTotalPages), info.x + 610, info.y + 24, 2, text, true);
+  gfx_.drawText("LOADED: " + std::to_string(state_.loadedChannels.size()) + " / " + std::to_string(state_.loadedTotal) + " CHANNELS", info.x + 610, info.y + 50, 1, blue, true);
   gfx_.drawText(provider + ": " + Graphics::fitText(state_.hasManifest ? state_.manifest.name : "CONFIGURE", 38), info.x + 940, info.y + 24, 2, text, false);
-  gfx_.drawText("ATUALIZADO", info.x + 978, info.y + 54, 1, green, false);
+  gfx_.drawText("UPDATED", info.x + 978, info.y + 54, 1, green, false);
 
   // Controls footer: smaller text ------------------------------------------
   Rect foot{18, 675, 1245, 36};
   gfx_.fillRoundRect(foot.x, foot.y, foot.w, foot.h, 10, rgba(17,24,39,240));
   gfx_.strokeRoundRect(foot.x, foot.y, foot.w, foot.h, 10, rgba(72,92,128,28), 1);
-  gfx_.drawText("UP LISTAS   LEFT/RIGHT COLUNAS   A SELECIONAR   B VOLTAR   X FAVORITOS   + LISTAS", foot.x + 26, foot.y + 13, 1, text, true);
+  gfx_.drawText("UP - PLAYLISTS   |    LEFT/RIGHT - COLUMNS   |    A  - SELECT   |    B - BACK   |    X - FAVORITES   |    + - PLAYLISTS", foot.x + 26, foot.y + 13, 1, text, true);
 
   if (state_.loading) {
     renderLoadingOverlay(state_.loadingMessage.empty() ? "Loading" : state_.loadingMessage);
@@ -1378,78 +1426,71 @@ void App::renderPlayerGraphic() {
       rgb(2, 5, 11)
     );
 
-    if (channel) {
+    const int boxW = 520;
+    const int boxH = 190;
+    const int boxX = (Graphics::Width - boxW) / 2;
+    const int boxY = (Graphics::Height - boxH) / 2;
+
+    gfx_.fillRoundRect(
+      boxX,
+      boxY,
+      boxW,
+      boxH,
+      24,
+      rgba(15, 23, 42, 232)
+    );
+
+    gfx_.strokeRoundRect(
+      boxX,
+      boxY,
+      boxW,
+      boxH,
+      24,
+      state_.playerLoadFailed ? rgba(248, 113, 113, 120) : rgba(72, 92, 128, 70),
+      1
+    );
+
+    if (state_.playerLoadFailed) {
       gfx_.drawText(
-        Graphics::fitText(channel->name, 44),
-        64,
-        92,
+        "Failed to load video",
+        boxX + 82,
+        boxY + 58,
         3,
-        rgb(248, 250, 252),
+        rgb(248, 113, 113),
         true
       );
 
       gfx_.drawText(
-        Graphics::fitText(channel->url, 92),
-        64,
-        136,
+        "Press B to return",
+        boxX + 164,
+        boxY + 104,
         1,
-        rgb(150, 163, 190),
+        rgb(203, 213, 225),
         false
       );
+    } else {
+      const char spinnerChars[4] = {'|', '/', '-', '\\'};
+      const int index = static_cast<int>((nowMs() / 140) % 4);
+      std::string spinner(1, spinnerChars[index]);
+
+      gfx_.drawText(
+        spinner,
+        boxX + 244,
+        boxY + 40,
+        5,
+        rgb(0, 191, 255),
+        true
+      );
+
+      gfx_.drawText(
+        "Loading video",
+        boxX + 138,
+        boxY + 106,
+        3,
+        rgb(248, 250, 252),
+        true
+      );
     }
-
-    std::string error = player_ && !player_->error().empty()
-      ? player_->error()
-      : "Unable to start playback";
-
-    gfx_.fillRoundRect(
-      56,
-      190,
-      Graphics::Width - 112,
-      330,
-      18,
-      rgba(15, 23, 42, 210)
-    );
-
-    gfx_.strokeRoundRect(
-      56,
-      190,
-      Graphics::Width - 112,
-      330,
-      18,
-      rgba(72, 92, 128, 50),
-      1
-    );
-
-    gfx_.drawText(
-      "Player diagnostic",
-      80,
-      214,
-      2,
-      rgb(248, 250, 252),
-      true
-    );
-
-    drawWrappedText(
-      gfx_,
-      error,
-      80,
-      252,
-      10,
-      112,
-      1,
-      rgb(203, 213, 225),
-      false
-    );
-
-    gfx_.drawText(
-      "Tip: this screen is currently showing decoder probe information.",
-      80,
-      548,
-      1,
-      rgb(148, 163, 184),
-      false
-    );
   }
 
   const bool showOverlay =

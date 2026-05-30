@@ -46,6 +46,9 @@ struct AppState {
   long long playerOverlayUntilMs = 0;
   bool playerStarted = false;
   bool playerFrameSeen = false;
+  bool playerLoading = false;
+  bool playerLoadFailed = false;
+  std::string playerErrorMessage;
 };
 
 class App {
