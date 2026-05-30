@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <chrono>
 #include <cstdio>
+#include <ctime>
 
 namespace nstv {
 
@@ -33,6 +34,39 @@ long long nowMs() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
     clock::now().time_since_epoch()
   ).count();
+}
+
+std::string formatSystemClockTime() {
+  std::time_t rawTime = std::time(nullptr);
+
+  if (rawTime <= 0) {
+    return "--:--";
+  }
+
+  std::tm localTime{};
+
+#if defined(_WIN32)
+  localtime_s(&localTime, &rawTime);
+#else
+  std::tm *result = std::localtime(&rawTime);
+
+  if (!result) {
+    return "--:--";
+  }
+
+  localTime = *result;
+#endif
+
+  char buffer[8] = {};
+  std::snprintf(
+    buffer,
+    sizeof(buffer),
+    "%02d:%02d",
+    localTime.tm_hour,
+    localTime.tm_min
+  );
+
+  return buffer;
 }
 
 std::vector<std::string> wrapText(const std::string &text, std::size_t maxCharsPerLine) {
@@ -281,6 +315,9 @@ void App::handle(Button button) {
         state_.message = "Playback stopped";
         state_.playerStarted = false;
         state_.playerFrameSeen = false;
+        state_.playerLoading = false;
+        state_.playerLoadFailed = false;
+        state_.playerErrorMessage.clear();
       } else if (button == Button::Select) {
         if (player_) {
           player_->togglePause();
@@ -888,9 +925,12 @@ void App::playSelectedChannel() {
   }
 
   state_.screen = ScreenId::Player;
-  state_.message = "Loading...";
+  state_.message = "Loading video";
   state_.playerStarted = false;
   state_.playerFrameSeen = false;
+  state_.playerLoading = true;
+  state_.playerLoadFailed = false;
+  state_.playerErrorMessage.clear();
   state_.playerOverlayUntilMs = nowMs() + 5000;
 
   render();
@@ -902,8 +942,15 @@ void App::playSelectedChannel() {
   if (player_->open(channel->url)) {
     state_.message = "Playing: " + channel->name;
     state_.playerStarted = true;
+    state_.playerLoading = false;
+    state_.playerLoadFailed = false;
+    state_.playerErrorMessage.clear();
   } else {
-    state_.message = "Player error: " + player_->error();
+    state_.message = "Failed to load video";
+    state_.playerStarted = false;
+    state_.playerLoading = false;
+    state_.playerLoadFailed = true;
+    state_.playerErrorMessage = player_->error();
   }
 }
 
@@ -1090,7 +1137,7 @@ void App::renderDashboardGraphic() {
 
   gfx_.fillCircle(984, 43, 6, green);
   gfx_.drawTextRight("ONLINE", 1080, 36, 3, text, true);
-  gfx_.drawTextRight("21:45", 1190, 30, 5, text, false);
+  gfx_.drawTextRight(formatSystemClockTime(), 1190, 30, 5, text, false);
   gfx_.drawHeaderIcon("config", 1216, 20, 38, text);
 
   auto drawPanel = [&](Rect r, const std::string &title, const std::string &icon, bool focused){
@@ -1379,78 +1426,71 @@ void App::renderPlayerGraphic() {
       rgb(2, 5, 11)
     );
 
-    if (channel) {
+    const int boxW = 520;
+    const int boxH = 190;
+    const int boxX = (Graphics::Width - boxW) / 2;
+    const int boxY = (Graphics::Height - boxH) / 2;
+
+    gfx_.fillRoundRect(
+      boxX,
+      boxY,
+      boxW,
+      boxH,
+      24,
+      rgba(15, 23, 42, 232)
+    );
+
+    gfx_.strokeRoundRect(
+      boxX,
+      boxY,
+      boxW,
+      boxH,
+      24,
+      state_.playerLoadFailed ? rgba(248, 113, 113, 120) : rgba(72, 92, 128, 70),
+      1
+    );
+
+    if (state_.playerLoadFailed) {
       gfx_.drawText(
-        Graphics::fitText(channel->name, 44),
-        64,
-        92,
+        "Failed to load video",
+        boxX + 82,
+        boxY + 58,
         3,
-        rgb(248, 250, 252),
+        rgb(248, 113, 113),
         true
       );
 
       gfx_.drawText(
-        Graphics::fitText(channel->url, 92),
-        64,
-        136,
+        "Press B to return",
+        boxX + 164,
+        boxY + 104,
         1,
-        rgb(150, 163, 190),
+        rgb(203, 213, 225),
         false
       );
+    } else {
+      const char spinnerChars[4] = {'|', '/', '-', '\\'};
+      const int index = static_cast<int>((nowMs() / 140) % 4);
+      std::string spinner(1, spinnerChars[index]);
+
+      gfx_.drawText(
+        spinner,
+        boxX + 244,
+        boxY + 40,
+        5,
+        rgb(0, 191, 255),
+        true
+      );
+
+      gfx_.drawText(
+        "Loading video",
+        boxX + 138,
+        boxY + 106,
+        3,
+        rgb(248, 250, 252),
+        true
+      );
     }
-
-    std::string error = player_ && !player_->error().empty()
-      ? player_->error()
-      : "Unable to start playback";
-
-    gfx_.fillRoundRect(
-      56,
-      190,
-      Graphics::Width - 112,
-      330,
-      18,
-      rgba(15, 23, 42, 210)
-    );
-
-    gfx_.strokeRoundRect(
-      56,
-      190,
-      Graphics::Width - 112,
-      330,
-      18,
-      rgba(72, 92, 128, 50),
-      1
-    );
-
-    gfx_.drawText(
-      "Player diagnostic",
-      80,
-      214,
-      2,
-      rgb(248, 250, 252),
-      true
-    );
-
-    drawWrappedText(
-      gfx_,
-      error,
-      80,
-      252,
-      10,
-      112,
-      1,
-      rgb(203, 213, 225),
-      false
-    );
-
-    gfx_.drawText(
-      "Tip: this screen is currently showing decoder probe information.",
-      80,
-      548,
-      1,
-      rgb(148, 163, 184),
-      false
-    );
   }
 
   const bool showOverlay =
