@@ -1,7 +1,7 @@
-APP_TITLE      := NSTV Native
-APP_AUTHOR     := Gilson Santos / OpenAI
+APP_TITLE      := kboré
+APP_AUTHOR     := Gilson Santos
 APP_VERSION    := 0.3.0
-TARGET         := nstv-native
+TARGET         := kbore
 BUILD          := build
 SOURCES        := source
 INCLUDES       := include

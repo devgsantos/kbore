@@ -6,14 +6,14 @@ APP_ROOT := $(abspath $(dir $(firstword $(MAKEFILE_LIST))))
 
 include $(DEVKITPRO)/libnx/switch_rules
 
-TARGET       := nstv-native
+TARGET       := kbore
 BUILD        := build-switch
 SOURCES      := source
 DATA         := data
 INCLUDES     := include
-APP_TITLE    := NSTV Native
-APP_AUTHOR   := Gilson Santos / OpenAI
-APP_VERSION  := 0.3.0
+APP_TITLE    := kboré
+APP_AUTHOR   := Gilson Santos
+APP_VERSION  := 1.0.0
 
 ARCH := -march=armv8-a -mtune=cortex-a57 -mtp=soft -fPIE
 CFLAGS   = -g -Wall -O2 -ffunction-sections $(ARCH) $(DEFINES) -D__SWITCH__ -DNSTV_USE_SDL -DNSTV_USE_SDL_TTF -DNSTV_USE_SDL_IMAGE -DNSTV_ENABLE_NATIVE_HW_PLAYER $(FFMPEG_DEFINES)

@@ -9,7 +9,7 @@ namespace nstv {
 
 std::string dataDir() {
 #ifdef __SWITCH__
-  return "sdmc:/switch/nstv";
+  return "sdmc:/switch/kbore";
 #else
   return ".";
 #endif
@@ -30,8 +30,8 @@ static void ensureDir(const std::string &path) {
 static void ensureDataDir() {
 #ifdef __SWITCH__
   mkdir("sdmc:/switch", 0777);
-  mkdir("sdmc:/switch/nstv", 0777);
-  mkdir("sdmc:/switch/nstv/cache", 0777);
+  mkdir("sdmc:/switch/kbore", 0777);
+  mkdir("sdmc:/switch/kbore/cache", 0777);
 #else
   mkdir(".", 0777);
   mkdir("./cache", 0777);
@@ -62,12 +62,14 @@ static std::string safeFilePart(const std::string &value) {
 }
 
 std::string channelPageCachePath(
+  const std::string &playlistId,
   Provider provider,
   StreamType type,
   const std::string &categoryId,
   int page
 ) {
   return cacheDir() + "/" +
+    safeFilePart(playlistId.empty() ? "active" : playlistId) + "_" +
     safeFilePart(toString(provider)) + "_" +
     safeFilePart(toString(type)) + "_" +
     safeFilePart(categoryId) + "_page_" +
@@ -226,6 +228,7 @@ bool loadManifest(Manifest &manifest) {
 }
 
 bool saveChannelPage(
+  const std::string &playlistId,
   Provider provider,
   StreamType type,
   const std::string &categoryId,
@@ -233,7 +236,7 @@ bool saveChannelPage(
 ) {
   ensureDataDir();
 
-  std::ofstream file(channelPageCachePath(provider, type, categoryId, page.page), std::ios::binary);
+  std::ofstream file(channelPageCachePath(playlistId, provider, type, categoryId, page.page), std::ios::binary);
   if (!file) return false;
 
   file << channelPageToJson(page).stringify();
@@ -241,13 +244,14 @@ bool saveChannelPage(
 }
 
 bool loadChannelPage(
+  const std::string &playlistId,
   Provider provider,
   StreamType type,
   const std::string &categoryId,
   int pageNumber,
   ChannelPage &page
 ) {
-  std::ifstream file(channelPageCachePath(provider, type, categoryId, pageNumber), std::ios::binary);
+  std::ifstream file(channelPageCachePath(playlistId, provider, type, categoryId, pageNumber), std::ios::binary);
   if (!file) return false;
 
   std::ostringstream ss;
