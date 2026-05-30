@@ -26,6 +26,10 @@ SDL_Window *g_window = nullptr;
 SDL_Renderer *g_renderer = nullptr;
 bool g_sdlReady = false;
 
+#ifdef __SWITCH__
+bool g_romfsReady = false;
+#endif
+
 #ifdef NSTV_USE_SDL_TTF
 std::map<std::string, TTF_Font *> g_fontCache;
 bool g_ttfReady = false;
@@ -217,25 +221,34 @@ std::array<uint8_t, 7> fallbackGlyph(char ch) {
 }
 
 const char *firstExistingFont() {
-  // Prefer project-bundled fonts. On Switch, copy the fonts folder to:
-  // sdmc:/switch/nstv/fonts/
   static std::vector<std::string> paths = {
 #ifdef __SWITCH__
+    "romfs:/fonts/OpenSans-Regular.ttf",
+    "romfs:/fonts/OpenSans-SemiBold.ttf",
+    "romfs:/fonts/Roboto-Regular.ttf",
+    "romfs:/fonts/Roboto-Medium.ttf",
+    "romfs:/fonts/DejaVuSans.ttf",
+
+    "sdmc:/switch/nstv-native/fonts/OpenSans-Regular.ttf",
+    "sdmc:/switch/nstv-native/fonts/OpenSans-SemiBold.ttf",
+    "sdmc:/switch/nstv-native/fonts/Roboto-Regular.ttf",
+    "sdmc:/switch/nstv-native/fonts/Roboto-Medium.ttf",
+    "sdmc:/switch/nstv-native/fonts/DejaVuSans.ttf",
+
+    "sdmc:/switch/nstv/fonts/OpenSans-Regular.ttf",
+    "sdmc:/switch/nstv/fonts/OpenSans-SemiBold.ttf",
     "sdmc:/switch/nstv/fonts/Roboto-Regular.ttf",
     "sdmc:/switch/nstv/fonts/Roboto-Medium.ttf",
-    "sdmc:/switch/nstv/fonts/Roboto_SemiCondensed-Regular.ttf",
-    "sdmc:/switch/nstv/fonts/ConcertOne-Regular.ttf",
-    "sdmc:/switch/nstv/fonts/OpenSans-Regular.ttf",
     "sdmc:/switch/nstv/fonts/DejaVuSans.ttf",
 #else
+    "./romfs/fonts/OpenSans-Regular.ttf",
+    "./romfs/fonts/OpenSans-SemiBold.ttf",
+    "./romfs/fonts/Roboto-Regular.ttf",
+    "./romfs/fonts/Roboto-Medium.ttf",
+    "./fonts/OpenSans-Regular.ttf",
+    "./fonts/OpenSans-SemiBold.ttf",
     "./fonts/Roboto-Regular.ttf",
     "./fonts/Roboto-Medium.ttf",
-    "./fonts/Roboto_SemiCondensed-Regular.ttf",
-    "./fonts/ConcertOne-Regular.ttf",
-    "./fonts/OpenSans-Regular.ttf",
-    "./fonts/open-sans/OpenSans-Regular.ttf",
-    "/usr/share/fonts/truetype/roboto/unhinted/RobotoTTF/Roboto-Regular.ttf",
-    "/usr/share/fonts/truetype/roboto/Roboto-Regular.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
 #endif
@@ -243,19 +256,31 @@ const char *firstExistingFont() {
 
   for (const auto &path : paths) {
     FILE *fp = std::fopen(path.c_str(), "rb");
+
     if (fp) {
       std::fclose(fp);
+      std::printf("[NSTV] Found font: %s\n", path.c_str());
       return path.c_str();
     }
   }
+
+  std::printf("[NSTV] No font found\n");
   return nullptr;
 }
 
 #ifdef NSTV_USE_SDL_TTF
 TTF_Font *fontForScale(int scale, bool bold) {
-  if (!g_ttfReady) return nullptr;
+  if (!g_ttfReady) {
+    std::printf("[NSTV] SDL_ttf is not ready\n");
+    return nullptr;
+  }
+
   const char *fontPath = firstExistingFont();
-  if (!fontPath) return nullptr;
+
+  if (!fontPath) {
+    std::printf("[NSTV] No TTF font path available\n");
+    return nullptr;
+  }
 
   // Map legacy scale values to TV-friendly point sizes.
   int size = 12;
@@ -274,12 +299,18 @@ TTF_Font *fontForScale(int scale, bool bold) {
   if (found != g_fontCache.end()) return found->second;
 
   TTF_Font *font = TTF_OpenFont(fontPath, size);
+
   if (!font) {
-    std::fprintf(stderr, "[NSTV] Failed to open font %s: %s\n", fontPath, TTF_GetError());
+    std::printf("[NSTV] TTF_OpenFont failed: %s | path=%s\n", TTF_GetError(), fontPath);
     return nullptr;
   }
 
-  if (bold) TTF_SetFontStyle(font, TTF_STYLE_BOLD);
+  if (bold) {
+    TTF_SetFontStyle(font, TTF_STYLE_BOLD);
+  }
+
+  std::printf("[NSTV] Loaded font: %s size=%d bold=%d\n", fontPath, size, bold ? 1 : 0);
+
   g_fontCache[key] = font;
   return font;
 }
@@ -309,7 +340,21 @@ Color typeColor(const std::string &type) {
 Graphics::Graphics() {
   if (g_sdlReady) return;
 
+  #ifdef __SWITCH__
+    if (!g_romfsReady) {
+      Result rc = romfsInit();
+
+      if (R_SUCCEEDED(rc)) {
+        g_romfsReady = true;
+        std::printf("[NSTV] RomFS initialized\n");
+      } else {
+        std::printf("[NSTV] romfsInit failed: 0x%x\n", rc);
+      }
+    }
+  #endif
+
   SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_AUDIO);
+
 #ifdef NSTV_USE_SDL_TTF
   if (TTF_Init() == 0) g_ttfReady = true;
 #endif
