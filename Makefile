@@ -1,5 +1,5 @@
 APP_TITLE      := NSTV Native
-APP_AUTHOR     := Gilson Santos / OpenAI
+APP_AUTHOR     := Gilson Santos
 APP_VERSION    := 0.3.0
 TARGET         := nstv-native
 BUILD          := build

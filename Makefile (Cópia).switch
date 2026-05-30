@@ -10,7 +10,7 @@ SOURCES      := source
 DATA         := data
 INCLUDES     := include
 APP_TITLE    := NSTV Native
-APP_AUTHOR   := Gilson Santos / OpenAI
+APP_AUTHOR   := Gilson Santos
 APP_VERSION  := 0.3.0
 
 APP_ROOT := $(abspath $(dir $(firstword $(MAKEFILE_LIST))))
