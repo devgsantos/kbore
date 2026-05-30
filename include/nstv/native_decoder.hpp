@@ -77,7 +77,11 @@ public:
   int audioQueuedBytes() const;
 
   bool decodeFirstVideoFrame(NativeDemuxer &demuxer);
-  bool decodeNextVideoFrame(NativeDemuxer &demuxer, bool outputFrame = true);
+  bool decodeNextVideoFrame(
+    NativeDemuxer &demuxer,
+    bool outputFrame = true,
+    YuvFrame *outputYuvFrame = nullptr
+  );
   bool dropNextVideoFrame(NativeDemuxer &demuxer);
 
 #ifdef NSTV_USE_FFMPEG

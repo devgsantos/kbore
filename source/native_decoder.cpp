@@ -1057,7 +1057,11 @@ bool NativeDecoder::decodeAudioPacketToSdl(AVPacket *packet) {
 }
 #endif
 
-bool NativeDecoder::decodeNextVideoFrame(NativeDemuxer &demuxer, bool outputFrame) {
+bool NativeDecoder::decodeNextVideoFrame(
+  NativeDemuxer &demuxer,
+  bool outputFrame,
+  YuvFrame *outputYuvFrame
+) {
 #ifndef NSTV_USE_FFMPEG
   error_ = "NativeDecoder requires NSTV_USE_FFMPEG.";
   return false;
@@ -1363,19 +1367,22 @@ bool NativeDecoder::decodeNextVideoFrame(NativeDemuxer &demuxer, bool outputFram
       }
 
       YuvFrame decodedFrame;
+      YuvFrame &targetFrame = outputYuvFrame ? *outputYuvFrame : decodedFrame;
       std::string copyError;
 
-      if (!copyAvFrameToYuvFrame(frameForCopy, decodedFrame, copyError)) {
+      if (!copyAvFrameToYuvFrame(frameForCopy, targetFrame, copyError)) {
         error_ = copyError;
         av_frame_unref(impl_->videoFrame);
         av_frame_unref(impl_->transferredFrame);
         return false;
       }
 
-      latestYuvFrame_ = std::move(decodedFrame);
-
       if (!firstYuvFrame_.valid()) {
-        firstYuvFrame_ = latestYuvFrame_;
+        firstYuvFrame_ = targetFrame;
+      }
+
+      if (!outputYuvFrame) {
+        latestYuvFrame_ = std::move(decodedFrame);
       }
 
       av_frame_unref(impl_->videoFrame);

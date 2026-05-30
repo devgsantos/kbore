@@ -405,7 +405,7 @@ bool NativeHwPlayerBackend::open(const std::string &url) {
   if (!nativeFramePresented_) {
     const long long firstDecodeStartMs = nowMs();
 
-    if (!decoder_.decodeFirstVideoFrame(demuxer_)) {
+    if (!decoder_.decodeNextVideoFrame(demuxer_, true, &yuvFrame_)) {
       error_ =
         "Native HW decoder opened, but first frame decode failed: " +
         decoder_.error() +
@@ -419,8 +419,6 @@ bool NativeHwPlayerBackend::open(const std::string &url) {
     }
 
     updateCpuFrameCost(nowMs() - firstDecodeStartMs);
-
-    yuvFrame_ = decoder_.latestYuvFrame();
 
     if (!yuvFrame_.valid()) {
       error_ =
@@ -563,14 +561,12 @@ bool NativeHwPlayerBackend::update() {
 
   const long long decodeStartMs = nowMs();
 
-  if (!decoder_.decodeNextVideoFrame(demuxer_, true)) {
+  if (!decoder_.decodeNextVideoFrame(demuxer_, true, &yuvFrame_)) {
     error_ = decoder_.error();
     return hasFrame();
   }
 
   updateCpuFrameCost(nowMs() - decodeStartMs);
-
-  yuvFrame_ = decoder_.latestYuvFrame();
 
   if (!yuvFrame_.valid()) {
     error_ = "Native decoded frame is invalid: " + decoder_.summary();
