@@ -68,6 +68,7 @@ private:
 
   int fallbackFrameIntervalMs_ = 40;
   int currentFrameIntervalMs_ = 40;
+  int cpuFrameCostAvgMs_ = 0;
 
   int decodedFrames_ = 0;
 
@@ -80,6 +81,7 @@ private:
   int cpuPresentationIntervalMs() const;
   int maxDropsPerUpdate() const;
   int dropDelayThresholdMs() const;
+  void updateCpuFrameCost(long long elapsedMs);
 };
 
 } // namespace nstv

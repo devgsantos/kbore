@@ -50,6 +50,7 @@ void NativeHwPlayerBackend::resetClock() {
 
   fallbackFrameIntervalMs_ = 40;
   currentFrameIntervalMs_ = 40;
+  cpuFrameCostAvgMs_ = 0;
 
   decodedFrames_ = 0;
 }
@@ -190,11 +191,31 @@ int NativeHwPlayerBackend::cpuPresentationIntervalMs() const {
   const int pixels = width * height;
 
   if (width >= 1700 || height >= 950 || pixels >= 1800 * 900) {
-    return 100;
+    if (cpuFrameCostAvgMs_ <= 0) {
+      return 50;
+    }
+
+    if (cpuFrameCostAvgMs_ <= 28) {
+      return 33;
+    }
+
+    if (cpuFrameCostAvgMs_ <= 45) {
+      return 50;
+    }
+
+    return 67;
   }
 
   if (width >= 1100 || height >= 650 || pixels >= 1000 * 600) {
-    return 50;
+    if (cpuFrameCostAvgMs_ <= 0) {
+      return 33;
+    }
+
+    if (cpuFrameCostAvgMs_ <= 22) {
+      return 25;
+    }
+
+    return 33;
   }
 
   return 0;
@@ -205,6 +226,10 @@ int NativeHwPlayerBackend::maxDropsPerUpdate() const {
 
   if (interval >= 100) {
     return 18;
+  }
+
+  if (interval >= 67) {
+    return 14;
   }
 
   if (interval >= 50) {
@@ -221,11 +246,26 @@ int NativeHwPlayerBackend::dropDelayThresholdMs() const {
     return 45;
   }
 
+  if (interval >= 67) {
+    return 55;
+  }
+
   if (interval >= 50) {
     return 70;
   }
 
   return 120;
+}
+
+void NativeHwPlayerBackend::updateCpuFrameCost(long long elapsedMs) {
+  const int clamped = std::max(1, std::min(250, static_cast<int>(elapsedMs)));
+
+  if (cpuFrameCostAvgMs_ <= 0) {
+    cpuFrameCostAvgMs_ = clamped;
+    return;
+  }
+
+  cpuFrameCostAvgMs_ = (cpuFrameCostAvgMs_ * 3 + clamped) / 4;
 }
 
 bool NativeHwPlayerBackend::open(const std::string &url) {
@@ -363,6 +403,8 @@ bool NativeHwPlayerBackend::open(const std::string &url) {
   }
 
   if (!nativeFramePresented_) {
+    const long long firstDecodeStartMs = nowMs();
+
     if (!decoder_.decodeFirstVideoFrame(demuxer_)) {
       error_ =
         "Native HW decoder opened, but first frame decode failed: " +
@@ -375,6 +417,8 @@ bool NativeHwPlayerBackend::open(const std::string &url) {
       open_ = false;
       return false;
     }
+
+    updateCpuFrameCost(nowMs() - firstDecodeStartMs);
 
     yuvFrame_ = decoder_.latestYuvFrame();
 
@@ -517,10 +561,14 @@ bool NativeHwPlayerBackend::update() {
 #endif
   }
 
+  const long long decodeStartMs = nowMs();
+
   if (!decoder_.decodeNextVideoFrame(demuxer_, true)) {
     error_ = decoder_.error();
     return hasFrame();
   }
+
+  updateCpuFrameCost(nowMs() - decodeStartMs);
 
   yuvFrame_ = decoder_.latestYuvFrame();
 
