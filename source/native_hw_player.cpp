@@ -45,6 +45,7 @@ void NativeHwPlayerBackend::resetClock() {
 
   playbackStartMs_ = 0;
   lastFrameWallMs_ = 0;
+  lastPresentedVideoWallMs_ = 0;
   nextFrameDueMs_ = 0;
 
   fallbackFrameIntervalMs_ = 40;
@@ -58,6 +59,7 @@ void NativeHwPlayerBackend::resetClockToCurrentFrame(long long now) {
 
   playbackStartMs_ = now;
   lastFrameWallMs_ = now;
+  lastPresentedVideoWallMs_ = now;
   nextFrameDueMs_ = now + currentFrameIntervalMs_;
 
   if (info.ptsMs >= 0) {
@@ -173,7 +175,57 @@ bool NativeHwPlayerBackend::shouldDropFrames(long long now) const {
     Isso evita o problema anterior do SD acelerando para 2x.
     Em SD estável, o delay fica baixo e nenhum frame é pulado.
   */
-  return playbackDelayMs(now) > 120;
+  return playbackDelayMs(now) > dropDelayThresholdMs();
+}
+
+int NativeHwPlayerBackend::cpuPresentationIntervalMs() const {
+  int width = decoder_.video().width;
+  int height = decoder_.video().height;
+
+  if (yuvFrame_.valid()) {
+    width = std::max(width, yuvFrame_.width);
+    height = std::max(height, yuvFrame_.height);
+  }
+
+  const int pixels = width * height;
+
+  if (width >= 1700 || height >= 950 || pixels >= 1800 * 900) {
+    return 100;
+  }
+
+  if (width >= 1100 || height >= 650 || pixels >= 1000 * 600) {
+    return 50;
+  }
+
+  return 0;
+}
+
+int NativeHwPlayerBackend::maxDropsPerUpdate() const {
+  const int interval = cpuPresentationIntervalMs();
+
+  if (interval >= 100) {
+    return 18;
+  }
+
+  if (interval >= 50) {
+    return 10;
+  }
+
+  return 6;
+}
+
+int NativeHwPlayerBackend::dropDelayThresholdMs() const {
+  const int interval = cpuPresentationIntervalMs();
+
+  if (interval >= 100) {
+    return 45;
+  }
+
+  if (interval >= 50) {
+    return 70;
+  }
+
+  return 120;
 }
 
 bool NativeHwPlayerBackend::open(const std::string &url) {
@@ -186,6 +238,7 @@ bool NativeHwPlayerBackend::open(const std::string &url) {
   nativeRenderer_.reset();
   nativeRendererReady_ = false;
   nativeRendererFailed_ = false;
+  nativeFramePresented_ = false;
   nativeRendererStatus_.clear();
   resetClock();
 
@@ -276,31 +329,67 @@ bool NativeHwPlayerBackend::open(const std::string &url) {
     }
   }
 
-  if (!decoder_.decodeFirstVideoFrame(demuxer_)) {
-    error_ =
-      "Native HW decoder opened, but first frame decode failed: " +
-      decoder_.error() +
-      " | decoder=" +
-      decoder_.summary() +
-      " | hwProbe=" +
-      hwProbe_.summary();
+  if (nativeRendererReady_ && nativeRenderer_) {
+#ifdef NSTV_USE_FFMPEG
+    if (decoder_.decodeNextHardwareFrame(demuxer_)) {
+      const AVFrame *frame = decoder_.latestHardwareFrame();
 
-    open_ = false;
-    return false;
+      if (nativeRenderer_->canRender(frame) && nativeRenderer_->renderFrame(frame)) {
+        nativeFramePresented_ = true;
+      } else {
+        nativeRendererFailed_ = true;
+        nativeRendererReady_ = false;
+        nativeRendererStatus_ = "Deko3D first-frame render failed: " + nativeRenderer_->error();
+
+        std::printf("[KBORE][DEKO3D] first frame failed: %s\n", nativeRendererStatus_.c_str());
+        std::printf("[KBORE][DEKO3D] fallback to SDL/YUV\n");
+
+        decoder_.releaseLatestHardwareFrame();
+        nativeRenderer_->shutdown();
+        nativeRenderer_.reset();
+      }
+    } else {
+      nativeRendererFailed_ = true;
+      nativeRendererReady_ = false;
+      nativeRendererStatus_ = "Deko3D first hardware decode failed: " + decoder_.error();
+
+      std::printf("[KBORE][DEKO3D] first hardware frame failed: %s\n", nativeRendererStatus_.c_str());
+      std::printf("[KBORE][DEKO3D] fallback to SDL/YUV\n");
+
+      nativeRenderer_->shutdown();
+      nativeRenderer_.reset();
+    }
+#endif
   }
 
-  yuvFrame_ = decoder_.latestYuvFrame();
+  if (!nativeFramePresented_) {
+    if (!decoder_.decodeFirstVideoFrame(demuxer_)) {
+      error_ =
+        "Native HW decoder opened, but first frame decode failed: " +
+        decoder_.error() +
+        " | decoder=" +
+        decoder_.summary() +
+        " | hwProbe=" +
+        hwProbe_.summary();
 
-  if (!yuvFrame_.valid()) {
-    error_ =
-      "Native HW first frame decoded, but YuvFrame is invalid: " +
-      decoder_.summary();
+      open_ = false;
+      return false;
+    }
 
-    open_ = false;
-    return false;
+    yuvFrame_ = decoder_.latestYuvFrame();
+
+    if (!yuvFrame_.valid()) {
+      error_ =
+        "Native HW first frame decoded, but YuvFrame is invalid: " +
+        decoder_.summary();
+
+      open_ = false;
+      return false;
+    }
   }
 
   syncClockFromLatestFrame();
+  lastPresentedVideoWallMs_ = nowMs();
 
   decoder_.startAudio();
 
@@ -331,6 +420,7 @@ void NativeHwPlayerBackend::close() {
   yuvFrame_ = YuvFrame{};
   nativeRendererReady_ = false;
   nativeRendererFailed_ = false;
+  nativeFramePresented_ = false;
   nativeRendererStatus_.clear();
   resetClock();
 }
@@ -367,9 +457,9 @@ bool NativeHwPlayerBackend::update() {
 
     Podemos permitir mais drops por update para HD/FHD.
   */
-  const int maxDropsPerUpdate = 6;
+  const int maxDrops = maxDropsPerUpdate();
 
-  while (dropped < maxDropsPerUpdate && shouldDropFrames(nowMs())) {
+  while (dropped < maxDrops && shouldDropFrames(nowMs())) {
     if (!decoder_.dropNextVideoFrame(demuxer_)) {
       error_ = decoder_.error();
       break;
@@ -377,6 +467,54 @@ bool NativeHwPlayerBackend::update() {
 
     syncClockFromLatestFrame();
     ++dropped;
+  }
+
+  const int cpuInterval = cpuPresentationIntervalMs();
+
+  if (
+    cpuInterval > 0 &&
+    yuvFrame_.valid() &&
+    lastPresentedVideoWallMs_ > 0 &&
+    nowMs() - lastPresentedVideoWallMs_ < cpuInterval
+  ) {
+    if (decoder_.dropNextVideoFrame(demuxer_)) {
+      syncClockFromLatestFrame();
+      error_.clear();
+    } else {
+      error_ = decoder_.error();
+    }
+
+    return hasFrame();
+  }
+
+  if (nativeRendererReady_ && nativeRenderer_) {
+#ifdef NSTV_USE_FFMPEG
+    if (decoder_.decodeNextHardwareFrame(demuxer_)) {
+      const AVFrame *frame = decoder_.latestHardwareFrame();
+
+      if (nativeRenderer_->canRender(frame) && nativeRenderer_->renderFrame(frame)) {
+        nativeFramePresented_ = true;
+        syncClockFromLatestFrame();
+        error_.clear();
+        return true;
+      }
+
+      nativeRendererFailed_ = true;
+      nativeRendererReady_ = false;
+      nativeFramePresented_ = false;
+      nativeRendererStatus_ = "Deko3D render failed: " + nativeRenderer_->error();
+
+      std::printf("[KBORE][DEKO3D] render failed: %s\n", nativeRendererStatus_.c_str());
+      std::printf("[KBORE][DEKO3D] fallback to SDL/YUV\n");
+
+      decoder_.releaseLatestHardwareFrame();
+      nativeRenderer_->shutdown();
+      nativeRenderer_.reset();
+    } else {
+      error_ = decoder_.error();
+      return hasFrame();
+    }
+#endif
   }
 
   if (!decoder_.decodeNextVideoFrame(demuxer_, true)) {
@@ -392,6 +530,7 @@ bool NativeHwPlayerBackend::update() {
   }
 
   syncClockFromLatestFrame();
+  lastPresentedVideoWallMs_ = nowMs();
 
   error_.clear();
 

@@ -20,6 +20,7 @@ public:
 
   virtual const Bitmap &frame() const = 0;
   virtual const YuvFrame &yuvFrame() const = 0;
+  virtual bool nativeVideoActive() const { return false; }
 
   virtual const std::string &error() const = 0;
   virtual const std::string &url() const = 0;

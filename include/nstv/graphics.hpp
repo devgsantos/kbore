@@ -22,8 +22,14 @@ struct Rect {
 
 
 struct YuvFrame {
+  enum class Format {
+    IYUV,
+    NV12
+  };
+
   int width = 0;
   int height = 0;
+  Format format = Format::IYUV;
   std::vector<uint8_t> y;
   std::vector<uint8_t> u;
   std::vector<uint8_t> v;
@@ -32,6 +38,13 @@ struct YuvFrame {
   int vPitch = 0;
 
   bool valid() const {
+    if (format == Format::NV12) {
+      return width > 0 && height > 0 &&
+             yPitch > 0 && uPitch > 0 &&
+             y.size() >= static_cast<std::size_t>(yPitch * height) &&
+             u.size() >= static_cast<std::size_t>(uPitch * ((height + 1) / 2));
+    }
+
     return width > 0 && height > 0 &&
            yPitch > 0 && uPitch > 0 && vPitch > 0 &&
            y.size() >= static_cast<std::size_t>(yPitch * height) &&

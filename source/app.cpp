@@ -1034,6 +1034,11 @@ void App::render() {
     case ScreenId::Settings: renderSettingsGraphic(); break;
     case ScreenId::Playlists: renderAddPlaylistGraphic(); break;
   }
+
+  if (state_.screen == ScreenId::Player && player_ && player_->nativeVideoActive()) {
+    return;
+  }
+
   gfx_.present();
 }
 
@@ -1383,7 +1388,14 @@ void App::renderPlayerGraphic() {
   if (isOpen) {
     player_->update();
 
-    if (player_->yuvFrame().valid()) {
+    if (player_->nativeVideoActive()) {
+      hasFrame = true;
+
+      if (!state_.playerFrameSeen) {
+        state_.playerFrameSeen = true;
+        state_.playerOverlayUntilMs = nowMs() + 5000;
+      }
+    } else if (player_->yuvFrame().valid()) {
       hasFrame = true;
 
       gfx_.drawYuvFrame(
