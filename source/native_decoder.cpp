@@ -1246,6 +1246,20 @@ bool NativeDecoder::decodeNextVideoFrame(
       const int inputWidth = frameForProcessing->width;
       const int inputHeight = frameForProcessing->height;
       const AVPixelFormat inputFormat = static_cast<AVPixelFormat>(frameForProcessing->format);
+      int outputWidth = inputWidth;
+      int outputHeight = inputHeight;
+
+      if (inputWidth > 1280 || inputHeight > 720) {
+        const double scale = std::min(
+          1280.0 / static_cast<double>(inputWidth),
+          720.0 / static_cast<double>(inputHeight)
+        );
+
+        outputWidth = std::max(2, static_cast<int>(inputWidth * scale));
+        outputHeight = std::max(2, static_cast<int>(inputHeight * scale));
+        outputWidth &= ~1;
+        outputHeight &= ~1;
+      }
 
       /*
         Atualiza info depois da transferência.
@@ -1253,8 +1267,8 @@ bool NativeDecoder::decodeNextVideoFrame(
       */
       latestFrameInfo_.width = inputWidth;
       latestFrameInfo_.height = inputHeight;
-      latestFrameInfo_.outputWidth = inputWidth;
-      latestFrameInfo_.outputHeight = inputHeight;
+      latestFrameInfo_.outputWidth = outputWidth;
+      latestFrameInfo_.outputHeight = outputHeight;
       latestFrameInfo_.pixelFormat = pixelFormatName(inputFormat);
       latestFrameInfo_.transferredFromHardware = transferredFromHardware;
 
@@ -1262,8 +1276,8 @@ bool NativeDecoder::decodeNextVideoFrame(
       currentFrameInfo.streamIndex = video_.streamIndex;
       currentFrameInfo.width = inputWidth;
       currentFrameInfo.height = inputHeight;
-      currentFrameInfo.outputWidth = inputWidth;
-      currentFrameInfo.outputHeight = inputHeight;
+      currentFrameInfo.outputWidth = outputWidth;
+      currentFrameInfo.outputHeight = outputHeight;
       currentFrameInfo.pixelFormat = pixelFormatName(inputFormat);
       currentFrameInfo.ptsMs = framePtsMs(impl_->videoFrame, videoStream);
       currentFrameInfo.hardwareFrame = hardwareFrame;
@@ -1273,15 +1287,20 @@ bool NativeDecoder::decodeNextVideoFrame(
 
       AVFrame *frameForCopy = frameForProcessing;
 
+      const bool mustScaleForOutput =
+        outputWidth != inputWidth ||
+        outputHeight != inputHeight;
+
       const bool canCopyDirect =
-        inputFormat == AV_PIX_FMT_YUV420P ||
-        inputFormat == AV_PIX_FMT_YUVJ420P;
+        !mustScaleForOutput &&
+        (inputFormat == AV_PIX_FMT_YUV420P ||
+         inputFormat == AV_PIX_FMT_YUVJ420P);
 
       if (!canCopyDirect) {
         int bufferSize = av_image_get_buffer_size(
           AV_PIX_FMT_YUV420P,
-          inputWidth,
-          inputHeight,
+          outputWidth,
+          outputHeight,
           1
         );
 
@@ -1299,21 +1318,21 @@ bool NativeDecoder::decodeNextVideoFrame(
           impl_->convertedYuvFrame->linesize,
           impl_->convertedYuvBuffer.data(),
           AV_PIX_FMT_YUV420P,
-          inputWidth,
-          inputHeight,
+          outputWidth,
+          outputHeight,
           1
         );
 
-        impl_->convertedYuvFrame->width = inputWidth;
-        impl_->convertedYuvFrame->height = inputHeight;
+        impl_->convertedYuvFrame->width = outputWidth;
+        impl_->convertedYuvFrame->height = outputHeight;
         impl_->convertedYuvFrame->format = AV_PIX_FMT_YUV420P;
 
         const bool mustRecreateSws =
           !impl_->sws ||
           impl_->swsSrcWidth != inputWidth ||
           impl_->swsSrcHeight != inputHeight ||
-          impl_->swsDstWidth != inputWidth ||
-          impl_->swsDstHeight != inputHeight ||
+          impl_->swsDstWidth != outputWidth ||
+          impl_->swsDstHeight != outputHeight ||
           impl_->swsSrcFormat != inputFormat;
 
         if (mustRecreateSws) {
@@ -1326,8 +1345,8 @@ bool NativeDecoder::decodeNextVideoFrame(
             inputWidth,
             inputHeight,
             inputFormat,
-            inputWidth,
-            inputHeight,
+            outputWidth,
+            outputHeight,
             AV_PIX_FMT_YUV420P,
             SWS_FAST_BILINEAR,
             nullptr,
@@ -1344,8 +1363,8 @@ bool NativeDecoder::decodeNextVideoFrame(
 
           impl_->swsSrcWidth = inputWidth;
           impl_->swsSrcHeight = inputHeight;
-          impl_->swsDstWidth = inputWidth;
-          impl_->swsDstHeight = inputHeight;
+          impl_->swsDstWidth = outputWidth;
+          impl_->swsDstHeight = outputHeight;
           impl_->swsSrcFormat = inputFormat;
         }
 
@@ -1361,8 +1380,8 @@ bool NativeDecoder::decodeNextVideoFrame(
 
         frameForCopy = impl_->convertedYuvFrame;
 
-        latestFrameInfo_.outputWidth = inputWidth;
-        latestFrameInfo_.outputHeight = inputHeight;
+        latestFrameInfo_.outputWidth = outputWidth;
+        latestFrameInfo_.outputHeight = outputHeight;
         latestFrameInfo_.pixelFormat = pixelFormatName(static_cast<AVPixelFormat>(frameForCopy->format));
       }
 
