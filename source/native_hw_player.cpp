@@ -199,7 +199,11 @@ int NativeHwPlayerBackend::cpuPresentationIntervalMs() const {
       return 33;
     }
 
-    if (cpuFrameCostAvgMs_ <= 45) {
+    if (cpuFrameCostAvgMs_ <= 42) {
+      return 40;
+    }
+
+    if (cpuFrameCostAvgMs_ <= 54) {
       return 50;
     }
 
@@ -252,6 +256,10 @@ int NativeHwPlayerBackend::dropDelayThresholdMs() const {
 
   if (interval >= 50) {
     return 70;
+  }
+
+  if (interval >= 40) {
+    return 90;
   }
 
   return 120;
