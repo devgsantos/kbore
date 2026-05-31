@@ -11,8 +11,6 @@ namespace nstv {
 
 struct ManifestLoadResult {
   Manifest manifest;
-  std::string cacheText;
-  bool cacheTextIsGzip = false;
 };
 
 class ParserApiClient {
@@ -32,6 +30,14 @@ public:
     const std::string &categoryId,
     int page
   ) const;
+  NodeChildrenPage loadNodeChildren(
+    const std::string &sourceUrl,
+    Provider provider,
+    StreamType type,
+    const std::string &nodeId,
+    int page,
+    int pageSize = 100
+  ) const;
 
 private:
   Manifest loadManifestEndpoint(const std::string &endpoint, const std::string &sourceUrl, Provider provider) const;
@@ -44,6 +50,7 @@ private:
     const std::string &categoryId,
     int page
   ) const;
+  NodeChildrenPage nodeChildrenPageFromJson(const Json &json, StreamType fallbackType) const;
 
   Manifest manifestFromJson(const Json &json, const std::string &sourceUrl, Provider provider) const;
   MediaNode nodeFromJson(const Json &json, const std::string &fallbackType) const;

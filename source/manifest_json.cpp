@@ -1,12 +1,22 @@
 #include "nstv/manifest_json.hpp"
 #include "nstv/json.hpp"
 #include <cctype>
+#include <chrono>
 #include <cstdlib>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 
 namespace nstv {
 namespace {
+
+static void yieldParserPeriodically() {
+  static thread_local std::size_t steps = 0;
+
+  if (++steps % 512 == 0) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+}
 
 class FastJsonReader {
 public:
@@ -191,6 +201,7 @@ private:
     }
 
     while (true) {
+      yieldParserPeriodically();
       parseString();
       expect(':');
       skipValue();
@@ -211,6 +222,7 @@ private:
     }
 
     while (true) {
+      yieldParserPeriodically();
       skipValue();
 
       if (consumeIf(']')) {
@@ -240,6 +252,8 @@ static void appendNodeTypes(const MediaNode &node, Manifest &manifest) {
   group.totalChannels = node.totalChannels > 0 ? node.totalChannels : node.totalItems;
 
   for (const auto &child : node.children) {
+    yieldParserPeriodically();
+
     Category category;
     category.id = child.id;
     category.name = child.title.empty() ? child.name : child.title;
@@ -323,6 +337,8 @@ static TypeGroup parseTypeObject(FastJsonReader &reader) {
 
       if (!reader.consumeIf(']')) {
         while (true) {
+          yieldParserPeriodically();
+
           if (reader.peek() == '{') {
             group.categories.push_back(parseCategoryObject(reader, group.id));
           } else {
@@ -355,6 +371,8 @@ static TypeGroup parseTypeObject(FastJsonReader &reader) {
 }
 
 static MediaNode parseNodeObject(FastJsonReader &reader, const std::string &fallbackType) {
+  yieldParserPeriodically();
+
   MediaNode node;
   node.type = fallbackType;
 
@@ -395,6 +413,10 @@ static MediaNode parseNodeObject(FastJsonReader &reader, const std::string &fall
         node.totalItems = value;
         if (node.totalChannels <= 0) node.totalChannels = value;
       }
+    } else if (key == "childCount" || key == "childrenCount") {
+      node.childCount = reader.parseInt(node.childCount);
+    } else if (key == "hasChildren") {
+      node.hasChildren = reader.parseBool(node.hasChildren);
     } else if (key == "playable") {
       node.playable = reader.parseBool(node.playable);
     } else if (key == "children") {
@@ -402,6 +424,8 @@ static MediaNode parseNodeObject(FastJsonReader &reader, const std::string &fall
 
       if (!reader.consumeIf(']')) {
         while (true) {
+          yieldParserPeriodically();
+
           if (reader.peek() == '{') {
             node.children.push_back(parseNodeObject(reader, node.type));
           } else {
@@ -442,8 +466,16 @@ static MediaNode parseNodeObject(FastJsonReader &reader, const std::string &fall
     node.playable = true;
   }
 
+  if (node.childCount <= 0 && !node.children.empty()) {
+    node.childCount = static_cast<int>(node.children.size());
+  }
+
+  if (!node.hasChildren && (!node.children.empty() || node.childCount > 0)) {
+    node.hasChildren = true;
+  }
+
   if (node.kind.empty()) {
-    node.kind = node.children.empty() && node.playable ? "item" : "folder";
+    node.kind = !node.hasChildren && node.children.empty() && node.playable ? "item" : "folder";
   }
 
   if (node.id.empty()) {
@@ -461,6 +493,8 @@ static void parseNodesArray(FastJsonReader &reader, Manifest &manifest) {
   }
 
   while (true) {
+    yieldParserPeriodically();
+
     if (reader.peek() == '{') {
       MediaNode node = parseNodeObject(reader, "");
 
@@ -488,6 +522,8 @@ static void parseTypesArray(FastJsonReader &reader, Manifest &manifest) {
   }
 
   while (true) {
+    yieldParserPeriodically();
+
     if (reader.peek() == '{') {
       TypeGroup group = parseTypeObject(reader);
 
@@ -642,6 +678,8 @@ static void writeNode(std::ostream &out, const MediaNode &node) {
   out << ",\"groupId\":"; writeEscaped(out, node.groupId);
   out << ",\"totalItems\":" << node.totalItems;
   out << ",\"totalChannels\":" << node.totalChannels;
+  out << ",\"childCount\":" << node.childCount;
+  out << ",\"hasChildren\":" << (node.hasChildren ? "true" : "false");
   out << ",\"playable\":" << (node.playable ? "true" : "false");
   out << ",\"children\":[";
 

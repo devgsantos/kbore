@@ -90,7 +90,6 @@ private:
   void updatePlaylistLoad();
   bool playlistLoadActive() const;
 
-  void startDeferredCacheSave(std::string playlistId, std::string manifestText, bool alreadyGzip);
   void updateCacheSave();
   bool cacheSaveActive() const;
 
@@ -113,12 +112,18 @@ private:
 
   bool usingNodeTree() const;
   const MediaNode *selectedRootNode() const;
+  MediaNode *selectedRootNode();
   const MediaNode *nodeAtPath(const MediaNode *root, const std::vector<int> &path) const;
+  MediaNode *nodeAtPath(MediaNode *root, const std::vector<int> &path);
   const MediaNode *currentNodeParent() const;
+  MediaNode *currentNodeParent();
   const MediaNode *selectedCurrentNode() const;
+  MediaNode *selectedCurrentNode();
   const MediaNode *selectedPreviewNode() const;
+  MediaNode *selectedPreviewNode();
   std::vector<const MediaNode *> currentNodeChildren() const;
   std::vector<const MediaNode *> previewNodeChildren() const;
+  bool ensureNodeChildrenLoaded(MediaNode &node);
   Channel channelFromNode(const MediaNode &node) const;
   void enterNode(const MediaNode &node, int childIndex);
   void playNode(const MediaNode &node);
@@ -157,8 +162,6 @@ private:
   bool playlistLoadForceRefresh_ = false;
   PlaylistConfig playlistLoadPlaylist_;
   Manifest playlistLoadManifest_;
-  std::string playlistLoadCacheText_;
-  bool playlistLoadCacheTextIsGzip_ = false;
   std::string playlistLoadMessage_;
   std::string playlistLoadError_;
 

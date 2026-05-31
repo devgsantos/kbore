@@ -35,6 +35,8 @@ struct MediaNode {
   std::string groupId;
   int totalItems = 0;
   int totalChannels = 0;
+  int childCount = 0;
+  bool hasChildren = false;
   bool playable = false;
   std::vector<MediaNode> children;
 };
@@ -65,6 +67,15 @@ struct ChannelPage {
   int page = 1;
   int pageSize = 20;
   int totalChannels = 0;
+  int totalPages = 1;
+  bool hasNextPage = false;
+};
+
+struct NodeChildrenPage {
+  std::vector<MediaNode> items;
+  int page = 1;
+  int pageSize = 100;
+  int totalItems = 0;
   int totalPages = 1;
   bool hasNextPage = false;
 };

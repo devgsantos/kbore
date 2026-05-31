@@ -85,11 +85,19 @@ static std::string safeFilePart(const std::string &value) {
 }
 
 std::string playlistManifestPath(const std::string &playlistId) {
-  return cacheDir() + "/" + safeFilePart(playlistId.empty() ? "active" : playlistId) + "_manifest.json";
+  return dataDir() + "/manifests/" + safeFilePart(playlistId.empty() ? "active" : playlistId) + "_manifest.json";
 }
 
 static std::string playlistManifestGzipPath(const std::string &playlistId) {
   return playlistManifestPath(playlistId) + ".gz";
+}
+
+static std::string legacyPlaylistManifestPath(const std::string &playlistId) {
+  return cacheDir() + "/" + safeFilePart(playlistId.empty() ? "active" : playlistId) + "_manifest.json";
+}
+
+static std::string legacyPlaylistManifestGzipPath(const std::string &playlistId) {
+  return legacyPlaylistManifestPath(playlistId) + ".gz";
 }
 
 std::string channelPageCachePath(
@@ -107,6 +115,17 @@ std::string channelPageCachePath(
     std::to_string(page) + ".json";
 }
 
+std::string nodeChildrenPageCachePath(
+  const std::string &playlistId,
+  const std::string &nodeId,
+  int page
+) {
+  return cacheDir() + "/" +
+    safeFilePart(playlistId.empty() ? "active" : playlistId) + "_node_" +
+    safeFilePart(nodeId) + "_page_" +
+    std::to_string(page) + ".json";
+}
+
 
 static Json mediaNodeToJson(const MediaNode &node) {
   Json json(Json::object_t{});
@@ -121,6 +140,8 @@ static Json mediaNodeToJson(const MediaNode &node) {
   json["groupId"] = node.groupId;
   json["totalItems"] = node.totalItems;
   json["totalChannels"] = node.totalChannels;
+  json["childCount"] = node.childCount;
+  json["hasChildren"] = node.hasChildren;
   json["playable"] = node.playable;
 
   Json::array_t children;
@@ -149,6 +170,8 @@ static MediaNode mediaNodeFromJson(const Json &json, const std::string &fallback
   node.groupId = json["groupId"].asString(json["categoryId"].asString(json["category_id"].asString("")));
   node.totalItems = json["totalItems"].asInt(json["totalChannels"].asInt(0));
   node.totalChannels = json["totalChannels"].asInt(node.totalItems);
+  node.childCount = json["childCount"].asInt(json["childrenCount"].asInt(json["count"].asInt(0)));
+  node.hasChildren = json["hasChildren"].asBool(node.childCount > 0);
   node.playable = json["playable"].asBool(!node.url.empty());
 
   if (json["children"].isArray()) {
@@ -157,8 +180,16 @@ static MediaNode mediaNodeFromJson(const Json &json, const std::string &fallback
     }
   }
 
+  if (node.childCount <= 0 && !node.children.empty()) {
+    node.childCount = static_cast<int>(node.children.size());
+  }
+
+  if (!node.hasChildren && (!node.children.empty() || node.childCount > 0)) {
+    node.hasChildren = true;
+  }
+
   if (node.kind.empty()) {
-    node.kind = node.children.empty() && node.playable ? "item" : "folder";
+    node.kind = !node.hasChildren && node.children.empty() && node.playable ? "item" : "folder";
   }
 
   return node;
@@ -323,10 +354,58 @@ static ChannelPage channelPageFromJson(const Json &json) {
   return page;
 }
 
+static Json nodeChildrenPageToJson(const NodeChildrenPage &page) {
+  Json root(Json::object_t{});
+  root["page"] = page.page;
+  root["pageSize"] = page.pageSize;
+  root["totalItems"] = page.totalItems;
+  root["totalPages"] = page.totalPages;
+  root["hasNextPage"] = page.hasNextPage;
+
+  Json::array_t items;
+  for (const auto &item : page.items) {
+    items.push_back(mediaNodeToJson(item));
+  }
+  root["items"] = Json(items);
+
+  return root;
+}
+
+static NodeChildrenPage nodeChildrenPageFromJson(const Json &json) {
+  const Json &root = json["data"].isObject() ? json["data"] : json;
+
+  NodeChildrenPage page;
+  page.page = root["page"].asInt(json["page"].asInt(1));
+  page.pageSize = root["pageSize"].asInt(json["pageSize"].asInt(100));
+  page.totalItems = root["totalItems"].asInt(root["totalChannels"].asInt(root["total"].asInt(0)));
+  page.totalPages = root["totalPages"].asInt(json["totalPages"].asInt(1));
+  page.hasNextPage = root["hasNextPage"].asBool(json["hasNextPage"].asBool(page.page < page.totalPages));
+
+  const Json &items = root["items"].isArray()
+    ? root["items"]
+    : (root["children"].isArray() ? root["children"] : json["items"]);
+
+  if (items.isArray()) {
+    for (const auto &item : items.asArray()) {
+      page.items.push_back(mediaNodeFromJson(item));
+    }
+  }
+
+  if (page.totalItems <= 0 && !page.items.empty()) {
+    page.totalItems = static_cast<int>(page.items.size());
+  }
+
+  if (page.totalPages <= 0) {
+    page.totalPages = 1;
+  }
+
+  return page;
+}
+
 static bool saveManifestToPath(const Manifest &manifest, const std::string &path) {
   ensureDataDir();
 
-  std::ofstream file(manifestPath(manifest.id), std::ios::binary);
+  std::ofstream file(path, std::ios::binary);
   if (!file) return false;
 
   /*
@@ -511,6 +590,19 @@ static bool loadManifestFromGzipPath(Manifest &manifest, const std::string &path
   return parseManifestText(manifest, text);
 }
 
+static bool copyFile(const std::string &from, const std::string &to) {
+  ensureDataDir();
+
+  std::ifstream input(from, std::ios::binary);
+  if (!input) return false;
+
+  std::ofstream output(to, std::ios::binary);
+  if (!output) return false;
+
+  output << input.rdbuf();
+  return static_cast<bool>(output);
+}
+
 bool saveManifestForPlaylist(const Manifest &manifest, const std::string &playlistId) {
   return saveManifestToPath(manifest, playlistManifestPath(playlistId.empty() ? manifest.id : playlistId));
 }
@@ -521,7 +613,16 @@ bool loadManifestForPlaylist(Manifest &manifest, const std::string &playlistId) 
 
   if (!loadManifestFromGzipPath(manifest, gzipPath) &&
       !loadManifestFromPath(manifest, rawPath)) {
-    return false;
+    const std::string legacyGzipPath = legacyPlaylistManifestGzipPath(playlistId);
+    const std::string legacyRawPath = legacyPlaylistManifestPath(playlistId);
+
+    if (loadManifestFromGzipPath(manifest, legacyGzipPath)) {
+      copyFile(legacyGzipPath, gzipPath);
+    } else if (loadManifestFromPath(manifest, legacyRawPath)) {
+      copyFile(legacyRawPath, rawPath);
+    } else {
+      return false;
+    }
   }
 
   /*
@@ -662,6 +763,40 @@ bool loadChannelPage(
 
   try {
     page = channelPageFromJson(Json::parse(ss.str()));
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+bool saveNodeChildrenPage(
+  const std::string &playlistId,
+  const std::string &nodeId,
+  const NodeChildrenPage &page
+) {
+  ensureDataDir();
+
+  std::ofstream file(nodeChildrenPageCachePath(playlistId, nodeId, page.page), std::ios::binary);
+  if (!file) return false;
+
+  file << nodeChildrenPageToJson(page).stringify();
+  return true;
+}
+
+bool loadNodeChildrenPage(
+  const std::string &playlistId,
+  const std::string &nodeId,
+  int pageNumber,
+  NodeChildrenPage &page
+) {
+  std::ifstream file(nodeChildrenPageCachePath(playlistId, nodeId, pageNumber), std::ios::binary);
+  if (!file) return false;
+
+  std::ostringstream ss;
+  ss << file.rdbuf();
+
+  try {
+    page = nodeChildrenPageFromJson(Json::parse(ss.str()));
     return true;
   } catch (...) {
     return false;

@@ -6,6 +6,7 @@
 
 #include <curl/curl.h>
 #include "nstv/http_client.hpp"
+#include <chrono>
 #include <cstdio>
 #include <cctype>
 #include <utility>
@@ -18,6 +19,7 @@ struct WriteContext {
   std::string *body = nullptr;
   HttpProgressCallback progress;
   std::size_t lastReportedBytes = 0;
+  long long lastReportedAtMs = 0;
 };
 
 struct HeaderContext {
@@ -61,6 +63,31 @@ static size_t headerCallback(char *ptr, size_t size, size_t nmemb, void *userdat
   return bytes;
 }
 
+static long long nowMs() {
+  using clock = std::chrono::steady_clock;
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+    clock::now().time_since_epoch()
+  ).count();
+}
+
+static void reportProgress(WriteContext &ctx, std::size_t current, bool force = false) {
+  if (!ctx.progress) {
+    return;
+  }
+
+  const long long now = nowMs();
+  const bool firstReport = ctx.lastReportedAtMs == 0;
+  const bool enoughBytes = current > ctx.lastReportedBytes &&
+    (current - ctx.lastReportedBytes >= 64 * 1024 || ctx.lastReportedBytes == 0);
+  const bool enoughTime = now - ctx.lastReportedAtMs >= 1000;
+
+  if (force || firstReport || enoughBytes || enoughTime) {
+    ctx.lastReportedBytes = current;
+    ctx.lastReportedAtMs = now;
+    ctx.progress(current);
+  }
+}
+
 static size_t writeCallback(char *ptr, size_t size, size_t nmemb, void *userdata) {
   auto *ctx = static_cast<WriteContext *>(userdata);
   const std::size_t bytes = size * nmemb;
@@ -71,16 +98,25 @@ static size_t writeCallback(char *ptr, size_t size, size_t nmemb, void *userdata
 
   ctx->body->append(ptr, bytes);
 
-  if (ctx->progress) {
-    const std::size_t current = ctx->body->size();
-
-    if (current == 0 || current - ctx->lastReportedBytes >= 256 * 1024) {
-      ctx->lastReportedBytes = current;
-      ctx->progress(current);
-    }
-  }
+  reportProgress(*ctx, ctx->body->size());
 
   return bytes;
+}
+
+static int transferCallback(
+  void *clientp,
+  curl_off_t,
+  curl_off_t dlnow,
+  curl_off_t,
+  curl_off_t
+) {
+  auto *ctx = static_cast<WriteContext *>(clientp);
+
+  if (ctx && dlnow >= 0) {
+    reportProgress(*ctx, static_cast<std::size_t>(dlnow));
+  }
+
+  return 0;
 }
 
 } // namespace
@@ -104,6 +140,7 @@ HttpResponse HttpClient::postJson(
   headerList = curl_slist_append(headerList, "Content-Type: application/json");
   headerList = curl_slist_append(headerList, "Accept: application/json, text/plain, */*");
   headerList = curl_slist_append(headerList, "User-Agent: kboré-Switch/0.1");
+  headerList = curl_slist_append(headerList, "Expect:");
 
   if (!decodeResponse) {
     headerList = curl_slist_append(headerList, "Accept-Encoding: gzip");
@@ -132,6 +169,9 @@ HttpResponse HttpClient::postJson(
   curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, headerCallback);
   curl_easy_setopt(curl, CURLOPT_HEADERDATA, &headerContext);
   curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+  curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+  curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, transferCallback);
+  curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &writeContext);
 
   /*
     Normal small API calls can be decoded automatically by libcurl.
@@ -160,9 +200,7 @@ HttpResponse HttpClient::postJson(
   curl_easy_getinfo(curl, CURLINFO_TOTAL_TIME, &result.totalTimeSeconds);
   curl_easy_getinfo(curl, CURLINFO_SIZE_DOWNLOAD, &result.downloadedBytes);
 
-  if (writeContext.progress) {
-    writeContext.progress(result.body.size());
-  }
+  reportProgress(writeContext, result.body.size(), true);
 
   if (code != CURLE_OK) {
     result.error = curl_easy_strerror(code);

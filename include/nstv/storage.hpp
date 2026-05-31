@@ -56,4 +56,23 @@ bool loadChannelPage(
   ChannelPage &page
 );
 
+std::string nodeChildrenPageCachePath(
+  const std::string &playlistId,
+  const std::string &nodeId,
+  int page
+);
+
+bool saveNodeChildrenPage(
+  const std::string &playlistId,
+  const std::string &nodeId,
+  const NodeChildrenPage &page
+);
+
+bool loadNodeChildrenPage(
+  const std::string &playlistId,
+  const std::string &nodeId,
+  int pageNumber,
+  NodeChildrenPage &page
+);
+
 } // namespace nstv

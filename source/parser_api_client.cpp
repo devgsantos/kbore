@@ -238,14 +238,6 @@ ManifestLoadResult ParserApiClient::loadManifestEndpointWithCacheText(
   ManifestLoadResult result;
   result.manifest = std::move(manifest);
 
-  if (bodyIsGzip) {
-    result.cacheText = std::move(res.body);
-    result.cacheTextIsGzip = true;
-  } else {
-    result.cacheText = std::move(responseText);
-    result.cacheTextIsGzip = false;
-  }
-
   return result;
 }
 
@@ -258,6 +250,28 @@ ChannelPage ParserApiClient::loadChannels(
 ) const {
   std::string endpointPath = provider == Provider::Xtream ? "/api/xtream/channels" : "/api/parse-url";
   return loadChannelsEndpoint(endpoint(endpointPath), sourceUrl, provider, type, categoryId, page);
+}
+
+NodeChildrenPage ParserApiClient::loadNodeChildren(
+  const std::string &sourceUrl,
+  Provider provider,
+  StreamType type,
+  const std::string &nodeId,
+  int page,
+  int pageSize
+) const {
+  std::ostringstream body;
+  body << "{\"url\":\"" << jsonEscape(sourceUrl) << "\",";
+  body << "\"provider\":\"" << toString(provider) << "\",";
+  body << "\"nodeId\":\"" << jsonEscape(nodeId) << "\",";
+  body << "\"type\":\"" << toString(type) << "\",";
+  body << "\"streamType\":\"" << toString(type) << "\",";
+  body << "\"page\":" << page << ",";
+  body << "\"pageSize\":" << pageSize;
+  body << "}";
+
+  Json json = requestJson(endpoint("/api/nodes/children"), body.str());
+  return nodeChildrenPageFromJson(json, type);
 }
 
 ChannelPage ParserApiClient::loadChannelsEndpoint(
@@ -366,6 +380,8 @@ MediaNode ParserApiClient::nodeFromJson(const Json &json, const std::string &fal
   node.groupId = json["groupId"].asString(json["categoryId"].asString(json["category_id"].asString("")));
   node.totalItems = json["totalItems"].asInt(json["totalChannels"].asInt(0));
   node.totalChannels = json["totalChannels"].asInt(node.totalItems);
+  node.childCount = json["childCount"].asInt(json["childrenCount"].asInt(json["count"].asInt(0)));
+  node.hasChildren = json["hasChildren"].asBool(node.childCount > 0);
   node.playable = json["playable"].asBool(!node.url.empty());
 
   if (json["children"].isArray()) {
@@ -375,8 +391,16 @@ MediaNode ParserApiClient::nodeFromJson(const Json &json, const std::string &fal
     }
   }
 
+  if (node.childCount <= 0 && !node.children.empty()) {
+    node.childCount = static_cast<int>(node.children.size());
+  }
+
+  if (!node.hasChildren && (!node.children.empty() || node.childCount > 0)) {
+    node.hasChildren = true;
+  }
+
   if (node.kind.empty()) {
-    node.kind = node.children.empty() && node.playable ? "item" : "folder";
+    node.kind = !node.hasChildren && node.children.empty() && node.playable ? "item" : "folder";
   }
 
   if (node.id.empty()) {
@@ -464,6 +488,53 @@ ChannelPage ParserApiClient::channelPageFromJson(const Json &json) const {
 
   if (page.totalChannels <= 0 && !page.channels.empty()) {
     page.totalChannels = static_cast<int>(page.channels.size());
+  }
+
+  if (page.totalPages <= 0) {
+    page.totalPages = 1;
+  }
+
+  return page;
+}
+
+NodeChildrenPage ParserApiClient::nodeChildrenPageFromJson(const Json &json, StreamType fallbackType) const {
+  const Json &root =
+    json["data"].isObject()
+      ? json["data"]
+      : json;
+
+  NodeChildrenPage page;
+  page.page = root["page"].asInt(json["page"].asInt(1));
+  page.pageSize = root["pageSize"].asInt(json["pageSize"].asInt(100));
+  page.totalItems = root["totalItems"].asInt(root["totalChannels"].asInt(root["total"].asInt(json["totalItems"].asInt(json["total"].asInt(0)))));
+  page.totalPages = root["totalPages"].asInt(json["totalPages"].asInt(1));
+  page.hasNextPage = root["hasNextPage"].asBool(json["hasNextPage"].asBool(page.page < page.totalPages));
+
+  const Json &items =
+    root["items"].isArray()
+      ? root["items"]
+      : (
+          root["children"].isArray()
+            ? root["children"]
+            : (
+                json["items"].isArray()
+                  ? json["items"]
+                  : json["children"]
+              )
+        );
+
+  if (items.isArray()) {
+    for (const Json &item : items.asArray()) {
+      MediaNode node = nodeFromJson(item, toString(fallbackType));
+      if (node.type.empty()) {
+        node.type = toString(fallbackType);
+      }
+      page.items.push_back(std::move(node));
+    }
+  }
+
+  if (page.totalItems <= 0 && !page.items.empty()) {
+    page.totalItems = static_cast<int>(page.items.size());
   }
 
   if (page.totalPages <= 0) {

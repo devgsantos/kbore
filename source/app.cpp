@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cctype>
 #include <iostream>
+#include <iterator>
 #include <sstream>
 #include <stdexcept>
 #include <chrono>
@@ -208,6 +209,17 @@ std::string trimTrailingSlashLocal(std::string value) {
   return value;
 }
 
+int nodeCount(const MediaNode &node) {
+  if (node.totalItems > 0) return node.totalItems;
+  if (node.totalChannels > 0) return node.totalChannels;
+  if (node.childCount > 0) return node.childCount;
+  return static_cast<int>(node.children.size());
+}
+
+bool nodeCanHaveChildren(const MediaNode &node) {
+  return node.hasChildren || node.childCount > 0 || !node.children.empty();
+}
+
 }
 
 App::App() : api_(loadConfig()), player_(createPlayerBackend()) {
@@ -220,34 +232,7 @@ App::App() : api_(loadConfig()), player_(createPlayerBackend()) {
   const PlaylistConfig *playlist = activePlaylist();
 
   if (playlist) {
-    bool usedCache = false;
-
-    if (loadManifestForPlaylist(state_.manifest, playlist->id)) {
-      const bool cachedMatchesActive =
-        state_.manifest.id == playlist->id &&
-        (!state_.manifest.nodes.empty() || !state_.manifest.types.empty());
-
-      if (cachedMatchesActive) {
-        state_.hasManifest = true;
-        usedCache = true;
-        normalizeIndexes();
-
-        saveManifest(state_.manifest);
-
-        state_.message =
-          "Loaded cached manifest: " +
-          std::to_string(state_.manifest.totalChannels > 0 ? state_.manifest.totalChannels : state_.manifest.totalItems) +
-          " items";
-      }
-    }
-
-    if (!usedCache) {
-      startPlaylistLoad(*playlist);
-    }
-
-    if (!loadCachedPlaylist(*playlist)) {
-      importPlaylist(*playlist);
-    }
+    startPlaylistLoad(*playlist);
   } else if (loadManifest(state_.manifest) && (!state_.manifest.nodes.empty() || !state_.manifest.types.empty())) {
     state_.hasManifest = true;
     state_.message =
@@ -551,13 +536,17 @@ void App::handleDashboard(Button button) {
       }
 
       if (state_.focus == FocusColumn::Categories) {
-        const MediaNode *node = selectedCurrentNode();
+        MediaNode *node = selectedCurrentNode();
 
         if (!node) {
           return;
         }
 
-        if (!node->children.empty()) {
+        if (nodeCanHaveChildren(*node)) {
+          if (!ensureNodeChildrenLoaded(*node)) {
+            return;
+          }
+
           enterNode(*node, state_.selectedCategory);
           return;
         }
@@ -572,13 +561,17 @@ void App::handleDashboard(Button button) {
       }
 
       if (state_.focus == FocusColumn::Channels) {
-        const MediaNode *preview = selectedPreviewNode();
+        MediaNode *preview = selectedPreviewNode();
 
         if (!preview) {
           return;
         }
 
-        if (!preview->children.empty()) {
+        if (nodeCanHaveChildren(*preview)) {
+          if (!ensureNodeChildrenLoaded(*preview)) {
+            return;
+          }
+
           // Preview nodes are children of the currently selected category.
           state_.nodePath.push_back(state_.selectedCategory);
           state_.nodePath.push_back(state_.selectedChannel);
@@ -822,7 +815,7 @@ std::string App::activePlaylistName() const {
 bool App::loadCachedPlaylist(const PlaylistConfig &playlist) {
   Manifest cached;
 
-  if (!loadManifest(playlist.id, cached) || cached.types.empty()) {
+  if (!loadManifestForPlaylist(cached, playlist.id) || (cached.nodes.empty() && cached.types.empty())) {
     return false;
   }
 
@@ -845,8 +838,8 @@ bool App::loadCachedPlaylist(const PlaylistConfig &playlist) {
 
   state_.message =
     "Loaded cached manifest: " +
-    std::to_string(state_.manifest.totalChannels) +
-    " channels";
+    std::to_string(state_.manifest.totalChannels > 0 ? state_.manifest.totalChannels : state_.manifest.totalItems) +
+    " items";
 
   return true;
 }
@@ -905,8 +898,6 @@ void App::startPlaylistLoad(const PlaylistConfig &playlist, bool forceRefresh) {
     playlistLoadForceRefresh_ = forceRefresh;
     playlistLoadPlaylist_ = playlist;
     playlistLoadManifest_ = Manifest{};
-    playlistLoadCacheText_.clear();
-    playlistLoadCacheTextIsGzip_ = false;
     playlistLoadMessage_ = "Loading playlist...";
     playlistLoadError_.clear();
   }
@@ -975,32 +966,13 @@ void App::startPlaylistLoad(const PlaylistConfig &playlist, bool forceRefresh) {
         throw std::runtime_error("Parser returned an empty manifest");
       }
 
-      /*
-        Save the raw API response instead of serializing the Manifest tree
-        back to JSON. The API response is already the final contract and the
-        storage loader accepts both { ok, manifest } and flattened manifests.
-        This avoids the expensive recursive write that was freezing/crashing
-        on large node manifests.
-      */
-      if (loadResult.cacheText.empty()) {
-        throw std::runtime_error("Parser returned an empty cache body");
-      }
+      setStatus("Saving manifest...");
+      saveManifestForPlaylist(imported, playlist.id);
 
-      /*
-        Do not block the playlist-loading worker on SD-card cache writes.
-
-        Large dynamic manifests can be tens of MB after decompression. Even
-        when saved as gzip, the final chunks/gzclose/rename can freeze the
-        Switch enough to stop the UI spinner. The manifest is already parsed
-        and ready for use here, so hand the UI the Manifest first and defer
-        the cache write to a separate throttled background job.
-      */
       setStatus("Preparing interface...");
 
       std::lock_guard<std::mutex> lock(playlistLoadMutex_);
       playlistLoadManifest_ = std::move(imported);
-      playlistLoadCacheText_ = std::move(loadResult.cacheText);
-      playlistLoadCacheTextIsGzip_ = loadResult.cacheTextIsGzip;
       playlistLoadSuccess_ = true;
       playlistLoadDone_ = true;
       playlistLoadMessage_ = "Preparing interface...";
@@ -1017,8 +989,6 @@ void App::startPlaylistLoad(const PlaylistConfig &playlist, bool forceRefresh) {
 void App::updatePlaylistLoad() {
   PlaylistConfig playlist;
   Manifest manifest;
-  std::string cacheText;
-  bool cacheTextIsGzip = false;
   std::string message;
   std::string error;
   bool active = false;
@@ -1047,8 +1017,6 @@ void App::updatePlaylistLoad() {
         Move it once, then reset the worker state below.
       */
       manifest = std::move(playlistLoadManifest_);
-      cacheText = std::move(playlistLoadCacheText_);
-      cacheTextIsGzip = playlistLoadCacheTextIsGzip_;
     }
   }
 
@@ -1069,18 +1037,12 @@ void App::updatePlaylistLoad() {
     playlistLoadDone_ = false;
     playlistLoadSuccess_ = false;
     playlistLoadManifest_ = Manifest{};
-    playlistLoadCacheText_.clear();
-    playlistLoadCacheTextIsGzip_ = false;
     playlistLoadMessage_.clear();
     playlistLoadError_.clear();
   }
 
   state_.loading = false;
   state_.loadingMessage.clear();
-
-  if (success && !cacheText.empty()) {
-    startDeferredCacheSave(playlist.id, std::move(cacheText), cacheTextIsGzip);
-  }
 
 
   if (!success) {
@@ -1117,113 +1079,6 @@ void App::updatePlaylistLoad() {
     ": " +
     std::to_string(state_.manifest.totalChannels > 0 ? state_.manifest.totalChannels : state_.manifest.totalItems) +
     " items";
-}
-
-
-
-void App::startDeferredCacheSave(std::string playlistId, std::string manifestText, bool alreadyGzip) {
-  if (playlistId.empty() || manifestText.empty()) {
-    return;
-  }
-
-  /*
-    Only one cache writer is allowed at a time.
-
-    The previous detached implementation could keep a zlib/SD-card write alive
-    after App state changed or while another playlist was being loaded. On the
-    Switch this can crash the homebrew process. This version owns the worker
-    thread, tracks its lifecycle, joins completed work, and skips new cache
-    jobs while a previous one is still active.
-  */
-  {
-    std::lock_guard<std::mutex> lock(cacheSaveMutex_);
-
-    if (cacheSaveActive_ && !cacheSaveDone_) {
-      std::printf(
-        "[KBORE][CACHE] cache save already active, skipping new save: current=%s new=%s\n",
-        cacheSavePlaylistId_.c_str(),
-        playlistId.c_str()
-      );
-      return;
-    }
-  }
-
-  if (cacheSaveThread_.joinable()) {
-    cacheSaveThread_.join();
-  }
-
-  {
-    std::lock_guard<std::mutex> lock(cacheSaveMutex_);
-    cacheSaveActive_ = true;
-    cacheSaveDone_ = false;
-    cacheSaveSuccess_ = false;
-    cacheSavePlaylistId_ = playlistId;
-    cacheSaveError_.clear();
-    cacheSaveWritten_ = 0;
-    cacheSaveTotal_ = manifestText.size();
-  }
-
-  cacheSaveThread_ = std::thread(
-    [this, playlistId = std::move(playlistId), manifestText = std::move(manifestText), alreadyGzip]() mutable {
-      bool saved = false;
-      std::string error;
-
-      try {
-        std::printf(
-          "[KBORE][CACHE] lifecycle cache save started: playlist=%s size=%zu KB\n",
-          playlistId.c_str(),
-          manifestText.size() / 1024
-        );
-
-        auto progress = [this](std::size_t written, std::size_t total) {
-          std::lock_guard<std::mutex> lock(cacheSaveMutex_);
-          cacheSaveWritten_ = written;
-          cacheSaveTotal_ = total;
-        };
-
-        if (alreadyGzip) {
-          saved = saveManifestGzipBytesForPlaylist(
-            manifestText,
-            playlistId,
-            progress
-          );
-        } else {
-          saved = saveManifestTextForPlaylist(
-            manifestText,
-            playlistId,
-            progress
-          );
-        }
-
-        if (!saved) {
-          error = alreadyGzip
-            ? "saveManifestGzipBytesForPlaylist returned false"
-            : "saveManifestTextForPlaylist returned false";
-        }
-      } catch (const std::exception &ex) {
-        error = ex.what();
-        saved = false;
-      } catch (...) {
-        error = "unknown cache save error";
-        saved = false;
-      }
-
-      {
-        std::lock_guard<std::mutex> lock(cacheSaveMutex_);
-        cacheSaveSuccess_ = saved;
-        cacheSaveError_ = error;
-        cacheSaveDone_ = true;
-      }
-
-      std::printf(
-        "[KBORE][CACHE] lifecycle cache save %s: playlist=%s%s%s\n",
-        saved ? "completed" : "failed",
-        playlistId.c_str(),
-        error.empty() ? "" : " error=",
-        error.empty() ? "" : error.c_str()
-      );
-    }
-  );
 }
 
 void App::updateCacheSave() {
@@ -1419,9 +1274,7 @@ void App::deletePlaylist(int index) {
   const PlaylistConfig *playlist = activePlaylist();
 
   if (playlist) {
-    if (!loadCachedPlaylist(*playlist)) {
-      importPlaylist(*playlist);
-    }
+    startPlaylistLoad(*playlist);
   }
 }
 
@@ -1626,7 +1479,7 @@ std::vector<TypeGroup> App::visibleTypes() const {
       TypeGroup group;
       group.id = streamTypeFromString(node.type);
       group.label = node.title.empty() ? node.name : node.title;
-      group.totalChannels = node.totalChannels > 0 ? node.totalChannels : node.totalItems;
+      group.totalChannels = nodeCount(node);
       groups.push_back(group);
     }
 
@@ -1692,6 +1545,24 @@ const MediaNode *App::selectedRootNode() const {
   return &state_.manifest.nodes[static_cast<std::size_t>(index)];
 }
 
+MediaNode *App::selectedRootNode() {
+  if (!usingNodeTree()) {
+    return nullptr;
+  }
+
+  int index = std::clamp(
+    state_.selectedType,
+    0,
+    std::max(0, static_cast<int>(state_.manifest.nodes.size()) - 1)
+  );
+
+  if (index < 0 || index >= static_cast<int>(state_.manifest.nodes.size())) {
+    return nullptr;
+  }
+
+  return &state_.manifest.nodes[static_cast<std::size_t>(index)];
+}
+
 const MediaNode *App::nodeAtPath(const MediaNode *root, const std::vector<int> &path) const {
   const MediaNode *node = root;
 
@@ -1712,7 +1583,31 @@ const MediaNode *App::nodeAtPath(const MediaNode *root, const std::vector<int> &
   return node;
 }
 
+MediaNode *App::nodeAtPath(MediaNode *root, const std::vector<int> &path) {
+  MediaNode *node = root;
+
+  for (int index : path) {
+    if (!node || node->children.empty()) {
+      return node;
+    }
+
+    int safeIndex = std::clamp(
+      index,
+      0,
+      std::max(0, static_cast<int>(node->children.size()) - 1)
+    );
+
+    node = &node->children[static_cast<std::size_t>(safeIndex)];
+  }
+
+  return node;
+}
+
 const MediaNode *App::currentNodeParent() const {
+  return nodeAtPath(selectedRootNode(), state_.nodePath);
+}
+
+MediaNode *App::currentNodeParent() {
   return nodeAtPath(selectedRootNode(), state_.nodePath);
 }
 
@@ -1745,6 +1640,22 @@ const MediaNode *App::selectedCurrentNode() const {
   );
 
   return children[static_cast<std::size_t>(index)];
+}
+
+MediaNode *App::selectedCurrentNode() {
+  MediaNode *parent = currentNodeParent();
+
+  if (!parent || parent->children.empty()) {
+    return nullptr;
+  }
+
+  int index = std::clamp(
+    state_.selectedCategory,
+    0,
+    std::max(0, static_cast<int>(parent->children.size()) - 1)
+  );
+
+  return &parent->children[static_cast<std::size_t>(index)];
 }
 
 std::vector<const MediaNode *> App::previewNodeChildren() const {
@@ -1783,6 +1694,137 @@ const MediaNode *App::selectedPreviewNode() const {
   );
 
   return nodes[static_cast<std::size_t>(index)];
+}
+
+MediaNode *App::selectedPreviewNode() {
+  MediaNode *selected = selectedCurrentNode();
+
+  if (!selected) {
+    return nullptr;
+  }
+
+  if (!selected->children.empty()) {
+    int index = std::clamp(
+      state_.selectedChannel,
+      0,
+      std::max(0, static_cast<int>(selected->children.size()) - 1)
+    );
+
+    return &selected->children[static_cast<std::size_t>(index)];
+  }
+
+  if (selected->playable || !selected->url.empty()) {
+    return selected;
+  }
+
+  return nullptr;
+}
+
+bool App::ensureNodeChildrenLoaded(MediaNode &node) {
+  if (!node.children.empty()) {
+    return true;
+  }
+
+  if (!nodeCanHaveChildren(node)) {
+    state_.message = "Empty folder";
+    return false;
+  }
+
+  const PlaylistConfig *playlist = activePlaylist();
+  if (!playlist) {
+    state_.message = "No playlist loaded";
+    return false;
+  }
+
+  NodeChildrenPage firstPage;
+  std::vector<MediaNode> items;
+  bool usedOnlyCache = true;
+
+  try {
+    state_.loading = true;
+    state_.loadingMessage = "Loading folder...";
+    state_.message = "Loading " + (node.title.empty() ? node.name : node.title) + "...";
+    render();
+
+    api_ = ParserApiClient(state_.config);
+
+    const std::string sourceUrl = state_.manifest.source.empty()
+      ? playlist->sourceUrl()
+      : state_.manifest.source;
+    const StreamType streamType = streamTypeFromString(node.type);
+    const int pageSize = 250;
+    int pageNumber = 1;
+    int totalItems = 0;
+    int totalPages = 1;
+
+    while (pageNumber <= totalPages && pageNumber <= 200) {
+      NodeChildrenPage page;
+      const bool fromCache = loadNodeChildrenPage(playlist->id, node.id, pageNumber, page);
+
+      if (!fromCache) {
+        usedOnlyCache = false;
+        page = api_.loadNodeChildren(
+          sourceUrl,
+          state_.manifest.provider,
+          streamType,
+          node.id,
+          pageNumber,
+          pageSize
+        );
+
+        saveNodeChildrenPage(playlist->id, node.id, page);
+      }
+
+      if (pageNumber == 1) {
+        firstPage = page;
+      }
+
+      if (page.totalItems > totalItems) {
+        totalItems = page.totalItems;
+      }
+
+      totalPages = std::max(1, page.totalPages);
+
+      items.insert(
+        items.end(),
+        std::make_move_iterator(page.items.begin()),
+        std::make_move_iterator(page.items.end())
+      );
+
+      if (!page.hasNextPage) {
+        break;
+      }
+
+      ++pageNumber;
+    }
+  } catch (const std::exception &ex) {
+    state_.loading = false;
+    state_.loadingMessage.clear();
+    state_.message = "Failed to load folder items.";
+    std::printf("[KBORE] node children load failed: %s\n", ex.what());
+    return false;
+  }
+
+  state_.loading = false;
+  state_.loadingMessage.clear();
+
+  node.children = std::move(items);
+  node.childCount = std::max(node.childCount, static_cast<int>(node.children.size()));
+  if (firstPage.totalItems > 0) {
+    node.totalItems = firstPage.totalItems;
+    if (node.totalChannels <= 0) {
+      node.totalChannels = firstPage.totalItems;
+    }
+  }
+  node.hasChildren = !node.children.empty() || node.childCount > 0;
+
+  if (node.children.empty()) {
+    state_.message = usedOnlyCache ? "Folder cache is empty" : "Folder has no items";
+    return false;
+  }
+
+  state_.message = usedOnlyCache ? "Loaded folder from cache" : "Loaded folder from API";
+  return true;
 }
 
 Channel App::channelFromNode(const MediaNode &node) const {
@@ -1996,7 +2038,7 @@ void App::renderDashboardGraphic() {
       Category category;
       category.id = node->id;
       category.name = node->title.empty() ? node->name : node->title;
-      category.totalChannels = node->totalChannels > 0 ? node->totalChannels : node->totalItems;
+      category.totalChannels = nodeCount(*node);
       category.type = streamTypeFromString(node->type);
       categories.push_back(category);
     }
@@ -2125,7 +2167,11 @@ void App::renderDashboardGraphic() {
     ? state_.loadedTotal
     : (
         usingNodeTree()
-          ? static_cast<int>(nodePreview.size())
+          ? (
+              !nodePreview.empty()
+                ? static_cast<int>(nodePreview.size())
+                : (selectedCurrentNode() ? nodeCount(*selectedCurrentNode()) : 0)
+            )
           : (type ? type->totalChannels : 0)
       );
 
@@ -2202,7 +2248,7 @@ void App::renderDashboardGraphic() {
 
       bool selected = index == state_.selectedChannel;
       const bool playable = node->playable || !node->url.empty();
-      const bool folder = !node->children.empty();
+      const bool folder = nodeCanHaveChildren(*node);
 
       gfx_.fillRoundRect(channelsPanel.x + 14, y, channelsPanel.w - 32, 49, 12, selected ? rgba(12,23,52,245) : rgba(10,15,29,215));
       gfx_.strokeRoundRect(channelsPanel.x + 14, y, channelsPanel.w - 32, 49, 12, selected ? brightBlue : rgba(72,92,128,24), selected ? 2 : 1);
@@ -2214,7 +2260,7 @@ void App::renderDashboardGraphic() {
       gfx_.drawText(Graphics::fitText(ch.name, 35), nameX, y + 9, 3, text, true);
 
       std::string sub = folder
-        ? ("FOLDER • " + std::to_string(static_cast<int>(node->children.size())) + " ITEMS")
+        ? ("FOLDER • " + std::to_string(nodeCount(*node)) + " ITEMS")
         : (playable ? "PLAYABLE" : "EMPTY");
 
       gfx_.drawText(sub, nameX, y + 32, 2, muted, false);
