@@ -244,6 +244,10 @@ App::App() : api_(loadConfig()), player_(createPlayerBackend()) {
     if (!usedCache) {
       startPlaylistLoad(*playlist);
     }
+
+    if (!loadCachedPlaylist(*playlist)) {
+      importPlaylist(*playlist);
+    }
   } else if (loadManifest(state_.manifest) && (!state_.manifest.nodes.empty() || !state_.manifest.types.empty())) {
     state_.hasManifest = true;
     state_.message =
@@ -815,6 +819,38 @@ std::string App::activePlaylistName() const {
   return playlist->provider == Provider::Xtream ? "Xtream" : "M3U";
 }
 
+bool App::loadCachedPlaylist(const PlaylistConfig &playlist) {
+  Manifest cached;
+
+  if (!loadManifest(playlist.id, cached) || cached.types.empty()) {
+    return false;
+  }
+
+  cached.id = playlist.id;
+  cached.name = playlist.name.empty() ? cached.name : playlist.name;
+  cached.provider = playlist.provider;
+  if (cached.source.empty()) {
+    cached.source = playlist.sourceUrl();
+  }
+
+  state_.manifest = cached;
+  state_.hasManifest = true;
+  state_.screen = ScreenId::Dashboard;
+  state_.focus = FocusColumn::Types;
+  state_.selectedType = 0;
+  state_.selectedCategory = 0;
+  state_.selectedChannel = 0;
+  resetLoadedChannels();
+  normalizeIndexes();
+
+  state_.message =
+    "Loaded cached manifest: " +
+    std::to_string(state_.manifest.totalChannels) +
+    " channels";
+
+  return true;
+}
+
 void App::activatePlaylist(int index) {
   if (index < 0 || index >= static_cast<int>(state_.config.playlists.size())) {
     return;
@@ -1383,7 +1419,9 @@ void App::deletePlaylist(int index) {
   const PlaylistConfig *playlist = activePlaylist();
 
   if (playlist) {
-    importPlaylist(*playlist);
+    if (!loadCachedPlaylist(*playlist)) {
+      importPlaylist(*playlist);
+    }
   }
 }
 

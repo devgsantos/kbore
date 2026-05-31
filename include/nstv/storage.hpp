@@ -24,9 +24,11 @@ bool saveManifestGzipBytesForPlaylist(
   const std::function<void(std::size_t written, std::size_t total)> &progress = {}
 );
 bool loadManifestForPlaylist(Manifest &manifest, const std::string &playlistId);
+std::string manifestPath(const std::string &playlistId);
 
 bool saveManifest(const Manifest &manifest);
 bool loadManifest(Manifest &manifest);
+bool loadManifest(const std::string &playlistId, Manifest &manifest);
 
 std::string cacheDir();
 std::string channelPageCachePath(

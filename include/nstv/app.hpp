@@ -83,6 +83,7 @@ private:
 
   const PlaylistConfig *activePlaylist() const;
   std::string activePlaylistName() const;
+  bool loadCachedPlaylist(const PlaylistConfig &playlist);
   void activatePlaylist(int index);
   void importPlaylist(const PlaylistConfig &playlist);
   void startPlaylistLoad(const PlaylistConfig &playlist, bool forceRefresh = false);
