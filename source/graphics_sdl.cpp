@@ -323,6 +323,7 @@ struct CachedTexture {
   SDL_Texture *texture = nullptr;
   int width = 0;
   int height = 0;
+  Uint32 format = 0;
 };
 
 std::map<const uint8_t *, CachedTexture> g_textureCache;
@@ -737,7 +738,12 @@ void Graphics::drawYuvFrame(const YuvFrame &frame, int x, int y, int w, int h) {
   const uint8_t *key = frame.y.data();
   CachedTexture &cached = g_textureCache[key];
 
-  if (!cached.texture || cached.width != frame.width || cached.height != frame.height) {
+  const Uint32 textureFormat =
+    frame.format == YuvFrame::Format::NV12
+      ? SDL_PIXELFORMAT_NV12
+      : SDL_PIXELFORMAT_IYUV;
+
+  if (!cached.texture || cached.width != frame.width || cached.height != frame.height || cached.format != textureFormat) {
     if (cached.texture) {
       SDL_DestroyTexture(cached.texture);
       cached.texture = nullptr;
@@ -745,7 +751,7 @@ void Graphics::drawYuvFrame(const YuvFrame &frame, int x, int y, int w, int h) {
 
     cached.texture = SDL_CreateTexture(
       g_renderer,
-      SDL_PIXELFORMAT_IYUV,
+      textureFormat,
       SDL_TEXTUREACCESS_STREAMING,
       frame.width,
       frame.height
@@ -753,22 +759,34 @@ void Graphics::drawYuvFrame(const YuvFrame &frame, int x, int y, int w, int h) {
 
     cached.width = frame.width;
     cached.height = frame.height;
+    cached.format = textureFormat;
   }
 
   if (!cached.texture) {
     return;
   }
 
-  SDL_UpdateYUVTexture(
-    cached.texture,
-    nullptr,
-    frame.y.data(),
-    frame.yPitch,
-    frame.u.data(),
-    frame.uPitch,
-    frame.v.data(),
-    frame.vPitch
-  );
+  if (frame.format == YuvFrame::Format::NV12) {
+    SDL_UpdateNVTexture(
+      cached.texture,
+      nullptr,
+      frame.y.data(),
+      frame.yPitch,
+      frame.u.data(),
+      frame.uPitch
+    );
+  } else {
+    SDL_UpdateYUVTexture(
+      cached.texture,
+      nullptr,
+      frame.y.data(),
+      frame.yPitch,
+      frame.u.data(),
+      frame.uPitch,
+      frame.v.data(),
+      frame.vPitch
+    );
+  }
 
   float srcRatio = float(frame.width) / float(frame.height);
   float dstRatio = float(w) / float(h);

@@ -4,8 +4,10 @@
 #include "nstv/native_demuxer.hpp"
 #include "nstv/native_decoder.hpp"
 #include "nstv/native_hw_device.hpp"
+#include "nstv/native_video_renderer.hpp"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 
 namespace nstv {
@@ -22,10 +24,11 @@ public:
 
   bool isOpen() const override { return open_; }
   bool isPaused() const override { return paused_; }
-  bool hasFrame() const override { return yuvFrame_.valid(); }
+  bool hasFrame() const override { return yuvFrame_.valid() || nativeVideoActive(); }
 
   const Bitmap &frame() const override { return emptyFrame_; }
   const YuvFrame &yuvFrame() const override { return yuvFrame_; }
+  bool nativeVideoActive() const override { return nativeRendererReady_ && nativeFramePresented_; }
 
   const std::string &error() const override { return error_; }
   const std::string &url() const override { return url_; }
@@ -45,6 +48,13 @@ private:
   NativeDemuxer demuxer_;
   NativeDecoder decoder_;
   NativeHwDeviceProbe hwProbe_;
+  std::unique_ptr<INativeVideoRenderer> nativeRenderer_;
+
+  bool nativeRendererReady_ = false;
+  bool preferNativeRenderer_ = true;
+  bool nativeRendererFailed_ = false;
+  bool nativeFramePresented_ = false;
+  std::string nativeRendererStatus_;
 
   bool clockStarted_ = false;
 
@@ -53,10 +63,12 @@ private:
 
   long long playbackStartMs_ = 0;
   long long lastFrameWallMs_ = 0;
+  long long lastPresentedVideoWallMs_ = 0;
   long long nextFrameDueMs_ = 0;
 
   int fallbackFrameIntervalMs_ = 40;
   int currentFrameIntervalMs_ = 40;
+  int cpuFrameCostAvgMs_ = 0;
 
   int decodedFrames_ = 0;
 
@@ -66,6 +78,10 @@ private:
   void resetClockToCurrentFrame(long long now);
   long long playbackDelayMs(long long now) const;
   bool shouldDropFrames(long long now) const;
+  int cpuPresentationIntervalMs() const;
+  int maxDropsPerUpdate() const;
+  int dropDelayThresholdMs() const;
+  void updateCpuFrameCost(long long elapsedMs);
 };
 
 } // namespace nstv

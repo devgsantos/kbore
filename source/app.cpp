@@ -637,12 +637,14 @@ void App::importPlaylist(const PlaylistConfig &playlist) {
     // the type/category panels still remain visible and the user can navigate.
     normalizeIndexes();
 
-    const Category *category = selectedCategoryPtr();
+    /*  
+      Não carregue channels automaticamente ao importar/trocar playlist.
 
-    if (category) {
-      loadCategory(false);
-      state_.focus = FocusColumn::Types;
-    }
+      Isso evita que uma falha no endpoint de channels apague ou atrapalhe
+      a visualização de types/categories recém-carregados.
+      O usuário carrega a categoria pressionando A.
+    */
+    state_.focus = FocusColumn::Types;
 
     state_.loading = false;
     state_.loadingMessage.clear();
@@ -883,15 +885,31 @@ void App::loadCategory(bool append) {
       " channels loaded from " + origin +
       ", page " + std::to_string(result.page) +
       "/" + std::to_string(result.totalPages);
-  } catch (const std::exception &ex) {
-    std::printf("[KBORE] importPlaylist failed: %s\n", ex.what());
-    state_.loading = false;
-    state_.loadingMessage.clear();
-    state_.hasManifest = false;
-    state_.manifest = Manifest{};
-    resetLoadedChannels();
-    state_.message = "Failed to load stream data. Check the playlist info and add it again.";
-  }
+    } catch (const std::exception &ex) {
+      std::printf("[KBORE] loadCategory failed: %s\n", ex.what());
+
+      state_.loading = false;
+      state_.loadingMessage.clear();
+
+      /*
+        Não apague o manifest aqui.
+
+        Se o manifest já carregou, types/categories devem continuar visíveis.
+        Uma falha ao carregar channels pode ser:
+          - categoria vazia
+          - endpoint de channels com formato diferente
+          - erro temporário de rede
+          - cache antigo/inválido
+          - categoria não suportada pela API
+
+        Mas isso não significa que a playlist inteira é inválida.
+      */
+      resetLoadedChannels();
+
+      state_.screen = ScreenId::Dashboard;
+      state_.focus = FocusColumn::Categories;
+      state_.message = "Failed to load channels for this category.";
+    }
 }
 
 void App::maybePreloadNextPage() {
@@ -1034,6 +1052,11 @@ void App::render() {
     case ScreenId::Settings: renderSettingsGraphic(); break;
     case ScreenId::Playlists: renderAddPlaylistGraphic(); break;
   }
+
+  if (state_.screen == ScreenId::Player && player_ && player_->nativeVideoActive()) {
+    return;
+  }
+
   gfx_.present();
 }
 
@@ -1383,7 +1406,14 @@ void App::renderPlayerGraphic() {
   if (isOpen) {
     player_->update();
 
-    if (player_->yuvFrame().valid()) {
+    if (player_->nativeVideoActive()) {
+      hasFrame = true;
+
+      if (!state_.playerFrameSeen) {
+        state_.playerFrameSeen = true;
+        state_.playerOverlayUntilMs = nowMs() + 5000;
+      }
+    } else if (player_->yuvFrame().valid()) {
       hasFrame = true;
 
       gfx_.drawYuvFrame(

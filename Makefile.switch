@@ -24,6 +24,7 @@ LDFLAGS  := -specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir 
 ROMFS    := $(APP_ROOT)/romfs
 APP_ICON := $(APP_ROOT)/romfs/logo/icon.jpg
 NRO_ICON_ARG := $(if $(wildcard $(APP_ICON)),--icon="$(APP_ICON)",)
+OUT_SHADERS := shaders
 PORTLIBS := $(DEVKITPRO)/portlibs/switch
 LIBNX    := $(DEVKITPRO)/libnx
 
@@ -69,6 +70,7 @@ LIBS := \
   -lmbedx509 \
   -lmbedcrypto \
   -lz \
+  -ldeko3d \
   -lEGL \
   -lGLESv2 \
   -lglad \
@@ -88,12 +90,18 @@ export DEPSDIR := $(CURDIR)/$(BUILD)
 CFILES := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.c)))
 CPPFILES := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.cpp)))
 SFILES := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.s)))
+GLSLFILES := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.glsl)))
 BINFILES := $(foreach dir,$(DATA),$(notdir $(wildcard $(dir)/*.*)))
+
+ROMFS_SHADERS := $(ROMFS)/$(OUT_SHADERS)
+ROMFS_TARGETS := $(patsubst %.glsl,$(ROMFS_SHADERS)/%.dksh,$(GLSLFILES))
+ROMFS_FOLDERS := $(ROMFS_SHADERS)
 
 export OFILES_BIN := $(addsuffix .o,$(BINFILES))
 export OFILES_SRC := $(CPPFILES:.cpp=.o) $(CFILES:.c=.o) $(SFILES:.s=.o)
 export OFILES := $(OFILES_BIN) $(OFILES_SRC)
 export HFILES_BIN := $(addsuffix .h,$(subst .,_,$(BINFILES)))
+export ROMFS_DEPS := $(ROMFS_TARGETS)
 
 export INCLUDE := -I$(PLAYER_SDK_INC) \
                   $(foreach dir,$(INCLUDES),-I$(CURDIR)/$(dir)) \
@@ -104,20 +112,33 @@ export LIBPATHS := -L$(PLAYER_SDK_LIB) \
 
 .PHONY: $(BUILD) clean all
 
-all: $(BUILD)
+all: $(ROMFS_TARGETS) $(BUILD)
 
 $(BUILD):
 	@[ -d $@ ] || mkdir -p $@
 	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile.switch
 
+$(ROMFS_TARGETS): | $(ROMFS_FOLDERS)
+
+$(ROMFS_FOLDERS):
+	@mkdir -p $@
+
+$(ROMFS_SHADERS)/%_vsh.dksh: %_vsh.glsl
+	@echo {vert} $(notdir $<)
+	@uam -s vert -o $@ $<
+
+$(ROMFS_SHADERS)/%_fsh.dksh: %_fsh.glsl
+	@echo {frag} $(notdir $<)
+	@uam -s frag -o $@ $<
+
 clean:
 	@echo clean ...
-	@rm -fr $(BUILD) $(TARGET).elf $(TARGET).nro $(TARGET).nacp
+	@rm -fr $(BUILD) $(ROMFS_FOLDERS) $(TARGET).elf $(TARGET).nro $(TARGET).nacp
 
 else
 DEPENDS := $(OFILES:.o=.d)
 
-$(OUTPUT).nro: $(OUTPUT).elf
+$(OUTPUT).nro: $(OUTPUT).elf $(ROMFS_DEPS)
 $(OUTPUT).elf: $(OFILES)
 
 %.elf:

@@ -1,6 +1,8 @@
 #include "nstv/native_decoder.hpp"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <sstream>
 #include <vector>
@@ -12,6 +14,7 @@ extern "C" {
 #include <libavutil/channel_layout.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/mem.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/rational.h>
 #include <libavutil/version.h>
@@ -57,6 +60,8 @@ struct NativeDecoder::Impl {
   SwsContext *sws = nullptr;
 
   std::vector<uint8_t> convertedYuvBuffer;
+  uint8_t *alignedTransferBuffer = nullptr;
+  std::size_t alignedTransferBufferSize = 0;
 
   int swsSrcWidth = 0;
   int swsSrcHeight = 0;
@@ -66,6 +71,9 @@ struct NativeDecoder::Impl {
 
   bool usingHardware = false;
   AVPixelFormat selectedHwPixelFormat = AV_PIX_FMT_NONE;
+
+  NativeVideoSurfaceInfo latestNativeSurfaceInfo;
+  bool latestHardwareFrameRetained = false;
 };
 #endif
 
@@ -77,6 +85,11 @@ std::string ffmpegError(int code) {
   char buffer[AV_ERROR_MAX_STRING_SIZE] = {};
   av_strerror(code, buffer, sizeof(buffer));
   return buffer;
+}
+
+void noopBufferFree(void *opaque, uint8_t *data) {
+  (void)opaque;
+  (void)data;
 }
 
 int audioChannels(const AVCodecContext *ctx) {
@@ -233,9 +246,39 @@ bool copyAvFrameToYuvFrame(
 
   const AVPixelFormat pixelFormat = static_cast<AVPixelFormat>(frame->format);
 
+  if (pixelFormat == AV_PIX_FMT_NV12) {
+    out.width = width;
+    out.height = height;
+    out.format = YuvFrame::Format::NV12;
+    out.yPitch = width;
+    out.uPitch = width;
+    out.vPitch = 0;
+
+    copyPlane(
+      out.y,
+      frame->data[0],
+      frame->linesize[0],
+      width,
+      height,
+      out.yPitch
+    );
+
+    copyPlane(
+      out.u,
+      frame->data[1],
+      frame->linesize[1],
+      width,
+      (height + 1) / 2,
+      out.uPitch
+    );
+
+    out.v.clear();
+    return true;
+  }
+
   if (pixelFormat != AV_PIX_FMT_YUV420P && pixelFormat != AV_PIX_FMT_YUVJ420P) {
     error =
-      "copyAvFrameToYuvFrame expected yuv420p/yuvj420p but received: " +
+      "copyAvFrameToYuvFrame expected yuv420p/yuvj420p/nv12 but received: " +
       pixelFormatName(pixelFormat);
 
     return false;
@@ -243,6 +286,7 @@ bool copyAvFrameToYuvFrame(
 
   out.width = width;
   out.height = height;
+  out.format = YuvFrame::Format::IYUV;
 
   out.yPitch = width;
   out.uPitch = width / 2;
@@ -278,6 +322,120 @@ bool copyAvFrameToYuvFrame(
   return true;
 }
 
+bool prepareAlignedTransferFrame(
+  AVFrame *source,
+  AVFrame *target,
+  uint8_t *&alignedTransferBuffer,
+  std::size_t &alignedTransferBufferSize,
+  AVPixelFormat &transferFormat,
+  std::string &error
+) {
+  transferFormat = AV_PIX_FMT_NONE;
+
+  if (!source || !source->hw_frames_ctx || !target) {
+    error = "NativeDecoder cannot prepare aligned transfer frame without a hardware frame context.";
+    return false;
+  }
+
+  AVPixelFormat *formats = nullptr;
+  int ret = av_hwframe_transfer_get_formats(
+    source->hw_frames_ctx,
+    AV_HWFRAME_TRANSFER_DIRECTION_FROM,
+    &formats,
+    0
+  );
+
+  if (ret < 0 || !formats || formats[0] == AV_PIX_FMT_NONE) {
+    if (formats) {
+      av_freep(&formats);
+    }
+
+    error = "NativeDecoder could not query NVTEGRA transfer formats: " + ffmpegError(ret);
+    return false;
+  }
+
+  transferFormat = formats[0];
+  av_freep(&formats);
+
+  if (transferFormat != AV_PIX_FMT_NV12 &&
+      transferFormat != AV_PIX_FMT_YUV420P &&
+      transferFormat != AV_PIX_FMT_YUVJ420P) {
+    av_frame_unref(target);
+    target->format = transferFormat;
+    target->width = source->width;
+    target->height = source->height;
+    return true;
+  }
+
+  const int width = source->width;
+  const int height = source->height;
+  const int bufferSize = av_image_get_buffer_size(
+    transferFormat,
+    width,
+    height,
+    256
+  );
+
+  if (width <= 0 || height <= 0 || bufferSize <= 0) {
+    error = "NativeDecoder could not size aligned transfer buffer.";
+    return false;
+  }
+
+  const std::size_t required = static_cast<std::size_t>((bufferSize + 255) & ~255);
+
+  if (required > alignedTransferBufferSize) {
+    if (alignedTransferBuffer) {
+      std::free(alignedTransferBuffer);
+      alignedTransferBuffer = nullptr;
+      alignedTransferBufferSize = 0;
+    }
+
+    alignedTransferBuffer = static_cast<uint8_t *>(std::aligned_alloc(256, required));
+
+    if (!alignedTransferBuffer) {
+      error = "NativeDecoder could not allocate aligned transfer buffer.";
+      return false;
+    }
+
+    alignedTransferBufferSize = required;
+  }
+
+  av_frame_unref(target);
+  target->format = transferFormat;
+  target->width = width;
+  target->height = height;
+
+  ret = av_image_fill_arrays(
+    target->data,
+    target->linesize,
+    alignedTransferBuffer,
+    transferFormat,
+    width,
+    height,
+    256
+  );
+
+  if (ret < 0) {
+    error = "NativeDecoder could not fill aligned transfer frame: " + ffmpegError(ret);
+    return false;
+  }
+
+  target->buf[0] = av_buffer_create(
+    alignedTransferBuffer,
+    required,
+    noopBufferFree,
+    nullptr,
+    0
+  );
+
+  if (!target->buf[0]) {
+    error = "NativeDecoder could not create aligned transfer buffer reference.";
+    return false;
+  }
+
+  return true;
+}
+
 #endif
 
 } // namespace
@@ -303,6 +461,9 @@ void NativeDecoder::resetState() {
 
   firstVideoFrame_ = NativeFrameInfo{};
   latestFrameInfo_ = NativeFrameInfo{};
+  if (impl_) {
+    impl_->latestNativeSurfaceInfo = NativeVideoSurfaceInfo{};
+  }
 
   firstYuvFrame_ = YuvFrame{};
   latestYuvFrame_ = YuvFrame{};
@@ -328,6 +489,8 @@ void NativeDecoder::rebuildSummary() {
       << firstVideoFrame_.pixelFormat
       << " hwFrame="
       << (firstVideoFrame_.hardwareFrame ? "yes" : "no")
+      << " nativeSurface="
+      << (firstVideoFrame_.nativeSurfaceAvailable ? "yes" : "no")
       << " transferred="
       << (firstVideoFrame_.transferredFromHardware ? "yes" : "no")
       << " ptsMs="
@@ -345,6 +508,8 @@ void NativeDecoder::rebuildSummary() {
       << latestFrameInfo_.pixelFormat
       << " hwFrame="
       << (latestFrameInfo_.hardwareFrame ? "yes" : "no")
+      << " nativeSurface="
+      << (latestFrameInfo_.nativeSurfaceAvailable ? "yes" : "no")
       << " transferred="
       << (latestFrameInfo_.transferredFromHardware ? "yes" : "no")
       << " | ";
@@ -414,6 +579,18 @@ bool NativeDecoder::openVideoHardware(
   AVPixelFormat hwPixelFormat
 ) {
   return openVideoInternal(demuxer, deviceContext, hwPixelFormat, true);
+}
+#endif
+
+#ifdef NSTV_USE_FFMPEG
+const NativeVideoSurfaceInfo &NativeDecoder::latestNativeSurfaceInfo() const {
+  static const NativeVideoSurfaceInfo empty;
+
+  if (!impl_) {
+    return empty;
+  }
+
+  return impl_->latestNativeSurfaceInfo;
 }
 #endif
 
@@ -880,7 +1057,11 @@ bool NativeDecoder::decodeAudioPacketToSdl(AVPacket *packet) {
 }
 #endif
 
-bool NativeDecoder::decodeNextVideoFrame(NativeDemuxer &demuxer, bool outputFrame) {
+bool NativeDecoder::decodeNextVideoFrame(
+  NativeDemuxer &demuxer,
+  bool outputFrame,
+  YuvFrame *outputYuvFrame
+) {
 #ifndef NSTV_USE_FFMPEG
   error_ = "NativeDecoder requires NSTV_USE_FFMPEG.";
   return false;
@@ -889,6 +1070,8 @@ bool NativeDecoder::decodeNextVideoFrame(NativeDemuxer &demuxer, bool outputFram
     error_ = "NativeDecoder internal state is unavailable.";
     return false;
   }
+
+  releaseLatestHardwareFrame();
 
   if (!video_.opened || !impl_->videoCodec || !impl_->packet || !impl_->videoFrame) {
     error_ = "NativeDecoder requires an open video decoder before decoding frames.";
@@ -985,6 +1168,19 @@ bool NativeDecoder::decodeNextVideoFrame(NativeDemuxer &demuxer, bool outputFram
       currentFrameInfo.hardwareFrame = hardwareFrame;
       currentFrameInfo.transferredFromHardware = false;
 
+      if (hasHardwareContext) {
+        impl_->latestNativeSurfaceInfo = inspectNativeVideoSurface(impl_->videoFrame);
+        currentFrameInfo.nativeSurfaceAvailable = impl_->latestNativeSurfaceInfo.valid;
+        currentFrameInfo.nativeSurfaceSummary = impl_->latestNativeSurfaceInfo.summary;
+
+        std::printf(
+          "[KBORE][NVTEGRA] %s\n",
+          impl_->latestNativeSurfaceInfo.summary.c_str()
+        );
+      } else {
+        impl_->latestNativeSurfaceInfo = NativeVideoSurfaceInfo{};
+      }
+
       latestFrameInfo_ = currentFrameInfo;
 
       if (!firstVideoFrame_.decoded) {
@@ -1015,7 +1211,21 @@ bool NativeDecoder::decodeNextVideoFrame(NativeDemuxer &demuxer, bool outputFram
       bool transferredFromHardware = false;
 
       if (hasHardwareContext) {
-        av_frame_unref(impl_->transferredFrame);
+        AVPixelFormat transferFormat = AV_PIX_FMT_NONE;
+        std::string transferPrepError;
+
+        if (!prepareAlignedTransferFrame(
+              impl_->videoFrame,
+              impl_->transferredFrame,
+              impl_->alignedTransferBuffer,
+              impl_->alignedTransferBufferSize,
+              transferFormat,
+              transferPrepError
+            )) {
+          error_ = transferPrepError;
+          av_frame_unref(impl_->videoFrame);
+          return false;
+        }
 
         ret = av_hwframe_transfer_data(
           impl_->transferredFrame,
@@ -1036,6 +1246,20 @@ bool NativeDecoder::decodeNextVideoFrame(NativeDemuxer &demuxer, bool outputFram
       const int inputWidth = frameForProcessing->width;
       const int inputHeight = frameForProcessing->height;
       const AVPixelFormat inputFormat = static_cast<AVPixelFormat>(frameForProcessing->format);
+      int outputWidth = inputWidth;
+      int outputHeight = inputHeight;
+
+      if (inputWidth > 1280 || inputHeight > 720) {
+        const double scale = std::min(
+          1280.0 / static_cast<double>(inputWidth),
+          720.0 / static_cast<double>(inputHeight)
+        );
+
+        outputWidth = std::max(2, static_cast<int>(inputWidth * scale));
+        outputHeight = std::max(2, static_cast<int>(inputHeight * scale));
+        outputWidth &= ~1;
+        outputHeight &= ~1;
+      }
 
       /*
         Atualiza info depois da transferência.
@@ -1043,8 +1267,8 @@ bool NativeDecoder::decodeNextVideoFrame(NativeDemuxer &demuxer, bool outputFram
       */
       latestFrameInfo_.width = inputWidth;
       latestFrameInfo_.height = inputHeight;
-      latestFrameInfo_.outputWidth = inputWidth;
-      latestFrameInfo_.outputHeight = inputHeight;
+      latestFrameInfo_.outputWidth = outputWidth;
+      latestFrameInfo_.outputHeight = outputHeight;
       latestFrameInfo_.pixelFormat = pixelFormatName(inputFormat);
       latestFrameInfo_.transferredFromHardware = transferredFromHardware;
 
@@ -1052,24 +1276,31 @@ bool NativeDecoder::decodeNextVideoFrame(NativeDemuxer &demuxer, bool outputFram
       currentFrameInfo.streamIndex = video_.streamIndex;
       currentFrameInfo.width = inputWidth;
       currentFrameInfo.height = inputHeight;
-      currentFrameInfo.outputWidth = inputWidth;
-      currentFrameInfo.outputHeight = inputHeight;
+      currentFrameInfo.outputWidth = outputWidth;
+      currentFrameInfo.outputHeight = outputHeight;
       currentFrameInfo.pixelFormat = pixelFormatName(inputFormat);
       currentFrameInfo.ptsMs = framePtsMs(impl_->videoFrame, videoStream);
       currentFrameInfo.hardwareFrame = hardwareFrame;
       currentFrameInfo.transferredFromHardware = transferredFromHardware;
+      currentFrameInfo.nativeSurfaceAvailable = latestFrameInfo_.nativeSurfaceAvailable;
+      currentFrameInfo.nativeSurfaceSummary = latestFrameInfo_.nativeSurfaceSummary;
 
       AVFrame *frameForCopy = frameForProcessing;
 
+      const bool mustScaleForOutput =
+        outputWidth != inputWidth ||
+        outputHeight != inputHeight;
+
       const bool canCopyDirect =
-        inputFormat == AV_PIX_FMT_YUV420P ||
-        inputFormat == AV_PIX_FMT_YUVJ420P;
+        !mustScaleForOutput &&
+        (inputFormat == AV_PIX_FMT_YUV420P ||
+         inputFormat == AV_PIX_FMT_YUVJ420P);
 
       if (!canCopyDirect) {
         int bufferSize = av_image_get_buffer_size(
           AV_PIX_FMT_YUV420P,
-          inputWidth,
-          inputHeight,
+          outputWidth,
+          outputHeight,
           1
         );
 
@@ -1087,21 +1318,21 @@ bool NativeDecoder::decodeNextVideoFrame(NativeDemuxer &demuxer, bool outputFram
           impl_->convertedYuvFrame->linesize,
           impl_->convertedYuvBuffer.data(),
           AV_PIX_FMT_YUV420P,
-          inputWidth,
-          inputHeight,
+          outputWidth,
+          outputHeight,
           1
         );
 
-        impl_->convertedYuvFrame->width = inputWidth;
-        impl_->convertedYuvFrame->height = inputHeight;
+        impl_->convertedYuvFrame->width = outputWidth;
+        impl_->convertedYuvFrame->height = outputHeight;
         impl_->convertedYuvFrame->format = AV_PIX_FMT_YUV420P;
 
         const bool mustRecreateSws =
           !impl_->sws ||
           impl_->swsSrcWidth != inputWidth ||
           impl_->swsSrcHeight != inputHeight ||
-          impl_->swsDstWidth != inputWidth ||
-          impl_->swsDstHeight != inputHeight ||
+          impl_->swsDstWidth != outputWidth ||
+          impl_->swsDstHeight != outputHeight ||
           impl_->swsSrcFormat != inputFormat;
 
         if (mustRecreateSws) {
@@ -1114,8 +1345,8 @@ bool NativeDecoder::decodeNextVideoFrame(NativeDemuxer &demuxer, bool outputFram
             inputWidth,
             inputHeight,
             inputFormat,
-            inputWidth,
-            inputHeight,
+            outputWidth,
+            outputHeight,
             AV_PIX_FMT_YUV420P,
             SWS_FAST_BILINEAR,
             nullptr,
@@ -1132,8 +1363,8 @@ bool NativeDecoder::decodeNextVideoFrame(NativeDemuxer &demuxer, bool outputFram
 
           impl_->swsSrcWidth = inputWidth;
           impl_->swsSrcHeight = inputHeight;
-          impl_->swsDstWidth = inputWidth;
-          impl_->swsDstHeight = inputHeight;
+          impl_->swsDstWidth = outputWidth;
+          impl_->swsDstHeight = outputHeight;
           impl_->swsSrcFormat = inputFormat;
         }
 
@@ -1149,25 +1380,28 @@ bool NativeDecoder::decodeNextVideoFrame(NativeDemuxer &demuxer, bool outputFram
 
         frameForCopy = impl_->convertedYuvFrame;
 
-        latestFrameInfo_.outputWidth = inputWidth;
-        latestFrameInfo_.outputHeight = inputHeight;
+        latestFrameInfo_.outputWidth = outputWidth;
+        latestFrameInfo_.outputHeight = outputHeight;
         latestFrameInfo_.pixelFormat = pixelFormatName(static_cast<AVPixelFormat>(frameForCopy->format));
       }
 
       YuvFrame decodedFrame;
+      YuvFrame &targetFrame = outputYuvFrame ? *outputYuvFrame : decodedFrame;
       std::string copyError;
 
-      if (!copyAvFrameToYuvFrame(frameForCopy, decodedFrame, copyError)) {
+      if (!copyAvFrameToYuvFrame(frameForCopy, targetFrame, copyError)) {
         error_ = copyError;
         av_frame_unref(impl_->videoFrame);
         av_frame_unref(impl_->transferredFrame);
         return false;
       }
 
-      latestYuvFrame_ = std::move(decodedFrame);
-
       if (!firstYuvFrame_.valid()) {
-        firstYuvFrame_ = latestYuvFrame_;
+        firstYuvFrame_ = targetFrame;
+      }
+
+      if (!outputYuvFrame) {
+        latestYuvFrame_ = std::move(decodedFrame);
       }
 
       av_frame_unref(impl_->videoFrame);
@@ -1198,9 +1432,157 @@ bool NativeDecoder::dropNextVideoFrame(NativeDemuxer &demuxer) {
   return decodeNextVideoFrame(demuxer, false);
 }
 
+#ifdef NSTV_USE_FFMPEG
+bool NativeDecoder::decodeNextHardwareFrame(NativeDemuxer &demuxer) {
+  if (!impl_) {
+    error_ = "NativeDecoder internal state is unavailable.";
+    return false;
+  }
+
+  releaseLatestHardwareFrame();
+
+  if (!video_.opened || !impl_->videoCodec || !impl_->packet || !impl_->videoFrame) {
+    error_ = "NativeDecoder requires an open video decoder before decoding hardware frames.";
+    return false;
+  }
+
+  AVFormatContext *format = demuxer.formatContext();
+
+  if (!format) {
+    error_ = "NativeDecoder could not access AVFormatContext while decoding hardware frame.";
+    return false;
+  }
+
+  const int maxPackets = 80;
+
+  for (int i = 0; i < maxPackets; ++i) {
+    int ret = av_read_frame(format, impl_->packet);
+
+    if (ret < 0) {
+      error_ = "NativeDecoder could not read next hardware frame: " + ffmpegError(ret);
+      return false;
+    }
+
+    if (audio_.opened && impl_->packet->stream_index == audio_.streamIndex) {
+      if (!decodeAudioPacketToSdl(impl_->packet)) {
+        av_packet_unref(impl_->packet);
+        return false;
+      }
+
+      av_packet_unref(impl_->packet);
+      continue;
+    }
+
+    if (impl_->packet->stream_index != video_.streamIndex) {
+      av_packet_unref(impl_->packet);
+      continue;
+    }
+
+    ret = avcodec_send_packet(impl_->videoCodec, impl_->packet);
+
+    av_packet_unref(impl_->packet);
+
+    if (ret < 0 && ret != AVERROR(EAGAIN)) {
+      error_ = "NativeDecoder could not send video packet for hardware frame: " + ffmpegError(ret);
+      return false;
+    }
+
+    while (true) {
+      ret = avcodec_receive_frame(impl_->videoCodec, impl_->videoFrame);
+
+      if (ret == AVERROR(EAGAIN)) {
+        break;
+      }
+
+      if (ret == AVERROR_EOF) {
+        error_ = "NativeDecoder reached EOF while decoding hardware frame.";
+        return false;
+      }
+
+      if (ret < 0) {
+        error_ = "NativeDecoder could not receive hardware frame: " + ffmpegError(ret);
+        return false;
+      }
+
+      AVStream *videoStream = format->streams[video_.streamIndex];
+      AVPixelFormat originalFormat = static_cast<AVPixelFormat>(impl_->videoFrame->format);
+      const bool hardwareFrame =
+        impl_->usingHardware &&
+        originalFormat == impl_->selectedHwPixelFormat;
+      const bool hasHardwareContext =
+        hardwareFrame ||
+        impl_->videoFrame->hw_frames_ctx != nullptr;
+
+      NativeFrameInfo currentFrameInfo;
+      currentFrameInfo.decoded = true;
+      currentFrameInfo.streamIndex = video_.streamIndex;
+      currentFrameInfo.width = impl_->videoFrame->width;
+      currentFrameInfo.height = impl_->videoFrame->height;
+      currentFrameInfo.outputWidth = impl_->videoFrame->width;
+      currentFrameInfo.outputHeight = impl_->videoFrame->height;
+      currentFrameInfo.pixelFormat = pixelFormatName(originalFormat);
+      currentFrameInfo.ptsMs = framePtsMs(impl_->videoFrame, videoStream);
+      currentFrameInfo.hardwareFrame = hardwareFrame;
+      currentFrameInfo.transferredFromHardware = false;
+
+      if (hasHardwareContext) {
+        impl_->latestNativeSurfaceInfo = inspectNativeVideoSurface(impl_->videoFrame);
+        currentFrameInfo.nativeSurfaceAvailable = impl_->latestNativeSurfaceInfo.valid;
+        currentFrameInfo.nativeSurfaceSummary = impl_->latestNativeSurfaceInfo.summary;
+        latestFrameInfo_ = currentFrameInfo;
+
+        if (!firstVideoFrame_.decoded) {
+          firstVideoFrame_ = currentFrameInfo;
+        }
+
+        impl_->latestHardwareFrameRetained = true;
+
+        std::printf(
+          "[KBORE][NVTEGRA] retained hardware frame without CPU transfer: %s\n",
+          impl_->latestNativeSurfaceInfo.summary.c_str()
+        );
+
+        rebuildSummary();
+        return true;
+      }
+
+      latestFrameInfo_ = currentFrameInfo;
+      impl_->latestNativeSurfaceInfo = NativeVideoSurfaceInfo{};
+      av_frame_unref(impl_->videoFrame);
+      rebuildSummary();
+
+      error_ = "NativeDecoder received a software frame while hardware frame was requested.";
+      return false;
+    }
+  }
+
+  error_ = "NativeDecoder reached packet limit before next hardware frame.";
+  return false;
+}
+
+const AVFrame *NativeDecoder::latestHardwareFrame() const {
+  if (!impl_ || !impl_->latestHardwareFrameRetained) {
+    return nullptr;
+  }
+
+  return impl_->videoFrame;
+}
+
+void NativeDecoder::releaseLatestHardwareFrame() {
+  if (!impl_ || !impl_->latestHardwareFrameRetained) {
+    return;
+  }
+
+  av_frame_unref(impl_->videoFrame);
+  impl_->latestHardwareFrameRetained = false;
+}
+#endif
+
 void NativeDecoder::close() {
 #ifdef NSTV_USE_FFMPEG
   if (impl_) {
+    releaseLatestHardwareFrame();
+
     #ifdef NSTV_USE_SDL
         if (impl_->audioDevice != 0) {
           SDL_PauseAudioDevice(impl_->audioDevice, 1);
@@ -1243,6 +1625,12 @@ void NativeDecoder::close() {
     if (impl_->sws) {
       sws_freeContext(impl_->sws);
       impl_->sws = nullptr;
+    }
+
+    if (impl_->alignedTransferBuffer) {
+      std::free(impl_->alignedTransferBuffer);
+      impl_->alignedTransferBuffer = nullptr;
+      impl_->alignedTransferBufferSize = 0;
     }
 
     if (impl_->videoCodec) {
