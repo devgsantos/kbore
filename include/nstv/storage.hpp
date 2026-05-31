@@ -1,12 +1,29 @@
 #pragma once
 
 #include "nstv/models.hpp"
+#include <cstddef>
+#include <functional>
 #include <string>
 
 namespace nstv {
 
 std::string dataDir();
 std::string activeManifestPath();
+std::string playlistManifestPath(const std::string &playlistId);
+
+bool saveManifestForPlaylist(const Manifest &manifest, const std::string &playlistId);
+bool saveManifestTextForPlaylist(
+  const std::string &manifestText,
+  const std::string &playlistId,
+  const std::function<void(std::size_t written, std::size_t total)> &progress = {}
+);
+
+bool saveManifestGzipBytesForPlaylist(
+  const std::string &gzipBytes,
+  const std::string &playlistId,
+  const std::function<void(std::size_t written, std::size_t total)> &progress = {}
+);
+bool loadManifestForPlaylist(Manifest &manifest, const std::string &playlistId);
 
 bool saveManifest(const Manifest &manifest);
 bool loadManifest(Manifest &manifest);

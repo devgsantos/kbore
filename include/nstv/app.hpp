@@ -10,9 +10,12 @@
 #include "nstv/player_backend.hpp"
 #include "nstv/player_backend_factory.hpp"
 #include "nstv/video_player.hpp"
+#include <cstddef>
 #include <set>
 #include <string>
 #include <memory>
+#include <mutex>
+#include <thread>
 
 namespace nstv {
 
@@ -31,6 +34,11 @@ struct AppState {
   int loadedTotal = 0;
   int loadedTotalPages = 1;
   std::string loadedCategoryKey;
+
+  // Dynamic tree navigation. When manifest.nodes is available, the dashboard
+  // behaves as a three-column tree browser:
+  //   roots -> current folder children -> selected child preview/items.
+  std::vector<int> nodePath;
 
   int selectedType = 0;
   int selectedCategory = 0;
@@ -54,6 +62,7 @@ struct AppState {
 class App {
 public:
   App();
+  ~App();
   int run();
 
 private:
@@ -76,6 +85,14 @@ private:
   std::string activePlaylistName() const;
   void activatePlaylist(int index);
   void importPlaylist(const PlaylistConfig &playlist);
+  void startPlaylistLoad(const PlaylistConfig &playlist, bool forceRefresh = false);
+  void updatePlaylistLoad();
+  bool playlistLoadActive() const;
+
+  void startDeferredCacheSave(std::string playlistId, std::string manifestText, bool alreadyGzip);
+  void updateCacheSave();
+  bool cacheSaveActive() const;
+
   void addM3uPlaylist();
   void addXtreamPlaylist();
   void deletePlaylist(int index);
@@ -92,6 +109,19 @@ private:
   const TypeGroup *selectedTypeGroup() const;
   const Category *selectedCategoryPtr() const;
   const Channel *selectedChannelPtr() const;
+
+  bool usingNodeTree() const;
+  const MediaNode *selectedRootNode() const;
+  const MediaNode *nodeAtPath(const MediaNode *root, const std::vector<int> &path) const;
+  const MediaNode *currentNodeParent() const;
+  const MediaNode *selectedCurrentNode() const;
+  const MediaNode *selectedPreviewNode() const;
+  std::vector<const MediaNode *> currentNodeChildren() const;
+  std::vector<const MediaNode *> previewNodeChildren() const;
+  Channel channelFromNode(const MediaNode &node) const;
+  void enterNode(const MediaNode &node, int childIndex);
+  void playNode(const MediaNode &node);
+  std::string breadcrumbText() const;
 
   template <typename T, typename LabelFn>
   std::vector<std::string> buildWindowRows(
@@ -117,6 +147,29 @@ private:
   Graphics gfx_;
   ImageCache imageCache_;
   std::unique_ptr<IPlayerBackend> player_;
+
+  std::thread playlistLoadThread_;
+  mutable std::mutex playlistLoadMutex_;
+  bool playlistLoadActive_ = false;
+  bool playlistLoadDone_ = false;
+  bool playlistLoadSuccess_ = false;
+  bool playlistLoadForceRefresh_ = false;
+  PlaylistConfig playlistLoadPlaylist_;
+  Manifest playlistLoadManifest_;
+  std::string playlistLoadCacheText_;
+  bool playlistLoadCacheTextIsGzip_ = false;
+  std::string playlistLoadMessage_;
+  std::string playlistLoadError_;
+
+  std::thread cacheSaveThread_;
+  mutable std::mutex cacheSaveMutex_;
+  bool cacheSaveActive_ = false;
+  bool cacheSaveDone_ = false;
+  bool cacheSaveSuccess_ = false;
+  std::string cacheSavePlaylistId_;
+  std::string cacheSaveError_;
+  std::size_t cacheSaveWritten_ = 0;
+  std::size_t cacheSaveTotal_ = 0;
 
   bool splashVisible_ = true;
   long long splashStartedAtMs_ = 0;

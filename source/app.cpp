@@ -7,6 +7,8 @@
 #include <chrono>
 #include <cstdio>
 #include <ctime>
+#include <mutex>
+#include <thread>
 
 namespace nstv {
 
@@ -220,31 +222,29 @@ App::App() : api_(loadConfig()), player_(createPlayerBackend()) {
   if (playlist) {
     bool usedCache = false;
 
-    if (loadManifest(state_.manifest)) {
+    if (loadManifestForPlaylist(state_.manifest, playlist->id)) {
       const bool cachedMatchesActive =
         state_.manifest.id == playlist->id &&
-        !state_.manifest.types.empty();
+        (!state_.manifest.nodes.empty() || !state_.manifest.types.empty());
 
       if (cachedMatchesActive) {
         state_.hasManifest = true;
         usedCache = true;
         normalizeIndexes();
 
-        if (selectedCategoryPtr()) {
-          loadCategory(false);
-        }
+        saveManifest(state_.manifest);
 
         state_.message =
           "Loaded cached manifest: " +
-          std::to_string(state_.manifest.totalChannels) +
-          " channels";
+          std::to_string(state_.manifest.totalChannels > 0 ? state_.manifest.totalChannels : state_.manifest.totalItems) +
+          " items";
       }
     }
 
     if (!usedCache) {
-      importPlaylist(*playlist);
+      startPlaylistLoad(*playlist);
     }
-  } else if (loadManifest(state_.manifest) && !state_.manifest.types.empty()) {
+  } else if (loadManifest(state_.manifest) && (!state_.manifest.nodes.empty() || !state_.manifest.types.empty())) {
     state_.hasManifest = true;
     state_.message =
       "Loaded cached manifest: " +
@@ -255,11 +255,38 @@ App::App() : api_(loadConfig()), player_(createPlayerBackend()) {
   }
 }
 
+
+App::~App() {
+  if (playlistLoadThread_.joinable()) {
+    playlistLoadThread_.join();
+  }
+
+  if (cacheSaveThread_.joinable()) {
+    cacheSaveThread_.join();
+  }
+}
+
 int App::run() {
   render();
 
   while (state_.running) {
+    updatePlaylistLoad();
+    updateCacheSave();
+
     if (splashVisible_) {
+      Button button = pollButton();
+
+      if (button == Button::Quit) {
+        state_.running = false;
+        break;
+      }
+
+      render();
+      sleepMs(16);
+      continue;
+    }
+
+    if (playlistLoadActive()) {
       Button button = pollButton();
 
       if (button == Button::Quit) {
@@ -286,6 +313,8 @@ int App::run() {
 
     Button button = pollButtonBlocking();
     handle(button);
+    updatePlaylistLoad();
+    updateCacheSave();
     render();
   }
 
@@ -341,7 +370,7 @@ void App::handleDashboard(Button button) {
     return;
   }
 
-  if (button == Button::Back) {
+  if (button == Button::Back && !usingNodeTree()) {
     if (state_.focus == FocusColumn::Playlist) {
       state_.focus = FocusColumn::Types;
     } else if (state_.focus == FocusColumn::Channels) {
@@ -350,6 +379,221 @@ void App::handleDashboard(Button button) {
       state_.focus = FocusColumn::Types;
     }
     return;
+  }
+
+
+  if (usingNodeTree()) {
+    if (button == Button::Back) {
+      if (state_.focus == FocusColumn::Channels) {
+        state_.focus = FocusColumn::Categories;
+      } else if (state_.focus == FocusColumn::Categories) {
+        if (!state_.nodePath.empty()) {
+          state_.nodePath.pop_back();
+          state_.selectedCategory = 0;
+          state_.selectedChannel = 0;
+        } else {
+          state_.focus = FocusColumn::Types;
+        }
+      } else if (state_.focus == FocusColumn::Types) {
+        state_.focus = FocusColumn::Playlist;
+      }
+      return;
+    }
+
+    if (button == Button::Left) {
+      if (state_.focus == FocusColumn::Playlist) {
+        const int count = static_cast<int>(state_.config.playlists.size());
+        if (count > 1) {
+          int activeIndex = 0;
+
+          for (int i = 0; i < count; ++i) {
+            if (state_.config.playlists[static_cast<std::size_t>(i)].id == state_.config.activePlaylistId) {
+              activeIndex = i;
+              break;
+            }
+          }
+
+          activeIndex = (activeIndex + count - 1) % count;
+          activatePlaylist(activeIndex);
+        }
+        return;
+      }
+
+      if (state_.focus == FocusColumn::Channels) {
+        state_.focus = FocusColumn::Categories;
+      } else if (state_.focus == FocusColumn::Categories) {
+        state_.focus = FocusColumn::Types;
+      }
+      return;
+    }
+
+    if (button == Button::Right) {
+      if (state_.focus == FocusColumn::Playlist) {
+        const int count = static_cast<int>(state_.config.playlists.size());
+        if (count > 1) {
+          int activeIndex = 0;
+
+          for (int i = 0; i < count; ++i) {
+            if (state_.config.playlists[static_cast<std::size_t>(i)].id == state_.config.activePlaylistId) {
+              activeIndex = i;
+              break;
+            }
+          }
+
+          activeIndex = (activeIndex + 1) % count;
+          activatePlaylist(activeIndex);
+        }
+        return;
+      }
+
+      if (state_.focus == FocusColumn::Types) {
+        state_.focus = FocusColumn::Categories;
+      } else if (state_.focus == FocusColumn::Categories) {
+        state_.focus = FocusColumn::Channels;
+      }
+      return;
+    }
+
+    if (button == Button::Up) {
+      if (state_.focus == FocusColumn::Playlist) {
+        return;
+      }
+
+      if (state_.focus == FocusColumn::Types) {
+        if (state_.selectedType <= 0) {
+          state_.focus = FocusColumn::Playlist;
+        } else {
+          state_.selectedType--;
+          state_.nodePath.clear();
+          state_.selectedCategory = 0;
+          state_.selectedChannel = 0;
+        }
+        return;
+      }
+
+      if (state_.focus == FocusColumn::Categories) {
+        if (state_.selectedCategory <= 0) {
+          state_.focus = FocusColumn::Playlist;
+        } else {
+          state_.selectedCategory--;
+          state_.selectedChannel = 0;
+        }
+        return;
+      }
+
+      if (state_.focus == FocusColumn::Channels) {
+        if (state_.selectedChannel <= 0) {
+          state_.focus = FocusColumn::Categories;
+        } else {
+          state_.selectedChannel--;
+        }
+        return;
+      }
+    }
+
+    if (button == Button::Down) {
+      if (state_.focus == FocusColumn::Playlist) {
+        state_.focus = FocusColumn::Types;
+        return;
+      }
+
+      if (state_.focus == FocusColumn::Types) {
+        state_.selectedType++;
+        state_.nodePath.clear();
+        state_.selectedCategory = 0;
+        state_.selectedChannel = 0;
+      } else if (state_.focus == FocusColumn::Categories) {
+        state_.selectedCategory++;
+        state_.selectedChannel = 0;
+      } else if (state_.focus == FocusColumn::Channels) {
+        state_.selectedChannel++;
+      }
+
+      normalizeIndexes();
+      return;
+    }
+
+    if (button == Button::Favorite) {
+      const MediaNode *node = state_.focus == FocusColumn::Channels
+        ? selectedPreviewNode()
+        : selectedCurrentNode();
+
+      if (!node || node->url.empty()) {
+        return;
+      }
+
+      if (state_.favorites.count(node->id)) {
+        state_.favorites.erase(node->id);
+        state_.message = "Removed favorite: " + (node->title.empty() ? node->name : node->title);
+      } else {
+        state_.favorites.insert(node->id);
+        state_.message = "Favorite: " + (node->title.empty() ? node->name : node->title);
+      }
+      return;
+    }
+
+    if (button == Button::Select) {
+      if (state_.focus == FocusColumn::Playlist) {
+        state_.screen = ScreenId::AddPlaylist;
+        return;
+      }
+
+      if (state_.focus == FocusColumn::Types) {
+        state_.nodePath.clear();
+        state_.selectedCategory = 0;
+        state_.selectedChannel = 0;
+        state_.focus = FocusColumn::Categories;
+        return;
+      }
+
+      if (state_.focus == FocusColumn::Categories) {
+        const MediaNode *node = selectedCurrentNode();
+
+        if (!node) {
+          return;
+        }
+
+        if (!node->children.empty()) {
+          enterNode(*node, state_.selectedCategory);
+          return;
+        }
+
+        if (node->playable || !node->url.empty()) {
+          playNode(*node);
+          return;
+        }
+
+        state_.message = "Empty folder";
+        return;
+      }
+
+      if (state_.focus == FocusColumn::Channels) {
+        const MediaNode *preview = selectedPreviewNode();
+
+        if (!preview) {
+          return;
+        }
+
+        if (!preview->children.empty()) {
+          // Preview nodes are children of the currently selected category.
+          state_.nodePath.push_back(state_.selectedCategory);
+          state_.nodePath.push_back(state_.selectedChannel);
+          state_.selectedCategory = 0;
+          state_.selectedChannel = 0;
+          state_.focus = FocusColumn::Categories;
+          normalizeIndexes();
+          return;
+        }
+
+        if (preview->playable || !preview->url.empty()) {
+          playNode(*preview);
+          return;
+        }
+
+        state_.message = "Empty folder";
+        return;
+      }
+    }
   }
 
   if (button == Button::Left) {
@@ -580,89 +824,444 @@ void App::activatePlaylist(int index) {
   state_.config.activePlaylistId = playlist.id;
   saveConfig(state_.config);
 
-  importPlaylist(playlist);
+  /*
+    Manifest loading can be heavy for dynamic node manifests (tens of MB).
+    Always load it through the background worker, even when it is already
+    cached locally, so the UI keeps rendering the Loading spinner.
+  */
+  startPlaylistLoad(playlist, false);
 }
 
 void App::importPlaylist(const PlaylistConfig &playlist) {
-  try {
-    const std::string sourceUrl = playlist.sourceUrl();
+  startPlaylistLoad(playlist, false);
+}
 
-    // Recreate the API client with the latest config. This matters after the
-    // user adds/saves a playlist from inside the app.
-    api_ = ParserApiClient(state_.config);
+bool App::playlistLoadActive() const {
+  std::lock_guard<std::mutex> lock(playlistLoadMutex_);
+  return playlistLoadActive_;
+}
 
-    if (state_.config.parserApiBaseUrl.empty()) {
-      throw std::runtime_error("Internal parser API base URL is empty");
+void App::startPlaylistLoad(const PlaylistConfig &playlist, bool forceRefresh) {
+  updatePlaylistLoad();
+
+  {
+    std::lock_guard<std::mutex> lock(playlistLoadMutex_);
+
+    if (playlistLoadActive_) {
+      state_.message = "Playlist is already loading. Please wait.";
+      return;
+    }
+  }
+
+  if (playlistLoadThread_.joinable()) {
+    playlistLoadThread_.join();
+  }
+
+  state_.loading = true;
+  state_.loadingMessage = "Loading playlist...";
+  state_.message = "Loading " + playlist.name + "...";
+
+  {
+    std::lock_guard<std::mutex> lock(playlistLoadMutex_);
+    playlistLoadActive_ = true;
+    playlistLoadDone_ = false;
+    playlistLoadSuccess_ = false;
+    playlistLoadForceRefresh_ = forceRefresh;
+    playlistLoadPlaylist_ = playlist;
+    playlistLoadManifest_ = Manifest{};
+    playlistLoadCacheText_.clear();
+    playlistLoadCacheTextIsGzip_ = false;
+    playlistLoadMessage_ = "Loading playlist...";
+    playlistLoadError_.clear();
+  }
+
+  Config config = state_.config;
+
+  playlistLoadThread_ = std::thread([this, playlist, config, forceRefresh]() {
+    auto setStatus = [this](const std::string &message) {
+      std::lock_guard<std::mutex> lock(playlistLoadMutex_);
+      playlistLoadMessage_ = message;
+    };
+
+    try {
+      Manifest manifest;
+
+      if (!forceRefresh) {
+        setStatus("Loading cached manifest...");
+
+        if (loadManifestForPlaylist(manifest, playlist.id) &&
+            manifest.id == playlist.id &&
+            (!manifest.nodes.empty() || !manifest.types.empty())) {
+          manifest.id = playlist.id;
+          manifest.name = playlist.name.empty() ? manifest.name : playlist.name;
+          manifest.source = playlist.sourceUrl().empty() ? manifest.source : playlist.sourceUrl();
+          manifest.provider = playlist.provider;
+
+          std::lock_guard<std::mutex> lock(playlistLoadMutex_);
+          playlistLoadManifest_ = std::move(manifest);
+          playlistLoadSuccess_ = true;
+          playlistLoadDone_ = true;
+          playlistLoadMessage_ = "Preparing interface...";
+          return;
+        }
+      }
+
+      const std::string sourceUrl = playlist.sourceUrl();
+
+      if (config.parserApiBaseUrl.empty()) {
+        throw std::runtime_error("Internal parser API base URL is empty");
+      }
+
+      if (sourceUrl.empty()) {
+        throw std::runtime_error("Playlist URL/source is empty");
+      }
+
+      setStatus("Downloading manifest...");
+
+      ParserApiClient api(config, setStatus);
+      ManifestLoadResult loadResult;
+
+      if (playlist.provider == Provider::Xtream) {
+        loadResult = api.loadXtreamManifestWithCacheText(sourceUrl);
+      } else {
+        loadResult = api.loadM3uManifestWithCacheText(sourceUrl);
+      }
+
+      setStatus("Preparing manifest...");
+
+      Manifest imported = std::move(loadResult.manifest);
+      imported.id = playlist.id;
+      imported.name = playlist.name.empty() ? imported.name : playlist.name;
+      imported.source = sourceUrl;
+      imported.provider = playlist.provider;
+
+      if (imported.nodes.empty() && imported.types.empty()) {
+        throw std::runtime_error("Parser returned an empty manifest");
+      }
+
+      /*
+        Save the raw API response instead of serializing the Manifest tree
+        back to JSON. The API response is already the final contract and the
+        storage loader accepts both { ok, manifest } and flattened manifests.
+        This avoids the expensive recursive write that was freezing/crashing
+        on large node manifests.
+      */
+      if (loadResult.cacheText.empty()) {
+        throw std::runtime_error("Parser returned an empty cache body");
+      }
+
+      /*
+        Do not block the playlist-loading worker on SD-card cache writes.
+
+        Large dynamic manifests can be tens of MB after decompression. Even
+        when saved as gzip, the final chunks/gzclose/rename can freeze the
+        Switch enough to stop the UI spinner. The manifest is already parsed
+        and ready for use here, so hand the UI the Manifest first and defer
+        the cache write to a separate throttled background job.
+      */
+      setStatus("Preparing interface...");
+
+      std::lock_guard<std::mutex> lock(playlistLoadMutex_);
+      playlistLoadManifest_ = std::move(imported);
+      playlistLoadCacheText_ = std::move(loadResult.cacheText);
+      playlistLoadCacheTextIsGzip_ = loadResult.cacheTextIsGzip;
+      playlistLoadSuccess_ = true;
+      playlistLoadDone_ = true;
+      playlistLoadMessage_ = "Preparing interface...";
+    } catch (const std::exception &ex) {
+      std::lock_guard<std::mutex> lock(playlistLoadMutex_);
+      playlistLoadSuccess_ = false;
+      playlistLoadDone_ = true;
+      playlistLoadError_ = ex.what();
+      playlistLoadMessage_ = "Failed";
+    }
+  });
+}
+
+void App::updatePlaylistLoad() {
+  PlaylistConfig playlist;
+  Manifest manifest;
+  std::string cacheText;
+  bool cacheTextIsGzip = false;
+  std::string message;
+  std::string error;
+  bool active = false;
+  bool done = false;
+  bool success = false;
+
+  {
+    std::lock_guard<std::mutex> lock(playlistLoadMutex_);
+    active = playlistLoadActive_;
+
+    if (!active) {
+      return;
     }
 
-    if (sourceUrl.empty()) {
-      throw std::runtime_error("Playlist URL/source is empty");
-    }
+    done = playlistLoadDone_;
+    success = playlistLoadSuccess_;
+    playlist = playlistLoadPlaylist_;
+    message = playlistLoadMessage_;
+    error = playlistLoadError_;
 
+    if (done && success) {
+      /*
+        The dynamic nodes manifest can be very large. Do not copy it from
+        the worker result into the UI thread local variable; copying the
+        whole tree here freezes the UI right after cache saving completes.
+        Move it once, then reset the worker state below.
+      */
+      manifest = std::move(playlistLoadManifest_);
+      cacheText = std::move(playlistLoadCacheText_);
+      cacheTextIsGzip = playlistLoadCacheTextIsGzip_;
+    }
+  }
+
+  if (!done) {
     state_.loading = true;
-    state_.loadingMessage = "Loading";
-    state_.message = "Loading " + playlist.name + "...";
-    render();
+    state_.loadingMessage = message.empty() ? "Loading playlist..." : message;
+    state_.message = state_.loadingMessage;
+    return;
+  }
 
-    Manifest imported;
+  if (playlistLoadThread_.joinable()) {
+    playlistLoadThread_.join();
+  }
 
-    if (playlist.provider == Provider::Xtream) {
-      imported = api_.loadXtreamManifest(sourceUrl);
-    } else {
-      imported = api_.loadM3uManifest(sourceUrl);
-    }
+  {
+    std::lock_guard<std::mutex> lock(playlistLoadMutex_);
+    playlistLoadActive_ = false;
+    playlistLoadDone_ = false;
+    playlistLoadSuccess_ = false;
+    playlistLoadManifest_ = Manifest{};
+    playlistLoadCacheText_.clear();
+    playlistLoadCacheTextIsGzip_ = false;
+    playlistLoadMessage_.clear();
+    playlistLoadError_.clear();
+  }
 
-    imported.id = playlist.id;
-    imported.name = playlist.name.empty() ? imported.name : playlist.name;
-    imported.source = sourceUrl;
-    imported.provider = playlist.provider;
+  state_.loading = false;
+  state_.loadingMessage.clear();
 
-    if (imported.types.empty()) {
-      throw std::runtime_error("Parser returned an empty manifest");
-    }
+  if (success && !cacheText.empty()) {
+    startDeferredCacheSave(playlist.id, std::move(cacheText), cacheTextIsGzip);
+  }
 
-    state_.manifest = imported;
-    state_.hasManifest = true;
-    state_.screen = ScreenId::Dashboard;
-    state_.focus = FocusColumn::Types;
-    state_.selectedType = 0;
-    state_.selectedCategory = 0;
-    state_.selectedChannel = 0;
 
-    resetLoadedChannels();
-    saveManifest(state_.manifest);
-
-    // Load the first category immediately so the dashboard is populated after
-    // adding or switching playlists. If the selected type has no categories,
-    // the type/category panels still remain visible and the user can navigate.
-    normalizeIndexes();
-
-    /*  
-      Não carregue channels automaticamente ao importar/trocar playlist.
-
-      Isso evita que uma falha no endpoint de channels apague ou atrapalhe
-      a visualização de types/categories recém-carregados.
-      O usuário carrega a categoria pressionando A.
-    */
-    state_.focus = FocusColumn::Types;
-
-    state_.loading = false;
-    state_.loadingMessage.clear();
-    state_.message =
-      "Loaded " +
-      playlist.name +
-      ": " +
-      std::to_string(state_.manifest.totalChannels) +
-      " channels";
-  } catch (const std::exception &ex) {
-    state_.loading = false;
-    state_.loadingMessage.clear();
+  if (!success) {
     state_.hasManifest = false;
     resetLoadedChannels();
     state_.screen = ScreenId::AddPlaylist;
     state_.message = "Failed to load stream data. Check the playlist info and add it again.";
+
+    if (!error.empty()) {
+      std::printf("[KBORE] playlist load failed: %s\n", error.c_str());
+    }
+
+    return;
+  }
+
+  state_.manifest = std::move(manifest);
+  state_.hasManifest = true;
+  state_.screen = ScreenId::Dashboard;
+  state_.focus = FocusColumn::Types;
+  state_.selectedType = 0;
+  state_.selectedCategory = 0;
+  state_.selectedChannel = 0;
+  state_.nodePath.clear();
+
+  resetLoadedChannels();
+  normalizeIndexes();
+
+  // Keep the active manifest path compatible without forcing re-downloads.
+  // The per-playlist cache is the source of truth for large dynamic manifests.
+  // Avoid doing another large write here.
+  state_.message =
+    "Loaded " +
+    playlist.name +
+    ": " +
+    std::to_string(state_.manifest.totalChannels > 0 ? state_.manifest.totalChannels : state_.manifest.totalItems) +
+    " items";
+}
+
+
+
+void App::startDeferredCacheSave(std::string playlistId, std::string manifestText, bool alreadyGzip) {
+  if (playlistId.empty() || manifestText.empty()) {
+    return;
+  }
+
+  /*
+    Only one cache writer is allowed at a time.
+
+    The previous detached implementation could keep a zlib/SD-card write alive
+    after App state changed or while another playlist was being loaded. On the
+    Switch this can crash the homebrew process. This version owns the worker
+    thread, tracks its lifecycle, joins completed work, and skips new cache
+    jobs while a previous one is still active.
+  */
+  {
+    std::lock_guard<std::mutex> lock(cacheSaveMutex_);
+
+    if (cacheSaveActive_ && !cacheSaveDone_) {
+      std::printf(
+        "[KBORE][CACHE] cache save already active, skipping new save: current=%s new=%s\n",
+        cacheSavePlaylistId_.c_str(),
+        playlistId.c_str()
+      );
+      return;
+    }
+  }
+
+  if (cacheSaveThread_.joinable()) {
+    cacheSaveThread_.join();
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(cacheSaveMutex_);
+    cacheSaveActive_ = true;
+    cacheSaveDone_ = false;
+    cacheSaveSuccess_ = false;
+    cacheSavePlaylistId_ = playlistId;
+    cacheSaveError_.clear();
+    cacheSaveWritten_ = 0;
+    cacheSaveTotal_ = manifestText.size();
+  }
+
+  cacheSaveThread_ = std::thread(
+    [this, playlistId = std::move(playlistId), manifestText = std::move(manifestText), alreadyGzip]() mutable {
+      bool saved = false;
+      std::string error;
+
+      try {
+        std::printf(
+          "[KBORE][CACHE] lifecycle cache save started: playlist=%s size=%zu KB\n",
+          playlistId.c_str(),
+          manifestText.size() / 1024
+        );
+
+        auto progress = [this](std::size_t written, std::size_t total) {
+          std::lock_guard<std::mutex> lock(cacheSaveMutex_);
+          cacheSaveWritten_ = written;
+          cacheSaveTotal_ = total;
+        };
+
+        if (alreadyGzip) {
+          saved = saveManifestGzipBytesForPlaylist(
+            manifestText,
+            playlistId,
+            progress
+          );
+        } else {
+          saved = saveManifestTextForPlaylist(
+            manifestText,
+            playlistId,
+            progress
+          );
+        }
+
+        if (!saved) {
+          error = alreadyGzip
+            ? "saveManifestGzipBytesForPlaylist returned false"
+            : "saveManifestTextForPlaylist returned false";
+        }
+      } catch (const std::exception &ex) {
+        error = ex.what();
+        saved = false;
+      } catch (...) {
+        error = "unknown cache save error";
+        saved = false;
+      }
+
+      {
+        std::lock_guard<std::mutex> lock(cacheSaveMutex_);
+        cacheSaveSuccess_ = saved;
+        cacheSaveError_ = error;
+        cacheSaveDone_ = true;
+      }
+
+      std::printf(
+        "[KBORE][CACHE] lifecycle cache save %s: playlist=%s%s%s\n",
+        saved ? "completed" : "failed",
+        playlistId.c_str(),
+        error.empty() ? "" : " error=",
+        error.empty() ? "" : error.c_str()
+      );
+    }
+  );
+}
+
+void App::updateCacheSave() {
+  bool active = false;
+  bool done = false;
+  bool success = false;
+  std::string playlistId;
+  std::string error;
+  std::size_t written = 0;
+  std::size_t total = 0;
+
+  {
+    std::lock_guard<std::mutex> lock(cacheSaveMutex_);
+    active = cacheSaveActive_;
+
+    if (!active) {
+      return;
+    }
+
+    done = cacheSaveDone_;
+    success = cacheSaveSuccess_;
+    playlistId = cacheSavePlaylistId_;
+    error = cacheSaveError_;
+    written = cacheSaveWritten_;
+    total = cacheSaveTotal_;
+  }
+
+  if (!done) {
+    /*
+      Keep this non-invasive. The cache save happens after the playlist is
+      already usable, so do not show a blocking overlay. Leave breadcrumbs in
+      the status message only when the app is otherwise idle.
+    */
+    if (!state_.loading && state_.screen == ScreenId::Dashboard && total > 0) {
+      std::ostringstream message;
+      message << "Saving playlist cache... " << (written / 1024) << " / " << (total / 1024) << " KB";
+      state_.message = message.str();
+    }
+
+    return;
+  }
+
+  if (cacheSaveThread_.joinable()) {
+    cacheSaveThread_.join();
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(cacheSaveMutex_);
+    cacheSaveActive_ = false;
+    cacheSaveDone_ = false;
+    cacheSaveSuccess_ = false;
+    cacheSavePlaylistId_.clear();
+    cacheSaveError_.clear();
+    cacheSaveWritten_ = 0;
+    cacheSaveTotal_ = 0;
+  }
+
+  if (!state_.loading && state_.screen == ScreenId::Dashboard) {
+    state_.message = success
+      ? "Playlist cache saved"
+      : "Playlist cache save failed";
+  }
+
+  if (!success && !error.empty()) {
+    std::printf("[KBORE][CACHE] cache save failed for %s: %s\n", playlistId.c_str(), error.c_str());
   }
 }
+
+bool App::cacheSaveActive() const {
+  std::lock_guard<std::mutex> lock(cacheSaveMutex_);
+  return cacheSaveActive_;
+}
+
+
 
 
 void App::addM3uPlaylist() {
@@ -982,6 +1581,20 @@ void App::resetLoadedChannels() {
 }
 
 std::vector<TypeGroup> App::visibleTypes() const {
+  if (usingNodeTree()) {
+    std::vector<TypeGroup> groups;
+
+    for (const auto &node : state_.manifest.nodes) {
+      TypeGroup group;
+      group.id = streamTypeFromString(node.type);
+      group.label = node.title.empty() ? node.name : node.title;
+      group.totalChannels = node.totalChannels > 0 ? node.totalChannels : node.totalItems;
+      groups.push_back(group);
+    }
+
+    return groups;
+  }
+
   if (state_.hasManifest) return state_.manifest.types;
   return {
     {StreamType::Live, "Live TV", 0, {}},
@@ -1002,6 +1615,10 @@ const TypeGroup *App::selectedTypeGroup() const {
 }
 
 const Category *App::selectedCategoryPtr() const {
+  if (usingNodeTree()) {
+    return nullptr;
+  }
+
   const TypeGroup *type = selectedTypeGroup();
   if (!type || type->categories.empty()) return nullptr;
   int index = std::clamp(state_.selectedCategory, 0, static_cast<int>(type->categories.size()) - 1);
@@ -1014,9 +1631,251 @@ const Channel *App::selectedChannelPtr() const {
   return &state_.loadedChannels[index];
 }
 
+
+bool App::usingNodeTree() const {
+  return state_.hasManifest && !state_.manifest.nodes.empty();
+}
+
+const MediaNode *App::selectedRootNode() const {
+  if (!usingNodeTree()) {
+    return nullptr;
+  }
+
+  int index = std::clamp(
+    state_.selectedType,
+    0,
+    std::max(0, static_cast<int>(state_.manifest.nodes.size()) - 1)
+  );
+
+  if (index < 0 || index >= static_cast<int>(state_.manifest.nodes.size())) {
+    return nullptr;
+  }
+
+  return &state_.manifest.nodes[static_cast<std::size_t>(index)];
+}
+
+const MediaNode *App::nodeAtPath(const MediaNode *root, const std::vector<int> &path) const {
+  const MediaNode *node = root;
+
+  for (int index : path) {
+    if (!node || node->children.empty()) {
+      return node;
+    }
+
+    int safeIndex = std::clamp(
+      index,
+      0,
+      std::max(0, static_cast<int>(node->children.size()) - 1)
+    );
+
+    node = &node->children[static_cast<std::size_t>(safeIndex)];
+  }
+
+  return node;
+}
+
+const MediaNode *App::currentNodeParent() const {
+  return nodeAtPath(selectedRootNode(), state_.nodePath);
+}
+
+std::vector<const MediaNode *> App::currentNodeChildren() const {
+  std::vector<const MediaNode *> nodes;
+  const MediaNode *parent = currentNodeParent();
+
+  if (!parent) {
+    return nodes;
+  }
+
+  for (const auto &child : parent->children) {
+    nodes.push_back(&child);
+  }
+
+  return nodes;
+}
+
+const MediaNode *App::selectedCurrentNode() const {
+  std::vector<const MediaNode *> children = currentNodeChildren();
+
+  if (children.empty()) {
+    return nullptr;
+  }
+
+  int index = std::clamp(
+    state_.selectedCategory,
+    0,
+    std::max(0, static_cast<int>(children.size()) - 1)
+  );
+
+  return children[static_cast<std::size_t>(index)];
+}
+
+std::vector<const MediaNode *> App::previewNodeChildren() const {
+  std::vector<const MediaNode *> nodes;
+  const MediaNode *selected = selectedCurrentNode();
+
+  if (!selected) {
+    return nodes;
+  }
+
+  if (!selected->children.empty()) {
+    for (const auto &child : selected->children) {
+      nodes.push_back(&child);
+    }
+    return nodes;
+  }
+
+  if (selected->playable || !selected->url.empty()) {
+    nodes.push_back(selected);
+  }
+
+  return nodes;
+}
+
+const MediaNode *App::selectedPreviewNode() const {
+  std::vector<const MediaNode *> nodes = previewNodeChildren();
+
+  if (nodes.empty()) {
+    return nullptr;
+  }
+
+  int index = std::clamp(
+    state_.selectedChannel,
+    0,
+    std::max(0, static_cast<int>(nodes.size()) - 1)
+  );
+
+  return nodes[static_cast<std::size_t>(index)];
+}
+
+Channel App::channelFromNode(const MediaNode &node) const {
+  Channel channel;
+  channel.id = node.id;
+  channel.name = node.title.empty() ? node.name : node.title;
+  channel.url = node.url;
+  channel.logo = node.logo;
+  channel.group = node.group;
+  channel.groupId = node.groupId;
+  channel.type = streamTypeFromString(node.type);
+  return channel;
+}
+
+void App::enterNode(const MediaNode &node, int childIndex) {
+  if (!usingNodeTree()) {
+    return;
+  }
+
+  if (node.children.empty()) {
+    return;
+  }
+
+  state_.nodePath.push_back(childIndex);
+  state_.selectedCategory = 0;
+  state_.selectedChannel = 0;
+  resetLoadedChannels();
+  state_.focus = FocusColumn::Categories;
+}
+
+void App::playNode(const MediaNode &node) {
+  if (node.url.empty()) {
+    state_.message = "This item has no playback URL";
+    return;
+  }
+
+  Channel channel = channelFromNode(node);
+  state_.loadedChannels.clear();
+  state_.loadedChannels.push_back(channel);
+  state_.selectedChannel = 0;
+  playSelectedChannel();
+}
+
+std::string App::breadcrumbText() const {
+  if (!usingNodeTree()) {
+    return "";
+  }
+
+  std::string out = activePlaylistName();
+  const MediaNode *root = selectedRootNode();
+
+  if (!root) {
+    return out;
+  }
+
+  out += " > ";
+  out += root->title.empty() ? root->name : root->title;
+
+  const MediaNode *node = root;
+  for (int index : state_.nodePath) {
+    if (!node || node->children.empty()) {
+      break;
+    }
+
+    int safeIndex = std::clamp(
+      index,
+      0,
+      std::max(0, static_cast<int>(node->children.size()) - 1)
+    );
+
+    node = &node->children[static_cast<std::size_t>(safeIndex)];
+    out += " > ";
+    out += node->title.empty() ? node->name : node->title;
+  }
+
+  return out;
+}
+
 void App::normalizeIndexes() {
   auto types = visibleTypes();
   state_.selectedType = std::clamp(state_.selectedType, 0, std::max(0, static_cast<int>(types.size()) - 1));
+
+  if (usingNodeTree()) {
+    const MediaNode *root = selectedRootNode();
+
+    if (!root) {
+      state_.nodePath.clear();
+      state_.selectedCategory = 0;
+      state_.selectedChannel = 0;
+      return;
+    }
+
+    // Clamp the stored path defensively, because different playlists may have
+    // different tree depths and branch sizes.
+    const MediaNode *node = root;
+    std::vector<int> safePath;
+
+    for (int index : state_.nodePath) {
+      if (!node || node->children.empty()) {
+        break;
+      }
+
+      int safeIndex = std::clamp(
+        index,
+        0,
+        std::max(0, static_cast<int>(node->children.size()) - 1)
+      );
+
+      safePath.push_back(safeIndex);
+      node = &node->children[static_cast<std::size_t>(safeIndex)];
+    }
+
+    state_.nodePath = safePath;
+
+    const auto children = currentNodeChildren();
+    state_.selectedCategory = std::clamp(
+      state_.selectedCategory,
+      0,
+      std::max(0, static_cast<int>(children.size()) - 1)
+    );
+
+    const auto preview = previewNodeChildren();
+    state_.selectedChannel = std::clamp(
+      state_.selectedChannel,
+      0,
+      std::max(0, static_cast<int>(preview.size()) - 1)
+    );
+
+    return;
+  }
+
   const TypeGroup *type = selectedTypeGroup();
   int categories = type ? static_cast<int>(type->categories.size()) : 0;
   state_.selectedCategory = std::clamp(state_.selectedCategory, 0, std::max(0, categories - 1));
@@ -1081,9 +1940,42 @@ void App::renderDashboardGraphic() {
   auto types = visibleTypes();
   std::vector<Category> categories;
   const TypeGroup *type = selectedTypeGroup();
-  if (type) categories = type->categories;
 
-  const Channel *selectedChannel = selectedChannelPtr();
+  std::vector<const MediaNode *> nodeChildren;
+  std::vector<const MediaNode *> nodePreview;
+  Channel selectedNodeChannel;
+  bool hasSelectedNodeChannel = false;
+
+  if (usingNodeTree()) {
+    nodeChildren = currentNodeChildren();
+    nodePreview = previewNodeChildren();
+
+    for (const MediaNode *node : nodeChildren) {
+      if (!node) {
+        continue;
+      }
+
+      Category category;
+      category.id = node->id;
+      category.name = node->title.empty() ? node->name : node->title;
+      category.totalChannels = node->totalChannels > 0 ? node->totalChannels : node->totalItems;
+      category.type = streamTypeFromString(node->type);
+      categories.push_back(category);
+    }
+
+    const MediaNode *previewNode = selectedPreviewNode();
+    if (previewNode && (previewNode->playable || !previewNode->url.empty())) {
+      selectedNodeChannel = channelFromNode(*previewNode);
+      hasSelectedNodeChannel = true;
+    }
+  } else if (type) {
+    categories = type->categories;
+  }
+
+  const Channel *selectedChannel = hasSelectedNodeChannel
+    ? &selectedNodeChannel
+    : selectedChannelPtr();
+
   const Category *selectedCategory = selectedCategoryPtr();
   const std::string provider = providerLabel(state_.hasManifest ? state_.manifest.provider : Provider::Local);
 
@@ -1175,12 +2067,31 @@ void App::renderDashboardGraphic() {
   Rect categoriesPanel{332, 90, 330, 470};
   Rect channelsPanel{676, 90, 587, 470};
 
-  drawPanel(typesPanel, "STREAM TYPES", "layers", state_.focus == FocusColumn::Types);
-  drawPanel(categoriesPanel, "CATEGORIES", "categories", state_.focus == FocusColumn::Categories);
-  std::string chTitle = "CHANNELS";
-  if (type) chTitle += " (" + type->label + ")";
+  drawPanel(typesPanel, usingNodeTree() ? "ROOT" : "STREAM TYPES", "layers", state_.focus == FocusColumn::Types);
+
+  std::string categoriesTitle = "CATEGORIES";
+  if (usingNodeTree()) {
+    const MediaNode *parent = currentNodeParent();
+    if (parent) {
+      categoriesTitle = Graphics::fitText(parent->title.empty() ? parent->name : parent->title, 18);
+    }
+  }
+
+  drawPanel(categoriesPanel, categoriesTitle, "categories", state_.focus == FocusColumn::Categories);
+
+  std::string chTitle = usingNodeTree() ? "NEXT / ITEMS" : "CHANNELS";
+  if (!usingNodeTree() && type) chTitle += " (" + type->label + ")";
   drawPanel(channelsPanel, chTitle, "channels", state_.focus == FocusColumn::Channels);
-  gfx_.drawTextRight(std::to_string(state_.loadedTotal > 0 ? state_.loadedTotal : (type ? type->totalChannels : 0)) + " CHANNELS", channelsPanel.x + channelsPanel.w - 28, channelsPanel.y + 25, 2, muted, false);
+
+  int panelTotal = state_.loadedTotal > 0
+    ? state_.loadedTotal
+    : (
+        usingNodeTree()
+          ? static_cast<int>(nodePreview.size())
+          : (type ? type->totalChannels : 0)
+      );
+
+  gfx_.drawTextRight(std::to_string(panelTotal) + " ITEMS", channelsPanel.x + channelsPanel.w - 28, channelsPanel.y + 25, 2, muted, false);
 
   // Stream type cards -------------------------------------------------------
   int typeY = typesPanel.y + 70;
@@ -1206,6 +2117,17 @@ void App::renderDashboardGraphic() {
   gfx_.drawText("CONNECTED", typesPanel.x+78, cy+12, 3, text, true);
   gfx_.drawText((provider + " ONLINE"), typesPanel.x+78, cy+37, 2, green, false);
 
+  if (usingNodeTree()) {
+    gfx_.drawText(
+      Graphics::fitText(breadcrumbText(), 64),
+      categoriesPanel.x + 18,
+      categoriesPanel.y + categoriesPanel.h - 28,
+      1,
+      muted,
+      false
+    );
+  }
+
   // Categories: no side acronym/icon, smaller text -------------------------
   int catRows = 9;
   int catStart = windowStart(state_.selectedCategory, (int)categories.size(), catRows);
@@ -1221,29 +2143,73 @@ void App::renderDashboardGraphic() {
     gfx_.drawBadge(std::to_string(c.totalChannels), categoriesPanel.x + categoriesPanel.w - 72, y + 8, 42, 22, rgba(41,54,82,220), text);
   }
 
-  // Channels/movies: no numeric prefix, smaller text, wider panel ----------
+  // Channels/movies/items: no numeric prefix, smaller text, wider panel ----
   int channelRows = 7;
-  int chanStart = windowStart(state_.selectedChannel, (int)state_.loadedChannels.size(), channelRows);
-  for (int i=0; i<channelRows; ++i) {
-    int index = chanStart + i;
-    int y = channelsPanel.y + 66 + i * 55;
-    if (index >= (int)state_.loadedChannels.size()) break;
-    const auto &ch = state_.loadedChannels[index];
-    bool selected = index == state_.selectedChannel;
-    gfx_.fillRoundRect(channelsPanel.x + 14, y, channelsPanel.w - 32, 49, 12, selected ? rgba(12,23,52,245) : rgba(10,15,29,215));
-    gfx_.strokeRoundRect(channelsPanel.x + 14, y, channelsPanel.w - 32, 49, 12, selected ? brightBlue : rgba(72,92,128,24), selected ? 2 : 1);
 
-    // Prefer the real logo from the API. If it is missing or cannot be decoded, use a small acronym fallback.
-    drawLogoOrFallback(ch, channelsPanel.x + 30, y + 7, 48, 35);
+  if (usingNodeTree()) {
+    int chanStart = windowStart(state_.selectedChannel, static_cast<int>(nodePreview.size()), channelRows);
 
-    const int nameX = channelsPanel.x + 94;
-    gfx_.drawText(Graphics::fitText(ch.name, 35), nameX, y + 9, 3, text, true);
-    gfx_.drawText("EPG unavailable", nameX, y + 32, 2, muted, false);
-    gfx_.drawText(state_.favorites.count(ch.id) ? "*" : "<3", channelsPanel.x + channelsPanel.w - 42, y + 15, 2, muted, false);
-  }
-  if (state_.loadedChannels.empty()) {
-    gfx_.drawText("SELECT A CATEGORY", channelsPanel.x + 40, channelsPanel.y + 178, 3, muted, false);
-    gfx_.drawText("PRESS A TO LOAD", channelsPanel.x + 40, channelsPanel.y + 206, 2, blue, true);
+    for (int i = 0; i < channelRows; ++i) {
+      int index = chanStart + i;
+      int y = channelsPanel.y + 66 + i * 55;
+
+      if (index >= static_cast<int>(nodePreview.size())) {
+        break;
+      }
+
+      const MediaNode *node = nodePreview[static_cast<std::size_t>(index)];
+      if (!node) {
+        continue;
+      }
+
+      bool selected = index == state_.selectedChannel;
+      const bool playable = node->playable || !node->url.empty();
+      const bool folder = !node->children.empty();
+
+      gfx_.fillRoundRect(channelsPanel.x + 14, y, channelsPanel.w - 32, 49, 12, selected ? rgba(12,23,52,245) : rgba(10,15,29,215));
+      gfx_.strokeRoundRect(channelsPanel.x + 14, y, channelsPanel.w - 32, 49, 12, selected ? brightBlue : rgba(72,92,128,24), selected ? 2 : 1);
+
+      Channel ch = channelFromNode(*node);
+      drawLogoOrFallback(ch, channelsPanel.x + 30, y + 7, 48, 35);
+
+      const int nameX = channelsPanel.x + 94;
+      gfx_.drawText(Graphics::fitText(ch.name, 35), nameX, y + 9, 3, text, true);
+
+      std::string sub = folder
+        ? ("FOLDER • " + std::to_string(static_cast<int>(node->children.size())) + " ITEMS")
+        : (playable ? "PLAYABLE" : "EMPTY");
+
+      gfx_.drawText(sub, nameX, y + 32, 2, muted, false);
+      gfx_.drawText(state_.favorites.count(node->id) ? "*" : (folder ? ">" : "<3"), channelsPanel.x + channelsPanel.w - 42, y + 15, 2, muted, false);
+    }
+
+    if (nodePreview.empty()) {
+      gfx_.drawText("SELECT A FOLDER OR ITEM", channelsPanel.x + 40, channelsPanel.y + 178, 3, muted, false);
+      gfx_.drawText("PRESS A TO OPEN", channelsPanel.x + 40, channelsPanel.y + 206, 2, blue, true);
+    }
+  } else {
+    int chanStart = windowStart(state_.selectedChannel, (int)state_.loadedChannels.size(), channelRows);
+    for (int i=0; i<channelRows; ++i) {
+      int index = chanStart + i;
+      int y = channelsPanel.y + 66 + i * 55;
+      if (index >= (int)state_.loadedChannels.size()) break;
+      const auto &ch = state_.loadedChannels[index];
+      bool selected = index == state_.selectedChannel;
+      gfx_.fillRoundRect(channelsPanel.x + 14, y, channelsPanel.w - 32, 49, 12, selected ? rgba(12,23,52,245) : rgba(10,15,29,215));
+      gfx_.strokeRoundRect(channelsPanel.x + 14, y, channelsPanel.w - 32, 49, 12, selected ? brightBlue : rgba(72,92,128,24), selected ? 2 : 1);
+
+      // Prefer the real logo from the API. If it is missing or cannot be decoded, use a small acronym fallback.
+      drawLogoOrFallback(ch, channelsPanel.x + 30, y + 7, 48, 35);
+
+      const int nameX = channelsPanel.x + 94;
+      gfx_.drawText(Graphics::fitText(ch.name, 35), nameX, y + 9, 3, text, true);
+      gfx_.drawText("EPG unavailable", nameX, y + 32, 2, muted, false);
+      gfx_.drawText(state_.favorites.count(ch.id) ? "*" : "<3", channelsPanel.x + channelsPanel.w - 42, y + 15, 2, muted, false);
+    }
+    if (state_.loadedChannels.empty()) {
+      gfx_.drawText("SELECT A CATEGORY", channelsPanel.x + 40, channelsPanel.y + 178, 3, muted, false);
+      gfx_.drawText("PRESS A TO LOAD", channelsPanel.x + 40, channelsPanel.y + 206, 2, blue, true);
+    }
   }
 
   // Info panel: smaller footer text ----------------------------------------

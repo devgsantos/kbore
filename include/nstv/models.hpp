@@ -23,6 +23,22 @@ struct TypeGroup {
   std::vector<Category> categories;
 };
 
+struct MediaNode {
+  std::string id;
+  std::string title;
+  std::string name;
+  std::string type;
+  std::string kind;
+  std::string url;
+  std::string logo;
+  std::string group;
+  std::string groupId;
+  int totalItems = 0;
+  int totalChannels = 0;
+  bool playable = false;
+  std::vector<MediaNode> children;
+};
+
 struct Channel {
   std::string id;
   std::string name;
@@ -39,7 +55,9 @@ struct Manifest {
   std::string source;
   Provider provider = Provider::Local;
   int totalChannels = 0;
+  int totalItems = 0;
   std::vector<TypeGroup> types;
+  std::vector<MediaNode> nodes;
 };
 
 struct ChannelPage {
