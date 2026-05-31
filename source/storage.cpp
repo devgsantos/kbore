@@ -18,10 +18,18 @@ std::string dataDir() {
 }
 
 std::string activeManifestPath() {
-  return dataDir() + "/active-manifest.json";
+  return dataDir() + "/manifests/active-manifest.json";
 }
 
 std::string manifestPath(const std::string &playlistId) {
+  return dataDir() + "/manifests/manifest-" + safeFilePart(playlistId.empty() ? "active" : playlistId) + ".json";
+}
+
+static std::string legacyActiveManifestPath() {
+  return dataDir() + "/active-manifest.json";
+}
+
+static std::string legacyManifestPath(const std::string &playlistId) {
   return dataDir() + "/manifest-" + safeFilePart(playlistId.empty() ? "active" : playlistId) + ".json";
 }
 
@@ -38,9 +46,11 @@ static void ensureDataDir() {
   mkdir("sdmc:/switch", 0777);
   mkdir("sdmc:/switch/kbore", 0777);
   mkdir("sdmc:/switch/kbore/cache", 0777);
+  mkdir("sdmc:/switch/kbore/manifests", 0777);
 #else
   mkdir(".", 0777);
   mkdir("./cache", 0777);
+  mkdir("./manifests", 0777);
 #endif
 }
 
@@ -234,7 +244,8 @@ bool saveManifest(const Manifest &manifest) {
 }
 
 bool loadManifest(Manifest &manifest) {
-  return readManifestFile(activeManifestPath(), manifest);
+  return readManifestFile(activeManifestPath(), manifest) ||
+    readManifestFile(legacyActiveManifestPath(), manifest);
 }
 
 bool loadManifest(const std::string &playlistId, Manifest &manifest) {
@@ -242,10 +253,15 @@ bool loadManifest(const std::string &playlistId, Manifest &manifest) {
     return true;
   }
 
+  if (readManifestFile(legacyManifestPath(playlistId), manifest)) {
+    saveManifest(manifest);
+    return true;
+  }
+
   Manifest legacy;
   if (
     !playlistId.empty() &&
-    readManifestFile(activeManifestPath(), legacy) &&
+    readManifestFile(legacyActiveManifestPath(), legacy) &&
     legacy.id == playlistId &&
     !legacy.types.empty()
   ) {
