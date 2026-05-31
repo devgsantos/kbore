@@ -74,6 +74,7 @@ private:
 
   const PlaylistConfig *activePlaylist() const;
   std::string activePlaylistName() const;
+  bool loadCachedPlaylist(const PlaylistConfig &playlist);
   void activatePlaylist(int index);
   void importPlaylist(const PlaylistConfig &playlist);
   void addM3uPlaylist();

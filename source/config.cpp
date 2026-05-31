@@ -134,12 +134,13 @@ static PlaylistConfig playlistFromJson(const Json &json, int index) {
   return playlist;
 }
 
-static Json playlistToJson(const PlaylistConfig &playlist) {
+static Json playlistToJson(const PlaylistConfig &playlist, const std::string &activePlaylistId) {
   Json json(Json::object_t{});
 
   json["id"] = playlist.id;
   json["name"] = playlist.name;
   json["type"] = toString(playlist.provider);
+  json["active"] = playlist.id == activePlaylistId;
 
   if (playlist.provider == Provider::M3u) {
     json["m3u_url"] = playlist.m3uUrl;
@@ -211,7 +212,7 @@ Config loadConfig() {
         cfg.defaultPlaylistUrl = json["defaultPlaylistUrl"].asString("");
         cfg.defaultXtreamUrl = json["defaultXtreamUrl"].asString("");
 
-        cfg.activePlaylistId = json["active_playlist_id"].asString(json["activePlaylistId"].asString(""));
+        cfg.activePlaylistId = json["active"].asString(json["active_playlist_id"].asString(json["activePlaylistId"].asString("")));
 
         cfg.pageSize = json["pageSize"].asInt(20);
         cfg.preloadThreshold = json["preloadThreshold"].asInt(8);
@@ -222,8 +223,13 @@ Config loadConfig() {
 
           for (const Json &item : json["playlists"].asArray()) {
             PlaylistConfig playlist = playlistFromJson(item, index++);
+            const bool itemActive = item["active"].asBool(false);
 
             if (!playlist.sourceUrl().empty()) {
+              if (itemActive) {
+                cfg.activePlaylistId = playlist.id;
+              }
+
               cfg.playlists.push_back(playlist);
             }
           }
@@ -333,6 +339,7 @@ bool saveConfig(const Config &config) {
   json["pageSize"] = config.pageSize;
   json["preloadThreshold"] = config.preloadThreshold;
   json["useUnicodeIcons"] = config.useUnicodeIcons;
+  json["active"] = config.activePlaylistId;
   json["active_playlist_id"] = config.activePlaylistId;
 
   // Keep legacy fields for compatibility with older builds/tools.
@@ -342,7 +349,7 @@ bool saveConfig(const Config &config) {
   Json::array_t playlists;
 
   for (const auto &playlist : config.playlists) {
-    playlists.push_back(playlistToJson(playlist));
+    playlists.push_back(playlistToJson(playlist, config.activePlaylistId));
   }
 
   json["playlists"] = Json(playlists);

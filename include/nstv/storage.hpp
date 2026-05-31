@@ -7,9 +7,11 @@ namespace nstv {
 
 std::string dataDir();
 std::string activeManifestPath();
+std::string manifestPath(const std::string &playlistId);
 
 bool saveManifest(const Manifest &manifest);
 bool loadManifest(Manifest &manifest);
+bool loadManifest(const std::string &playlistId, Manifest &manifest);
 
 std::string cacheDir();
 std::string channelPageCachePath(

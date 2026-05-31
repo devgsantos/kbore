@@ -7,6 +7,8 @@
 
 namespace nstv {
 
+static std::string safeFilePart(const std::string &value);
+
 std::string dataDir() {
 #ifdef __SWITCH__
   return "sdmc:/switch/kbore";
@@ -17,6 +19,10 @@ std::string dataDir() {
 
 std::string activeManifestPath() {
   return dataDir() + "/active-manifest.json";
+}
+
+std::string manifestPath(const std::string &playlistId) {
+  return dataDir() + "/manifest-" + safeFilePart(playlistId.empty() ? "active" : playlistId) + ".json";
 }
 
 std::string cacheDir() {
@@ -142,6 +148,21 @@ static Manifest manifestFromJson(const Json &json) {
   return manifest;
 }
 
+static bool readManifestFile(const std::string &path, Manifest &manifest) {
+  std::ifstream file(path, std::ios::binary);
+  if (!file) return false;
+
+  std::ostringstream ss;
+  ss << file.rdbuf();
+
+  try {
+    manifest = manifestFromJson(Json::parse(ss.str()));
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
 static Json channelToJson(const Channel &channel) {
   Json json(Json::object_t{});
   json["id"] = channel.id;
@@ -205,7 +226,7 @@ static ChannelPage channelPageFromJson(const Json &json) {
 bool saveManifest(const Manifest &manifest) {
   ensureDataDir();
 
-  std::ofstream file(activeManifestPath(), std::ios::binary);
+  std::ofstream file(manifestPath(manifest.id), std::ios::binary);
   if (!file) return false;
 
   file << manifestToJson(manifest).stringify();
@@ -213,18 +234,27 @@ bool saveManifest(const Manifest &manifest) {
 }
 
 bool loadManifest(Manifest &manifest) {
-  std::ifstream file(activeManifestPath(), std::ios::binary);
-  if (!file) return false;
+  return readManifestFile(activeManifestPath(), manifest);
+}
 
-  std::ostringstream ss;
-  ss << file.rdbuf();
-
-  try {
-    manifest = manifestFromJson(Json::parse(ss.str()));
+bool loadManifest(const std::string &playlistId, Manifest &manifest) {
+  if (readManifestFile(manifestPath(playlistId), manifest)) {
     return true;
-  } catch (...) {
-    return false;
   }
+
+  Manifest legacy;
+  if (
+    !playlistId.empty() &&
+    readManifestFile(activeManifestPath(), legacy) &&
+    legacy.id == playlistId &&
+    !legacy.types.empty()
+  ) {
+    manifest = legacy;
+    saveManifest(manifest);
+    return true;
+  }
+
+  return false;
 }
 
 bool saveChannelPage(
