@@ -69,6 +69,71 @@ std::string formatSystemClockTime() {
   return buffer;
 }
 
+std::string formatEpgClock(const std::string &value) {
+  if (value.empty()) {
+    return "--:--";
+  }
+
+  const bool allDigits = std::all_of(value.begin(), value.end(), [](char ch) {
+    return std::isdigit(static_cast<unsigned char>(ch));
+  });
+
+  if (allDigits && value.size() >= 10 && value.size() <= 13) {
+    long long raw = 0;
+
+    try {
+      raw = std::stoll(value);
+    } catch (...) {
+      raw = 0;
+    }
+
+    if (value.size() == 13) {
+      raw /= 1000;
+    }
+
+    if (raw > 0) {
+      std::time_t timestamp = static_cast<std::time_t>(raw);
+      std::tm localTime{};
+
+#if defined(_WIN32)
+      localtime_s(&localTime, &timestamp);
+#else
+      std::tm *result = std::localtime(&timestamp);
+      if (!result) {
+        return "--:--";
+      }
+      localTime = *result;
+#endif
+
+      char buffer[8] = {};
+      std::snprintf(buffer, sizeof(buffer), "%02d:%02d", localTime.tm_hour, localTime.tm_min);
+      return buffer;
+    }
+  }
+
+  // XMLTV common format: YYYYMMDDHHMMSS +/-ZZZZ
+  if (value.size() >= 12 &&
+      std::isdigit(static_cast<unsigned char>(value[8])) &&
+      std::isdigit(static_cast<unsigned char>(value[9])) &&
+      std::isdigit(static_cast<unsigned char>(value[10])) &&
+      std::isdigit(static_cast<unsigned char>(value[11]))) {
+    return value.substr(8, 2) + ":" + value.substr(10, 2);
+  }
+
+  // ISO/RFC3339 common format: YYYY-MM-DDTHH:MM:SS
+  const std::size_t tPos = value.find('T');
+  if (tPos != std::string::npos && tPos + 5 < value.size()) {
+    return value.substr(tPos + 1, 5);
+  }
+
+  if (value.size() >= 5 && value[2] == ':') {
+    return value.substr(0, 5);
+  }
+
+  return value.size() > 5 ? value.substr(0, 5) : value;
+}
+
+
 std::vector<std::string> wrapText(const std::string &text, std::size_t maxCharsPerLine) {
   std::vector<std::string> lines;
 
@@ -413,6 +478,7 @@ void App::handleDashboard(Button button) {
         state_.focus = FocusColumn::Playlist;
       } else {
         state_.selectedChannel--;
+        loadSelectedEpg();
       }
       return;
     }
@@ -434,6 +500,7 @@ void App::handleDashboard(Button button) {
       state_.selectedChannel++;
       normalizeIndexes();
       maybePreloadNextPage();
+      loadSelectedEpg();
     }
     return;
   }
@@ -465,6 +532,7 @@ void App::handleDashboard(Button button) {
     if (state_.focus == FocusColumn::Categories) {
       loadCategory(false);
       state_.focus = FocusColumn::Channels;
+      loadSelectedEpg();
       return;
     }
 
@@ -691,11 +759,14 @@ void App::addM3uPlaylist() {
     return;
   }
 
+  std::string epgUrl = trimText(requestTextInput("Optional EPG URL", "", 900));
+
   PlaylistConfig playlist;
   playlist.id = safePlaylistId(name, Provider::M3u);
   playlist.name = name;
   playlist.provider = Provider::M3u;
   playlist.m3uUrl = url;
+  playlist.epgUrl = epgUrl;
 
   state_.config.playlists.push_back(playlist);
   state_.config.activePlaylistId = playlist.id;
@@ -948,12 +1019,131 @@ void App::maybePreloadNextPage() {
 }
 
 
+std::string App::channelEpgKey(const Channel &channel) const {
+  if (!channel.tvgId.empty()) return channel.tvgId;
+  if (!channel.streamId.empty()) return channel.streamId;
+  if (!channel.id.empty()) return channel.id;
+  return channel.name;
+}
+
+void App::loadSelectedEpg(bool force) {
+  const Channel *channel = selectedChannelPtr();
+
+  if (!channel || !state_.hasManifest || channel->type != StreamType::Live) {
+    state_.currentEpgKey.clear();
+    state_.currentEpgAvailable = false;
+    return;
+  }
+
+  const std::string key = channelEpgKey(*channel);
+
+  if (!force && key == state_.currentEpgKey) {
+    return;
+  }
+
+  state_.currentEpgKey = key;
+
+  auto memoryIt = state_.epgByChannel.find(key);
+  if (!force && memoryIt != state_.epgByChannel.end()) {
+    state_.currentEpgAvailable = !memoryIt->second.programs.empty();
+    return;
+  }
+
+  EpgPage cached;
+  if (!force && loadEpgPage(state_.manifest.id, *channel, cached)) {
+    state_.epgByChannel[key] = cached;
+    state_.currentEpgAvailable = !cached.programs.empty();
+    return;
+  }
+
+  try {
+    state_.loading = true;
+    state_.loadingMessage = "Loading EPG";
+    render();
+
+    const PlaylistConfig *playlist = activePlaylist();
+    const std::string manualEpgUrl = playlist && playlist->provider == Provider::M3u ? playlist->epgUrl : "";
+    EpgPage epg = api_.loadEpgPrograms(state_.manifest.source, state_.manifest.provider, *channel, 1, 12, manualEpgUrl);
+    state_.epgByChannel[key] = epg;
+    state_.currentEpgAvailable = !epg.programs.empty();
+    saveEpgPage(state_.manifest.id, *channel, epg);
+
+    state_.loading = false;
+    state_.loadingMessage.clear();
+  } catch (const std::exception &ex) {
+    std::printf("[KBORE] loadSelectedEpg failed: %s\n", ex.what());
+
+    state_.loading = false;
+    state_.loadingMessage.clear();
+    state_.epgByChannel[key] = EpgPage{};
+    state_.currentEpgAvailable = false;
+  }
+}
+
+std::string App::epgLineForChannel(const Channel &channel) const {
+  if (channel.type != StreamType::Live) {
+    return "EPG not applicable";
+  }
+
+  const std::string key = channelEpgKey(channel);
+  auto it = state_.epgByChannel.find(key);
+
+  if (it == state_.epgByChannel.end() || it->second.programs.empty()) {
+    return key == state_.currentEpgKey ? "EPG unavailable" : "EPG not loaded";
+  }
+
+  const EpgProgram &program = it->second.programs.front();
+  std::string timePrefix;
+
+  if (!program.start.empty()) {
+    timePrefix = formatEpgClock(program.start) + "  ";
+  }
+
+  return timePrefix + program.title;
+}
+
+std::string App::epgNowNextLine(const Channel &channel) const {
+  if (channel.type != StreamType::Live) {
+    return "EPG is available only for live channels";
+  }
+
+  const std::string key = channelEpgKey(channel);
+  auto it = state_.epgByChannel.find(key);
+
+  if (it == state_.epgByChannel.end() || it->second.programs.empty()) {
+    return "EPG unavailable for this channel";
+  }
+
+  const EpgPage &page = it->second;
+  const EpgProgram &now = page.programs.front();
+
+  std::string line = "NOW ";
+  if (!now.start.empty()) {
+    line += formatEpgClock(now.start) + " ";
+  }
+  line += now.title;
+
+  if (page.programs.size() > 1) {
+    const EpgProgram &next = page.programs[1];
+    line += "  |  NEXT ";
+    if (!next.start.empty()) {
+      line += formatEpgClock(next.start) + " ";
+    }
+    line += next.title;
+  }
+
+  return line;
+}
+
+
 void App::playSelectedChannel() {
   const Channel *channel = selectedChannelPtr();
 
   if (!channel) {
     return;
   }
+
+  loadSelectedEpg();
 
   state_.screen = ScreenId::Player;
   state_.message = "Loading video";
@@ -992,6 +1182,8 @@ void App::resetLoadedChannels() {
   state_.loadedTotal = 0;
   state_.loadedTotalPages = 1;
   state_.selectedChannel = 0;
+  state_.currentEpgKey.clear();
+  state_.currentEpgAvailable = false;
 }
 
 std::vector<TypeGroup> App::visibleTypes() const {
@@ -1251,7 +1443,7 @@ void App::renderDashboardGraphic() {
 
     const int nameX = channelsPanel.x + 94;
     gfx_.drawText(Graphics::fitText(ch.name, 35), nameX, y + 9, 3, text, true);
-    gfx_.drawText("EPG unavailable", nameX, y + 32, 2, muted, false);
+    gfx_.drawText(Graphics::fitText(epgLineForChannel(ch), 44), nameX, y + 32, 2, muted, false);
     gfx_.drawText(state_.favorites.count(ch.id) ? "*" : "<3", channelsPanel.x + channelsPanel.w - 42, y + 15, 2, muted, false);
   }
   if (state_.loadedChannels.empty()) {
@@ -1267,7 +1459,7 @@ void App::renderDashboardGraphic() {
   if (selectedChannel) {
     drawLogoOrFallback(*selectedChannel, info.x + 34, info.y + 13, 154, 62);
     gfx_.drawText(Graphics::fitText(selectedChannel->name, 42), info.x + 210, info.y + 18, 2, text, true);
-    gfx_.drawText("EPG unavailable", info.x + 210, info.y + 46, 1, muted, false);
+    gfx_.drawText(Graphics::fitText(epgNowNextLine(*selectedChannel), 86), info.x + 210, info.y + 46, 1, muted, false);
   } else {
     gfx_.drawText(state_.hasManifest ? Graphics::fitText(state_.manifest.name, 34) : "NSTV", info.x + 40, info.y + 30, 4, text, true);
   }
@@ -1571,16 +1763,14 @@ void App::renderPlayerGraphic() {
         true
       );
 
-      if (player_) {
-        gfx_.drawText(
-          std::string("Backend: ") + player_->name(),
-          28,
-          46,
-          1,
-          rgb(150, 163, 190),
-          false
-        );
-      }
+      gfx_.drawText(
+        Graphics::fitText(epgNowNextLine(*channel), 94),
+        28,
+        46,
+        1,
+        rgb(150, 163, 190),
+        false
+      );
 
       std::string status;
 

@@ -39,4 +39,19 @@ bool loadChannelPage(
   ChannelPage &page
 );
 
+std::string epgCacheKey(const Channel &channel);
+std::string epgCachePath(const std::string &playlistId, const Channel &channel);
+
+bool saveEpgPage(
+  const std::string &playlistId,
+  const Channel &channel,
+  const EpgPage &page
+);
+
+bool loadEpgPage(
+  const std::string &playlistId,
+  const Channel &channel,
+  EpgPage &page
+);
+
 } // namespace nstv

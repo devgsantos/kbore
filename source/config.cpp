@@ -122,6 +122,7 @@ static PlaylistConfig playlistFromJson(const Json &json, int index) {
   playlist.id = json["id"].asString(makePlaylistId(playlist.name, playlist.provider, index));
 
   playlist.m3uUrl = json["m3u_url"].asString(json["m3uUrl"].asString(json["url"].asString("")));
+  playlist.epgUrl = json["epg_url"].asString(json["epgUrl"].asString(""));
   playlist.serverUrl = trimTrailingSlash(json["server_url"].asString(json["serverUrl"].asString("")));
   playlist.username = json["username"].asString("");
   playlist.password = json["password"].asString("");
@@ -144,6 +145,9 @@ static Json playlistToJson(const PlaylistConfig &playlist, const std::string &ac
 
   if (playlist.provider == Provider::M3u) {
     json["m3u_url"] = playlist.m3uUrl;
+    if (!playlist.epgUrl.empty()) {
+      json["epg_url"] = playlist.epgUrl;
+    }
   } else if (playlist.provider == Provider::Xtream) {
     json["server_url"] = playlist.serverUrl;
     json["username"] = playlist.username;

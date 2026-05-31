@@ -10,6 +10,7 @@
 #include "nstv/player_backend.hpp"
 #include "nstv/player_backend_factory.hpp"
 #include "nstv/video_player.hpp"
+#include <map>
 #include <set>
 #include <string>
 #include <memory>
@@ -31,6 +32,10 @@ struct AppState {
   int loadedTotal = 0;
   int loadedTotalPages = 1;
   std::string loadedCategoryKey;
+
+  std::map<std::string, EpgPage> epgByChannel;
+  std::string currentEpgKey;
+  bool currentEpgAvailable = false;
 
   int selectedType = 0;
   int selectedCategory = 0;
@@ -88,6 +93,10 @@ private:
   void resetLoadedChannels();
   void normalizeIndexes();
   void maybePreloadNextPage();
+  void loadSelectedEpg(bool force = false);
+  std::string channelEpgKey(const Channel &channel) const;
+  std::string epgLineForChannel(const Channel &channel) const;
+  std::string epgNowNextLine(const Channel &channel) const;
 
   std::vector<TypeGroup> visibleTypes() const;
   const TypeGroup *selectedTypeGroup() const;

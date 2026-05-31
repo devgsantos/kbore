@@ -131,10 +131,106 @@ ChannelPage ParserApiClient::channelPageFromJson(const Json &json) const {
       channel.logo = item["logo"].asString("");
       channel.group = item["group"].asString("");
       channel.groupId = item["groupId"].asString(item["categoryId"].asString(""));
+      channel.tvgId = item["tvgId"].asString(item["tvg-id"].asString(item["epgChannelId"].asString("")));
+      channel.tvgName = item["tvgName"].asString(item["tvg-name"].asString(""));
+      channel.streamId = item["streamId"].asString(item["stream_id"].asString(item["id"].asString("")));
+      if (channel.streamId.empty() && item["stream_id"].isNumber()) {
+        channel.streamId = std::to_string(item["stream_id"].asInt(0));
+      }
+      if (channel.streamId.empty() && item["streamId"].isNumber()) {
+        channel.streamId = std::to_string(item["streamId"].asInt(0));
+      }
       channel.type = streamTypeFromString(item["type"].asString("live"));
       page.channels.push_back(channel);
     }
   }
+  return page;
+}
+
+
+EpgPage ParserApiClient::loadEpgPrograms(
+  const std::string &sourceUrl,
+  Provider provider,
+  const Channel &channel,
+  int page,
+  int pageSize,
+  const std::string &manualEpgUrl
+) const {
+  if (sourceUrl.empty()) {
+    throw std::runtime_error("Playlist URL/source is empty");
+  }
+
+  std::ostringstream body;
+  body << "{\"url\":\"" << jsonEscape(sourceUrl) << "\",";
+  body << "\"page\":" << page << ",";
+  body << "\"pageSize\":" << pageSize;
+
+  if (!manualEpgUrl.empty()) {
+    body << ",\"epgUrl\":\"" << jsonEscape(manualEpgUrl) << "\"";
+  }
+
+  if (!channel.tvgId.empty()) {
+    body << ",\"channelId\":\"" << jsonEscape(channel.tvgId) << "\"";
+    body << ",\"tvgId\":\"" << jsonEscape(channel.tvgId) << "\"";
+  }
+
+  if (!channel.tvgName.empty()) {
+    body << ",\"channelName\":\"" << jsonEscape(channel.tvgName) << "\"";
+  } else if (!channel.name.empty()) {
+    body << ",\"channelName\":\"" << jsonEscape(channel.name) << "\"";
+  }
+
+  if (!channel.streamId.empty()) {
+    body << ",\"streamId\":\"" << jsonEscape(channel.streamId) << "\"";
+  }
+
+  body << "}";
+
+  const std::string path = provider == Provider::Xtream
+    ? (!channel.streamId.empty() ? "/api/xtream/epg/short" : "/api/xtream/epg/programs")
+    : "/api/epg/programs";
+
+  Json json = requestJson(endpoint(path), body.str());
+  return epgPageFromJson(json);
+}
+
+EpgPage ParserApiClient::epgPageFromJson(const Json &json) const {
+  EpgPage page;
+  page.page = json["page"].asInt(1);
+  page.pageSize = json["pageSize"].asInt(12);
+  page.totalPrograms = json["totalPrograms"].asInt(json["total"].asInt(0));
+  page.totalPages = json["totalPages"].asInt(1);
+  page.hasNextPage = json["hasNextPage"].asBool(page.page < page.totalPages);
+
+  const Json &items = json["programs"].isArray()
+    ? json["programs"]
+    : (json["epg_listings"].isArray() ? json["epg_listings"] : json["items"]);
+
+  if (items.isArray()) {
+    for (const Json &item : items.asArray()) {
+      EpgProgram program;
+      program.channelId = item["channelId"].asString(item["channel_id"].asString(item["id"].asString("")));
+      program.channelName = item["channelName"].asString(item["channel"].asString(""));
+      program.title = item["title"].asString(item["name"].asString("Program"));
+      program.description = item["description"].asString(item["desc"].asString(""));
+      program.start = item["start"].asString(item["start_timestamp"].asString(item["startTime"].asString("")));
+      program.stop = item["stop"].asString(item["end"].asString(item["end_timestamp"].asString(item["endTime"].asString(""))));
+
+      if (program.start.empty() && item["start_timestamp"].isNumber()) {
+        program.start = std::to_string(item["start_timestamp"].asInt(0));
+      }
+      if (program.stop.empty() && item["stop_timestamp"].isNumber()) {
+        program.stop = std::to_string(item["stop_timestamp"].asInt(0));
+      }
+
+      page.programs.push_back(program);
+    }
+  }
+
+  if (page.totalPrograms == 0) {
+    page.totalPrograms = static_cast<int>(page.programs.size());
+  }
+
   return page;
 }
 
