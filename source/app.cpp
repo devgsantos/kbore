@@ -220,6 +220,26 @@ bool nodeCanHaveChildren(const MediaNode &node) {
   return node.hasChildren || node.childCount > 0 || !node.children.empty();
 }
 
+bool nodeChildrenAreItems(const MediaNode &node) {
+  if (node.children.empty()) {
+    return false;
+  }
+
+  bool hasPlayableItem = false;
+
+  for (const auto &child : node.children) {
+    if (nodeCanHaveChildren(child)) {
+      return false;
+    }
+
+    if (child.playable || !child.url.empty()) {
+      hasPlayableItem = true;
+    }
+  }
+
+  return hasPlayableItem;
+}
+
 }
 
 App::App() : api_(loadConfig()), player_(createPlayerBackend()) {
@@ -259,8 +279,15 @@ int App::run() {
   render();
 
   while (state_.running) {
+    const bool hadPlaylistLoad = playlistLoadActive();
     updatePlaylistLoad();
     updateCacheSave();
+
+    if (hadPlaylistLoad && !playlistLoadActive()) {
+      render();
+      sleepMs(16);
+      continue;
+    }
 
     if (splashVisible_) {
       Button button = pollButton();
@@ -544,6 +571,13 @@ void App::handleDashboard(Button button) {
 
         if (nodeCanHaveChildren(*node)) {
           if (!ensureNodeChildrenLoaded(*node)) {
+            return;
+          }
+
+          if (nodeChildrenAreItems(*node)) {
+            state_.focus = FocusColumn::Categories;
+            state_.selectedChannel = 0;
+            normalizeIndexes();
             return;
           }
 
@@ -1626,6 +1660,28 @@ std::vector<const MediaNode *> App::currentNodeChildren() const {
   return nodes;
 }
 
+bool App::currentNodeChildrenAreItems() const {
+  const MediaNode *parent = currentNodeParent();
+
+  if (!parent || parent->children.empty()) {
+    return false;
+  }
+
+  bool hasPlayableItem = false;
+
+  for (const auto &child : parent->children) {
+    if (nodeCanHaveChildren(child)) {
+      return false;
+    }
+
+    if (child.playable || !child.url.empty()) {
+      hasPlayableItem = true;
+    }
+  }
+
+  return hasPlayableItem;
+}
+
 const MediaNode *App::selectedCurrentNode() const {
   std::vector<const MediaNode *> children = currentNodeChildren();
 
@@ -1660,6 +1716,21 @@ MediaNode *App::selectedCurrentNode() {
 
 std::vector<const MediaNode *> App::previewNodeChildren() const {
   std::vector<const MediaNode *> nodes;
+
+  if (currentNodeChildrenAreItems()) {
+    const MediaNode *parent = currentNodeParent();
+
+    if (!parent) {
+      return nodes;
+    }
+
+    for (const auto &child : parent->children) {
+      nodes.push_back(&child);
+    }
+
+    return nodes;
+  }
+
   const MediaNode *selected = selectedCurrentNode();
 
   if (!selected) {
@@ -1697,6 +1768,22 @@ const MediaNode *App::selectedPreviewNode() const {
 }
 
 MediaNode *App::selectedPreviewNode() {
+  if (currentNodeChildrenAreItems()) {
+    MediaNode *parent = currentNodeParent();
+
+    if (!parent || parent->children.empty()) {
+      return nullptr;
+    }
+
+    int index = std::clamp(
+      state_.selectedChannel,
+      0,
+      std::max(0, static_cast<int>(parent->children.size()) - 1)
+    );
+
+    return &parent->children[static_cast<std::size_t>(index)];
+  }
+
   MediaNode *selected = selectedCurrentNode();
 
   if (!selected) {
@@ -1940,11 +2027,15 @@ void App::normalizeIndexes() {
     state_.nodePath = safePath;
 
     const auto children = currentNodeChildren();
-    state_.selectedCategory = std::clamp(
-      state_.selectedCategory,
-      0,
-      std::max(0, static_cast<int>(children.size()) - 1)
-    );
+    if (currentNodeChildrenAreItems()) {
+      state_.selectedCategory = 0;
+    } else {
+      state_.selectedCategory = std::clamp(
+        state_.selectedCategory,
+        0,
+        std::max(0, static_cast<int>(children.size()) - 1)
+      );
+    }
 
     const auto preview = previewNodeChildren();
     state_.selectedChannel = std::clamp(
@@ -2030,17 +2121,30 @@ void App::renderDashboardGraphic() {
     nodeChildren = currentNodeChildren();
     nodePreview = previewNodeChildren();
 
-    for (const MediaNode *node : nodeChildren) {
-      if (!node) {
-        continue;
-      }
+    if (currentNodeChildrenAreItems()) {
+      const MediaNode *parent = currentNodeParent();
 
-      Category category;
-      category.id = node->id;
-      category.name = node->title.empty() ? node->name : node->title;
-      category.totalChannels = nodeCount(*node);
-      category.type = streamTypeFromString(node->type);
-      categories.push_back(category);
+      if (parent) {
+        Category category;
+        category.id = parent->id;
+        category.name = parent->title.empty() ? parent->name : parent->title;
+        category.totalChannels = nodeCount(*parent);
+        category.type = streamTypeFromString(parent->type);
+        categories.push_back(category);
+      }
+    } else {
+      for (const MediaNode *node : nodeChildren) {
+        if (!node) {
+          continue;
+        }
+
+        Category category;
+        category.id = node->id;
+        category.name = node->title.empty() ? node->name : node->title;
+        category.totalChannels = nodeCount(*node);
+        category.type = streamTypeFromString(node->type);
+        categories.push_back(category);
+      }
     }
 
     const MediaNode *previewNode = selectedPreviewNode();

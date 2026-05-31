@@ -123,6 +123,7 @@ private:
   MediaNode *selectedPreviewNode();
   std::vector<const MediaNode *> currentNodeChildren() const;
   std::vector<const MediaNode *> previewNodeChildren() const;
+  bool currentNodeChildrenAreItems() const;
   bool ensureNodeChildrenLoaded(MediaNode &node);
   Channel channelFromNode(const MediaNode &node) const;
   void enterNode(const MediaNode &node, int childIndex);
