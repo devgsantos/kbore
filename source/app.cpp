@@ -1326,10 +1326,10 @@ void App::renderAddPlaylistGraphic() {
 
   gfx_.drawImageFileCentered(
     "romfs:/logo/logo-horizontal.png",
-    64,
-    42,
-    260,
-    62
+    34,
+    35,
+    320,
+    76
   );
 
   gfx_.drawText("PLAYLISTS", 64, 124, 5, muted, true);
