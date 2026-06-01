@@ -729,6 +729,11 @@ void App::handleDashboard(Button button) {
       return;
     }
 
+    if (state_.loadedChannels.empty()) {
+      loadCategory(false);
+      return;
+    }
+
     playSelectedChannel();
   }
 }
@@ -1147,6 +1152,8 @@ void App::loadCategory(bool append) {
         resetLoadedChannels();
         state_.loadedCategoryKey = key;
       }
+      state_.channelListLoading = true;
+      state_.channelListLoadingKey = key;
 
       state_.message = append
         ? "Loading more channels in background..."
@@ -1177,6 +1184,8 @@ void App::loadCategory(bool append) {
     state_.loadedTotal = result.totalChannels;
     state_.loadedTotalPages = result.totalPages;
     state_.loadedCategoryKey = key;
+    state_.channelListLoading = false;
+    state_.channelListLoadingKey.clear();
     state_.loading = false;
     state_.loadingMessage.clear();
 
@@ -1320,6 +1329,11 @@ void App::drainFinishedChannelLoads() {
 
     if (result.categoryKey != state_.loadedCategoryKey) {
       continue;
+    }
+
+    if (result.categoryKey == state_.channelListLoadingKey) {
+      state_.channelListLoading = false;
+      state_.channelListLoadingKey.clear();
     }
 
     if (!result.ok) {
@@ -1726,6 +1740,8 @@ void App::resetLoadedChannels() {
   state_.selectedChannel = 0;
   state_.currentEpgKey.clear();
   state_.currentEpgAvailable = false;
+  state_.channelListLoading = false;
+  state_.channelListLoadingKey.clear();
 }
 
 std::vector<TypeGroup> App::visibleTypes() const {
@@ -1930,6 +1946,10 @@ void App::renderDashboardGraphic() {
   if (type) chTitle += " (" + type->label + ")";
   drawPanel(channelsPanel, chTitle, "channels", state_.focus == FocusColumn::Channels);
   gfx_.drawTextRight(std::to_string(state_.loadedTotal > 0 ? state_.loadedTotal : (type ? type->totalChannels : 0)) + " CHANNELS", channelsPanel.x + channelsPanel.w - 28, channelsPanel.y + 25, 2, muted, false);
+  const bool channelPanelLoading =
+    state_.channelListLoading &&
+    !state_.loadedCategoryKey.empty() &&
+    state_.channelListLoadingKey == state_.loadedCategoryKey;
 
   // Stream type cards -------------------------------------------------------
   int typeY = typesPanel.y + 70;
@@ -1990,9 +2010,31 @@ void App::renderDashboardGraphic() {
     gfx_.drawText(Graphics::fitText(epgLineForChannel(ch), 44), nameX, y + 32, 2, muted, false);
     gfx_.drawText(state_.favorites.count(ch.id) ? "*" : "<3", channelsPanel.x + channelsPanel.w - 42, y + 15, 2, muted, false);
   }
-  if (state_.loadedChannels.empty()) {
+  if (state_.loadedChannels.empty() && channelPanelLoading) {
+    const char spinnerChars[4] = {'|', '/', '-', '\\'};
+    const int spinnerIndex = static_cast<int>((nowMs() / 140) % 4);
+    std::string spinner(1, spinnerChars[spinnerIndex]);
+    const int centerX = channelsPanel.x + channelsPanel.w / 2;
+    const int centerY = channelsPanel.y + channelsPanel.h / 2 + 10;
+
+    gfx_.fillRoundRect(centerX - 128, centerY - 44, 256, 88, 14, rgba(12, 18, 34, 225));
+    gfx_.strokeRoundRect(centerX - 128, centerY - 44, 256, 88, 14, rgba(72, 92, 128, 45), 1);
+    gfx_.drawText(spinner, centerX - 10, centerY - 30, 5, blue, true);
+    gfx_.drawText("Loading", centerX - 54, centerY + 20, 3, text, true);
+  } else if (state_.loadedChannels.empty()) {
     gfx_.drawText("SELECT A CATEGORY", channelsPanel.x + 40, channelsPanel.y + 178, 3, muted, false);
     gfx_.drawText("PRESS A TO LOAD", channelsPanel.x + 40, channelsPanel.y + 206, 2, blue, true);
+  } else if (channelPanelLoading) {
+    const char spinnerChars[4] = {'|', '/', '-', '\\'};
+    const int spinnerIndex = static_cast<int>((nowMs() / 140) % 4);
+    std::string spinner(1, spinnerChars[spinnerIndex]);
+    const int loadingX = channelsPanel.x + channelsPanel.w - 176;
+    const int loadingY = channelsPanel.y + channelsPanel.h - 44;
+
+    gfx_.fillRoundRect(loadingX, loadingY, 142, 30, 10, rgba(12, 18, 34, 230));
+    gfx_.strokeRoundRect(loadingX, loadingY, 142, 30, 10, rgba(72, 92, 128, 45), 1);
+    gfx_.drawText(spinner, loadingX + 14, loadingY + 7, 2, blue, true);
+    gfx_.drawText("Loading", loadingX + 38, loadingY + 8, 2, text, true);
   }
 
   // Info panel: smaller footer text ----------------------------------------

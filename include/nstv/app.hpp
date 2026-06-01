@@ -38,6 +38,8 @@ struct AppState {
   int loadedTotal = 0;
   int loadedTotalPages = 1;
   std::string loadedCategoryKey;
+  bool channelListLoading = false;
+  std::string channelListLoadingKey;
 
   std::map<std::string, EpgPage> epgByChannel;
   std::string currentEpgKey;
