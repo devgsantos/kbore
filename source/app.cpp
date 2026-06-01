@@ -1718,13 +1718,10 @@ void App::playSelectedChannel() {
     player_ = createPlayerBackend();
   }
 
-  gfx_.suspendForNativeVideo();
+  player_->setNativeVideoAllowed(false);
+  player_->setOverlayVisible(true);
 
   if (player_->open(channel->url)) {
-    if (!player_->nativeVideoActive()) {
-      gfx_.resumeAfterNativeVideo();
-    }
-
     state_.message = "Playing: " + channel->name;
     state_.playerStarted = true;
     state_.playerLoading = false;
@@ -2200,8 +2197,42 @@ void App::renderPlayerGraphic() {
   bool hasFrame = false;
   const bool isOpen = player_ && player_->isOpen();
   const bool isPaused = player_ && player_->isPaused();
+  const bool overlayRequested =
+    !state_.playerFrameSeen ||
+    nowMs() < state_.playerOverlayUntilMs ||
+    isPaused ||
+    !isOpen;
 
   if (isOpen) {
+    std::string status;
+
+    if (isPaused) {
+      status = "PAUSED";
+    } else if (player_ && player_->hasFrame()) {
+      status = "PLAYING";
+    } else {
+      status = "LOADING";
+    }
+
+    player_->setOverlayInfo(
+      channel ? Graphics::fitText(channel->name, 58) : "",
+      channel && channel->type == StreamType::Live ? Graphics::fitText(epgNowNextLine(*channel), 98) : "",
+      status,
+      "A PAUSE/RESUME   B BACK"
+    );
+
+    if (player_->nativeVideoActive() || gfx_.isSuspendedForNativeVideo()) {
+      player_->setOverlayVisible(overlayRequested);
+      player_->setNativeVideoAllowed(true);
+    } else if (overlayRequested) {
+      player_->setOverlayVisible(false);
+      player_->setNativeVideoAllowed(false);
+    } else {
+      gfx_.suspendForNativeVideo();
+      player_->setOverlayVisible(false);
+      player_->setNativeVideoAllowed(true);
+    }
+
     player_->update();
 
     if (player_->nativeVideoActive()) {

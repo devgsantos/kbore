@@ -29,6 +29,14 @@ public:
   const Bitmap &frame() const override { return emptyFrame_; }
   const YuvFrame &yuvFrame() const override { return yuvFrame_; }
   bool nativeVideoActive() const override { return nativeRendererReady_ && nativeFramePresented_; }
+  void setNativeVideoAllowed(bool allowed) override;
+  void setOverlayVisible(bool visible) override;
+  void setOverlayInfo(
+    const std::string &title,
+    const std::string &subtitle,
+    const std::string &status,
+    const std::string &controls
+  ) override;
 
   const std::string &error() const override { return error_; }
   const std::string &url() const override { return url_; }
@@ -51,6 +59,12 @@ private:
   std::unique_ptr<INativeVideoRenderer> nativeRenderer_;
 
   bool nativeRendererReady_ = false;
+  bool nativeVideoAllowed_ = true;
+  bool nativeOverlayVisible_ = false;
+  std::string nativeOverlayTitle_;
+  std::string nativeOverlaySubtitle_;
+  std::string nativeOverlayStatus_;
+  std::string nativeOverlayControls_;
   bool preferNativeRenderer_ = true;
   bool nativeRendererFailed_ = false;
   bool nativeFramePresented_ = false;
