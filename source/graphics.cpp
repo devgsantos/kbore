@@ -160,6 +160,10 @@ Graphics::Graphics() {
 #endif
 }
 
+void Graphics::suspendForNativeVideo() {}
+void Graphics::resumeAfterNativeVideo() {}
+bool Graphics::isSuspendedForNativeVideo() const { return false; }
+
 void Graphics::beginFrame(Color color) {
   std::fill(g_pixels.begin(), g_pixels.end(), pack(color));
   // Subtle dark radial-ish bands.

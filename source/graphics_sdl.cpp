@@ -28,6 +28,7 @@ namespace {
 SDL_Window *g_window = nullptr;
 SDL_Renderer *g_renderer = nullptr;
 bool g_sdlReady = false;
+bool g_nativeVideoSuspended = false;
 
 #ifdef __SWITCH__
 bool g_romfsReady = false;
@@ -329,6 +330,33 @@ struct CachedTexture {
 std::map<const uint8_t *, CachedTexture> g_textureCache;
 std::map<std::string, CachedTexture> g_fileTextureCache;
 
+void clearTextureCaches() {
+  for (auto &item : g_textureCache) {
+    if (item.second.texture) {
+      SDL_DestroyTexture(item.second.texture);
+    }
+  }
+  g_textureCache.clear();
+
+  for (auto &item : g_fileTextureCache) {
+    if (item.second.texture) {
+      SDL_DestroyTexture(item.second.texture);
+    }
+  }
+  g_fileTextureCache.clear();
+}
+
+void closeFonts() {
+#ifdef NSTV_USE_SDL_TTF
+  for (auto &item : g_fontCache) {
+    if (item.second) {
+      TTF_CloseFont(item.second);
+    }
+  }
+  g_fontCache.clear();
+#endif
+}
+
 #ifdef NSTV_USE_SDL_IMAGE
 SDL_Texture *loadTextureFromFile(const std::string &path, int &outW, int &outH) {
   auto found = g_fileTextureCache.find(path);
@@ -433,6 +461,49 @@ Graphics::Graphics() {
 #endif
   SDL_SetRenderDrawBlendMode(g_renderer, SDL_BLENDMODE_BLEND);
   g_sdlReady = true;
+  g_nativeVideoSuspended = false;
+}
+
+void Graphics::suspendForNativeVideo() {
+#ifdef __SWITCH__
+  if (g_nativeVideoSuspended) {
+    return;
+  }
+
+  clearTextureCaches();
+  closeFonts();
+
+  if (g_renderer) {
+    SDL_DestroyRenderer(g_renderer);
+    g_renderer = nullptr;
+  }
+
+  if (g_window) {
+    SDL_DestroyWindow(g_window);
+    g_window = nullptr;
+  }
+
+  g_sdlReady = false;
+  g_nativeVideoSuspended = true;
+  std::printf("[NSTV] SDL video suspended for native deko3d playback\n");
+#endif
+}
+
+void Graphics::resumeAfterNativeVideo() {
+#ifdef __SWITCH__
+  if (!g_nativeVideoSuspended) {
+    return;
+  }
+
+  g_nativeVideoSuspended = false;
+  g_sdlReady = false;
+  Graphics();
+  std::printf("[NSTV] SDL video resumed after native deko3d playback\n");
+#endif
+}
+
+bool Graphics::isSuspendedForNativeVideo() const {
+  return g_nativeVideoSuspended;
 }
 
 void Graphics::beginFrame(Color color) {

@@ -311,6 +311,8 @@ void App::handle(Button button) {
           player_->close();
         }
 
+        gfx_.resumeAfterNativeVideo();
+
         state_.screen = ScreenId::Dashboard;
         state_.message = "Playback stopped";
         state_.playerStarted = false;
@@ -957,7 +959,13 @@ void App::playSelectedChannel() {
     player_ = createPlayerBackend();
   }
 
+  gfx_.suspendForNativeVideo();
+
   if (player_->open(channel->url)) {
+    if (!player_->nativeVideoActive()) {
+      gfx_.resumeAfterNativeVideo();
+    }
+
     state_.message = "Playing: " + channel->name;
     state_.playerStarted = true;
     state_.playerLoading = false;
@@ -969,6 +977,7 @@ void App::playSelectedChannel() {
     state_.playerLoading = false;
     state_.playerLoadFailed = true;
     state_.playerErrorMessage = player_->error();
+    gfx_.resumeAfterNativeVideo();
   }
 }
 
@@ -1397,8 +1406,6 @@ void App::renderAddPlaylistGraphic() {
 void App::renderPlayerGraphic() {
   const Channel *channel = selectedChannelPtr();
 
-  gfx_.fillRect(0, 0, Graphics::Width, Graphics::Height, rgb(0, 0, 0));
-
   bool hasFrame = false;
   const bool isOpen = player_ && player_->isOpen();
   const bool isPaused = player_ && player_->isPaused();
@@ -1413,7 +1420,18 @@ void App::renderPlayerGraphic() {
         state_.playerFrameSeen = true;
         state_.playerOverlayUntilMs = nowMs() + 5000;
       }
-    } else if (player_->yuvFrame().valid()) {
+      return;
+    }
+
+    if (gfx_.isSuspendedForNativeVideo()) {
+      gfx_.resumeAfterNativeVideo();
+    }
+  }
+
+  gfx_.fillRect(0, 0, Graphics::Width, Graphics::Height, rgb(0, 0, 0));
+
+  if (isOpen) {
+    if (player_->yuvFrame().valid()) {
       hasFrame = true;
 
       gfx_.drawYuvFrame(

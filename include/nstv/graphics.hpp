@@ -72,6 +72,9 @@ public:
   Graphics();
   void beginFrame(Color color = {8, 11, 18, 255});
   void present();
+  void suspendForNativeVideo();
+  void resumeAfterNativeVideo();
+  bool isSuspendedForNativeVideo() const;
 
   void fillRect(int x, int y, int w, int h, Color color);
   void strokeRect(int x, int y, int w, int h, Color color, int thickness = 1);

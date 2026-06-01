@@ -2,8 +2,10 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 #ifdef NSTV_USE_FFMPEG
 extern "C" {
@@ -27,6 +29,7 @@ constexpr uint32_t ScreenHeight = 720;
 constexpr uint32_t CodeMemSize = 128 * 1024;
 constexpr uint32_t CmdMemSize = 64 * 1024;
 constexpr uint32_t DescriptorMemSize = 4 * 1024;
+constexpr uint32_t PageSize = 0x1000;
 
 uint32_t alignUp(uint32_t value, uint32_t alignment) {
   return (value + alignment - 1) & ~(alignment - 1);
@@ -87,6 +90,12 @@ bool loadShader(dk::Device device, dk::MemBlock codeMem, uint32_t &codeOffset, d
 
 #ifdef __SWITCH__
 struct Deko3dVideoRenderer::SwitchState {
+  struct ExternalFrameMem {
+    void *addr = nullptr;
+    uint32_t size = 0;
+    dk::MemBlock mem;
+  };
+
   dk::Device device;
   dk::Queue queue;
   dk::CmdBuf cmdBuf;
@@ -104,6 +113,27 @@ struct Deko3dVideoRenderer::SwitchState {
 
   uint32_t framebufferSize = 0;
   uint32_t codeOffset = 0;
+
+  std::vector<ExternalFrameMem> externalFrameMems;
+
+  dk::MemBlock frameMemFor(void *addr, uint32_t size) {
+    for (const ExternalFrameMem &item : externalFrameMems) {
+      if (item.addr == addr && item.size == size) {
+        return item.mem;
+      }
+    }
+
+    dk::MemBlock mem = dk::MemBlockMaker{device, alignUp(size, PageSize)}
+      .setFlags(DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image)
+      .setStorage(addr)
+      .create();
+
+    if (mem) {
+      externalFrameMems.push_back({addr, size, mem});
+    }
+
+    return mem;
+  }
 };
 #endif
 
@@ -117,13 +147,6 @@ bool Deko3dVideoRenderer::initialize() {
   }
 
   error_.clear();
-
-#if !defined(NSTV_ENABLE_DEKO3D_DIRECT_IMPORT)
-  error_ =
-    "Deko3D direct NVTEGRA import is disabled: libnx/deko3d does not expose "
-    "a safe NvMap import path for FFmpeg decoder surfaces yet.";
-  return false;
-#endif
 
 #ifndef __SWITCH__
   error_ = "Deko3D renderer is only available on Switch.";
@@ -256,6 +279,13 @@ void Deko3dVideoRenderer::shutdown() {
       switchState_->queue.waitIdle();
     }
 
+    for (auto &item : switchState_->externalFrameMems) {
+      if (item.mem) {
+        item.mem.destroy();
+      }
+    }
+    switchState_->externalFrameMems.clear();
+
     if (switchState_->cmdBuf) switchState_->cmdBuf.destroy();
     if (switchState_->swapchain) switchState_->swapchain.destroy();
     if (switchState_->descriptorMem) switchState_->descriptorMem.destroy();
@@ -275,10 +305,6 @@ void Deko3dVideoRenderer::shutdown() {
 
 #ifdef NSTV_USE_FFMPEG
 bool Deko3dVideoRenderer::canRender(const AVFrame *frame) const {
-#if !defined(NSTV_ENABLE_DEKO3D_DIRECT_IMPORT)
-  (void)frame;
-  return false;
-#else
   if (!initialized_ || !frame || frame->format != AV_PIX_FMT_NVTEGRA) {
     return false;
   }
@@ -288,17 +314,9 @@ bool Deko3dVideoRenderer::canRender(const AVFrame *frame) const {
   }
 
   return frame->width > 0 && frame->height > 0 && frame->linesize[0] > 0;
-#endif
 }
 
 bool Deko3dVideoRenderer::renderFrame(const AVFrame *frame) {
-#if !defined(NSTV_ENABLE_DEKO3D_DIRECT_IMPORT)
-  (void)frame;
-  error_ =
-    "Deko3D direct NVTEGRA import is disabled to avoid wrapping FFmpeg NvMap "
-    "storage as a Deko3D MemBlock.";
-  return false;
-#else
 #ifndef __SWITCH__
   (void)frame;
   error_ = "Deko3D renderer is only available on Switch.";
@@ -324,10 +342,22 @@ bool Deko3dVideoRenderer::renderFrame(const AVFrame *frame) {
     return false;
   }
 
-  dk::MemBlock frameMem = dk::MemBlockMaker{switchState_->device, alignUp(mapSize, 0x1000)}
-    .setFlags(DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image)
-    .setStorage(mapAddr)
-    .create();
+  const uintptr_t baseAddr = reinterpret_cast<uintptr_t>(mapAddr);
+  const uintptr_t yAddr = reinterpret_cast<uintptr_t>(frame->data[0]);
+  const uintptr_t uvAddr = reinterpret_cast<uintptr_t>(frame->data[1]);
+
+  if (
+    yAddr < baseAddr ||
+    uvAddr < baseAddr ||
+    yAddr >= baseAddr + mapSize ||
+    uvAddr >= baseAddr + mapSize ||
+    uvAddr <= yAddr
+  ) {
+    error_ = "NVTEGRA frame planes are outside the backing map.";
+    return false;
+  }
+
+  dk::MemBlock frameMem = switchState_->frameMemFor(mapAddr, mapSize);
 
   if (!frameMem) {
     error_ = "could not wrap NVTEGRA map as Deko3D memory.";
@@ -336,30 +366,45 @@ bool Deko3dVideoRenderer::renderFrame(const AVFrame *frame) {
 
   const uint32_t yWidth = static_cast<uint32_t>(std::max(frame->linesize[0], frame->width));
   const uint32_t yHeight = static_cast<uint32_t>(alignUp(frame->height, 32));
-  const uint32_t uvOffset = static_cast<uint32_t>(frame->data[1] - frame->data[0]);
+  const uint32_t yOffset = static_cast<uint32_t>(yAddr - baseAddr);
+  const uint32_t uvOffset = static_cast<uint32_t>(uvAddr - baseAddr);
   const uint32_t uvWidth = static_cast<uint32_t>(std::max(frame->linesize[1] / 2, frame->width / 2));
   const uint32_t uvHeight = static_cast<uint32_t>(alignUp((frame->height + 1) / 2, 16));
+  const bool pitchLinear = map->is_linear;
 
   dk::ImageLayout yLayout;
   dk::ImageLayout uvLayout;
 
-  dk::ImageLayoutMaker{switchState_->device}
-    .setFlags(DkImageFlags_CustomTileSize | DkImageFlags_UsageVideo)
+  auto yLayoutMaker = dk::ImageLayoutMaker{switchState_->device}
+    .setFlags(
+      (pitchLinear ? DkImageFlags_PitchLinear : DkImageFlags_CustomTileSize) |
+      DkImageFlags_UsageVideo
+    )
     .setFormat(DkImageFormat_R8_Unorm)
-    .setDimensions(yWidth, yHeight)
-    .setTileSize(DkTileSize_TwoGobs)
-    .initialize(yLayout);
+    .setDimensions(yWidth, yHeight);
 
-  dk::ImageLayoutMaker{switchState_->device}
-    .setFlags(DkImageFlags_CustomTileSize | DkImageFlags_UsageVideo)
+  auto uvLayoutMaker = dk::ImageLayoutMaker{switchState_->device}
+    .setFlags(
+      (pitchLinear ? DkImageFlags_PitchLinear : DkImageFlags_CustomTileSize) |
+      DkImageFlags_UsageVideo
+    )
     .setFormat(DkImageFormat_RG8_Unorm)
-    .setDimensions(uvWidth, uvHeight)
-    .setTileSize(DkTileSize_TwoGobs)
-    .initialize(uvLayout);
+    .setDimensions(uvWidth, uvHeight);
+
+  if (pitchLinear) {
+    yLayoutMaker.setPitchStride(static_cast<uint32_t>(frame->linesize[0]));
+    uvLayoutMaker.setPitchStride(static_cast<uint32_t>(frame->linesize[1]));
+  } else {
+    yLayoutMaker.setTileSize(DkTileSize_TwoGobs);
+    uvLayoutMaker.setTileSize(DkTileSize_TwoGobs);
+  }
+
+  yLayoutMaker.initialize(yLayout);
+  uvLayoutMaker.initialize(uvLayout);
 
   dk::Image yImage;
   dk::Image uvImage;
-  yImage.initialize(yLayout, frameMem, 0);
+  yImage.initialize(yLayout, frameMem, yOffset);
   uvImage.initialize(uvLayout, frameMem, uvOffset);
 
   dk::ImageView yView{yImage};
@@ -411,47 +456,44 @@ bool Deko3dVideoRenderer::renderFrame(const AVFrame *frame) {
   const int slot = switchState_->queue.acquireImage(switchState_->swapchain);
 
   if (slot < 0 || slot >= static_cast<int>(FramebufferCount)) {
-    frameMem.destroy();
     error_ = "Deko3D could not acquire a swapchain image.";
     return false;
   }
 
   dk::ImageView framebufferView{switchState_->framebuffers[slot]};
-  DkImageView const *targets[] = {&framebufferView};
-  dkCmdBufBindRenderTargets(switchState_->cmdBuf, targets, 1, nullptr);
 
   DkViewport viewport{0.0f, 0.0f, static_cast<float>(ScreenWidth), static_cast<float>(ScreenHeight), 0.0f, 1.0f};
   DkScissor scissor{0, 0, ScreenWidth, ScreenHeight};
-  DkShader const *shaders[] = {&switchState_->vertexShader, &switchState_->fragmentShader};
-  DkResHandle textureHandles[] = {
+  std::array<DkShader const *, 2> shaders = {
+    &switchState_->vertexShader,
+    &switchState_->fragmentShader
+  };
+  std::array<DkResHandle, 2> textureHandles = {
     dkMakeTextureHandle(0, 0),
     dkMakeTextureHandle(1, 0)
   };
 
-  DkRasterizerState rasterizerState;
-  DkColorState colorState;
-  DkColorWriteState colorWriteState;
-  dkRasterizerStateDefaults(&rasterizerState);
-  dkColorStateDefaults(&colorState);
-  dkColorWriteStateDefaults(&colorWriteState);
+  dk::RasterizerState rasterizerState;
+  dk::ColorState colorState;
+  dk::ColorWriteState colorWriteState;
 
+  switchState_->cmdBuf.bindRenderTargets(&framebufferView);
   switchState_->cmdBuf.setViewports(0, viewport);
   switchState_->cmdBuf.setScissors(0, scissor);
-  dkCmdBufBindShaders(switchState_->cmdBuf, DkStageFlag_GraphicsMask, shaders, 2);
+  switchState_->cmdBuf.clearColor(0, DkColorMask_RGBA, 0.0f, 0.0f, 0.0f, 1.0f);
+  switchState_->cmdBuf.bindShaders(DkStageFlag_GraphicsMask, shaders);
   switchState_->cmdBuf.bindRasterizerState(rasterizerState);
   switchState_->cmdBuf.bindColorState(colorState);
   switchState_->cmdBuf.bindColorWriteState(colorWriteState);
-  dkCmdBufBindTextures(switchState_->cmdBuf, DkStage_Fragment, 0, textureHandles, 2);
+  switchState_->cmdBuf.bindTextures(DkStage_Fragment, 0, textureHandles);
   switchState_->cmdBuf.draw(DkPrimitive_Triangles, 3, 1, 0, 0);
 
   switchState_->queue.submitCommands(switchState_->cmdBuf.finishList());
   switchState_->queue.waitIdle();
   switchState_->queue.presentImage(switchState_->swapchain, slot);
 
-  frameMem.destroy();
   error_.clear();
   return true;
-#endif
 #endif
 }
 #endif
