@@ -86,6 +86,30 @@ private:
     EpgPage page;
   };
 
+  struct ChannelLoadJob {
+    Config config;
+    std::string manifestId;
+    std::string source;
+    Provider provider = Provider::M3u;
+    StreamType type = StreamType::Live;
+    std::string categoryId;
+    std::string categoryKey;
+    int page = 1;
+    bool append = false;
+  };
+
+  struct ChannelLoadResult {
+    std::string manifestId;
+    std::string categoryKey;
+    StreamType type = StreamType::Live;
+    std::string categoryId;
+    int page = 1;
+    bool append = false;
+    bool ok = false;
+    ChannelPage pageData;
+    std::string error;
+  };
+
   void render();
   void renderSplashGraphic();
   void renderDashboard();
@@ -120,6 +144,10 @@ private:
   void loadSelectedEpg(bool force = false, bool fetchRemote = true);
   void loadEpgForChannels(const std::vector<Channel> &channels);
   void loadVisibleEpgForChannelList();
+  void startChannelWorker();
+  void stopChannelWorker();
+  void channelWorkerLoop();
+  void drainFinishedChannelLoads();
   void startEpgWorker();
   void stopEpgWorker();
   void epgWorkerLoop();
@@ -157,6 +185,13 @@ private:
   Graphics gfx_;
   ImageCache imageCache_;
   std::unique_ptr<IPlayerBackend> player_;
+  std::thread channelWorker_;
+  std::mutex channelMutex_;
+  std::condition_variable channelCv_;
+  std::vector<ChannelLoadJob> channelQueue_;
+  std::set<std::string> channelQueuedKeys_;
+  std::vector<ChannelLoadResult> channelFinished_;
+  std::atomic<bool> channelStop_{false};
   std::thread epgWorker_;
   std::mutex epgMutex_;
   std::condition_variable epgCv_;

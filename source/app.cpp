@@ -475,10 +475,12 @@ App::App() : api_(loadConfig()), player_(createPlayerBackend()) {
     state_.message = "Press + to add an M3U or Xtream playlist";
   }
 
+  startChannelWorker();
   startEpgWorker();
 }
 
 App::~App() {
+  stopChannelWorker();
   stopEpgWorker();
 }
 
@@ -1106,28 +1108,54 @@ void App::loadCategory(bool append) {
     );
 
     if (!fromCache) {
-      state_.loading = true;
-      state_.loadingMessage = "Loading";
+      const std::string queuedKey = state_.manifest.id + ":" + key + ":" + std::to_string(page);
+      bool queued = false;
+
+      {
+        std::lock_guard<std::mutex> lock(channelMutex_);
+        if (!append) {
+          for (const ChannelLoadJob &pending : channelQueue_) {
+            channelQueuedKeys_.erase(pending.manifestId + ":" + pending.categoryKey + ":" + std::to_string(pending.page));
+          }
+          channelQueue_.clear();
+        }
+
+        if (!channelQueuedKeys_.count(queuedKey)) {
+          channelQueuedKeys_.insert(queuedKey);
+          ChannelLoadJob job{
+            state_.config,
+            state_.manifest.id,
+            state_.manifest.source,
+            state_.manifest.provider,
+            category->type,
+            category->id,
+            key,
+            page,
+            append
+          };
+
+          if (append) {
+            channelQueue_.push_back(job);
+          } else {
+            channelQueue_.insert(channelQueue_.begin(), job);
+          }
+          queued = true;
+        }
+      }
+
+      if (!append) {
+        resetLoadedChannels();
+        state_.loadedCategoryKey = key;
+      }
+
       state_.message = append
-        ? "Loading more channels from API..."
-        : "Loading channels from API...";
-      render();
+        ? "Loading more channels in background..."
+        : "Loading channels in background...";
 
-      result = api_.loadChannels(
-        state_.manifest.source,
-        state_.manifest.provider,
-        category->type,
-        category->id,
-        page
-      );
-
-      saveChannelPage(
-        state_.manifest.id,
-        state_.manifest.provider,
-        category->type,
-        category->id,
-        result
-      );
+      if (queued) {
+        channelCv_.notify_one();
+      }
+      return;
     } else {
       state_.message = append
         ? "Loading more channels from cache..."
@@ -1209,6 +1237,131 @@ void App::maybePreloadNextPage() {
 
   if (remaining <= preloadThreshold) {
     loadCategory(true);
+  }
+}
+
+void App::startChannelWorker() {
+  channelStop_ = false;
+  channelWorker_ = std::thread(&App::channelWorkerLoop, this);
+}
+
+void App::stopChannelWorker() {
+  channelStop_ = true;
+  channelCv_.notify_all();
+
+  if (channelWorker_.joinable()) {
+    channelWorker_.join();
+  }
+}
+
+void App::channelWorkerLoop() {
+  while (!channelStop_) {
+    ChannelLoadJob job;
+
+    {
+      std::unique_lock<std::mutex> lock(channelMutex_);
+      channelCv_.wait(lock, [this]() {
+        return channelStop_ || !channelQueue_.empty();
+      });
+
+      if (channelStop_) {
+        break;
+      }
+
+      job = channelQueue_.front();
+      channelQueue_.erase(channelQueue_.begin());
+    }
+
+    const std::string queuedKey = job.manifestId + ":" + job.categoryKey + ":" + std::to_string(job.page);
+    ChannelLoadResult result;
+    result.manifestId = job.manifestId;
+    result.categoryKey = job.categoryKey;
+    result.type = job.type;
+    result.categoryId = job.categoryId;
+    result.page = job.page;
+    result.append = job.append;
+
+    try {
+      ParserApiClient channelApi(job.config);
+      result.pageData = channelApi.loadChannels(
+        job.source,
+        job.provider,
+        job.type,
+        job.categoryId,
+        job.page
+      );
+      saveChannelPage(job.manifestId, job.provider, job.type, job.categoryId, result.pageData);
+      result.ok = true;
+    } catch (const std::exception &ex) {
+      std::printf("[KBORE] background channel load failed: %s\n", ex.what());
+      result.error = ex.what();
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(channelMutex_);
+      channelFinished_.push_back(result);
+      channelQueuedKeys_.erase(queuedKey);
+    }
+  }
+}
+
+void App::drainFinishedChannelLoads() {
+  std::vector<ChannelLoadResult> finished;
+
+  {
+    std::lock_guard<std::mutex> lock(channelMutex_);
+    finished.swap(channelFinished_);
+  }
+
+  for (const ChannelLoadResult &result : finished) {
+    if (!state_.hasManifest || result.manifestId != state_.manifest.id) {
+      continue;
+    }
+
+    if (result.categoryKey != state_.loadedCategoryKey) {
+      continue;
+    }
+
+    if (!result.ok) {
+      if (!result.append && state_.loadedChannels.empty()) {
+        resetLoadedChannels();
+        state_.focus = FocusColumn::Categories;
+      }
+      state_.message = result.append
+        ? "Failed to load more channels."
+        : "Failed to load channels for this category.";
+      continue;
+    }
+
+    if (result.append) {
+      if (result.page <= state_.loadedPage) {
+        continue;
+      }
+
+      state_.loadedChannels.insert(
+        state_.loadedChannels.end(),
+        result.pageData.channels.begin(),
+        result.pageData.channels.end()
+      );
+    } else {
+      state_.loadedChannels = result.pageData.channels;
+      state_.selectedChannel = 0;
+    }
+
+    state_.loadedPage = result.pageData.page;
+    state_.loadedTotal = result.pageData.totalChannels;
+    state_.loadedTotalPages = result.pageData.totalPages;
+    state_.loadedCategoryKey = result.categoryKey;
+
+    loadVisibleEpgForChannelList();
+    loadSelectedEpg(false, false);
+
+    state_.message =
+      std::to_string(state_.loadedChannels.size()) + "/" +
+      std::to_string(result.pageData.totalChannels) +
+      " channels loaded from API, page " +
+      std::to_string(result.pageData.page) +
+      "/" + std::to_string(result.pageData.totalPages);
   }
 }
 
@@ -1625,6 +1778,7 @@ static int windowStart(int selected, int size, int maxRows) {
 }
 
 void App::render() {
+  drainFinishedChannelLoads();
   drainFinishedEpg();
   gfx_.beginFrame();
 
