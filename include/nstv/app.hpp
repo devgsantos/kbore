@@ -93,7 +93,9 @@ private:
   void resetLoadedChannels();
   void normalizeIndexes();
   void maybePreloadNextPage();
-  void loadSelectedEpg(bool force = false);
+  void loadSelectedEpg(bool force = false, bool fetchRemote = true);
+  void loadEpgForChannels(const std::vector<Channel> &channels);
+  void loadVisibleEpgForChannelList();
   std::string channelEpgKey(const Channel &channel) const;
   std::string epgLineForChannel(const Channel &channel) const;
   std::string epgNowNextLine(const Channel &channel) const;

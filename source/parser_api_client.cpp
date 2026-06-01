@@ -1,8 +1,80 @@
 #include "nstv/parser_api_client.hpp"
+#include <algorithm>
+#include <cctype>
+#include <cstdio>
 #include <sstream>
 #include <stdexcept>
+#include <ctime>
 
 namespace nstv {
+
+namespace {
+
+std::string isoLocalTime(std::time_t value) {
+  std::tm localTime{};
+  std::tm utcTime{};
+
+#if defined(_WIN32)
+  localtime_s(&localTime, &value);
+  gmtime_s(&utcTime, &value);
+#else
+  std::tm *result = std::localtime(&value);
+  if (!result) {
+    return "";
+  }
+  localTime = *result;
+
+  result = std::gmtime(&value);
+  if (!result) {
+    return "";
+  }
+  utcTime = *result;
+#endif
+
+  const long offsetSeconds = static_cast<long>(std::difftime(std::mktime(&localTime), std::mktime(&utcTime)));
+  const char offsetSign = offsetSeconds < 0 ? '-' : '+';
+  const long absoluteOffset = offsetSeconds < 0 ? -offsetSeconds : offsetSeconds;
+  const int offsetHours = static_cast<int>(absoluteOffset / 3600);
+  const int offsetMinutes = static_cast<int>((absoluteOffset % 3600) / 60);
+
+  char buffer[96] = {};
+  std::snprintf(
+    buffer,
+    sizeof(buffer),
+    "%04d-%02d-%02dT%02d:%02d:%02d%c%02d:%02d",
+    localTime.tm_year + 1900,
+    localTime.tm_mon + 1,
+    localTime.tm_mday,
+    localTime.tm_hour,
+    localTime.tm_min,
+    localTime.tm_sec,
+    offsetSign,
+    offsetHours,
+    offsetMinutes
+  );
+
+  return buffer;
+}
+
+std::string currentEpgWindowJson() {
+  const std::time_t now = std::time(nullptr);
+  const std::string from = isoLocalTime(now - 1800);
+  const std::string to = isoLocalTime(now + 24 * 60 * 60);
+
+  if (from.empty() || to.empty()) {
+    return "";
+  }
+
+  return ",\"from\":\"" + jsonEscape(from) + "\",\"to\":\"" + jsonEscape(to) + "\"";
+}
+
+bool isAllDigits(const std::string &value) {
+  return !value.empty() && std::all_of(value.begin(), value.end(), [](char ch) {
+    return std::isdigit(static_cast<unsigned char>(ch));
+  });
+}
+
+} // namespace
 
 ParserApiClient::ParserApiClient(Config config) : config_(std::move(config)) {}
 
@@ -27,7 +99,7 @@ Json ParserApiClient::requestJson(const std::string &url, const std::string &bod
     std::string message = json["error"]["message"].asString("HTTP " + std::to_string(res.status));
     throw std::runtime_error(message);
   }
-  if (!json["ok"].asBool(false)) {
+  if (!json["ok"].asBool(json["success"].asBool(false))) {
     throw std::runtime_error(json["error"]["message"].asString(json["message"].asString("Parser API returned ok=false")));
   }
   return json;
@@ -162,8 +234,10 @@ EpgPage ParserApiClient::loadEpgPrograms(
 
   std::ostringstream body;
   body << "{\"url\":\"" << jsonEscape(sourceUrl) << "\",";
+  body << "\"provider\":\"" << toString(provider) << "\",";
   body << "\"page\":" << page << ",";
   body << "\"pageSize\":" << pageSize;
+  body << currentEpgWindowJson();
 
   if (!manualEpgUrl.empty()) {
     body << ",\"epgUrl\":\"" << jsonEscape(manualEpgUrl) << "\"";
@@ -181,7 +255,12 @@ EpgPage ParserApiClient::loadEpgPrograms(
   }
 
   if (!channel.streamId.empty()) {
-    body << ",\"streamId\":\"" << jsonEscape(channel.streamId) << "\"";
+    if (isAllDigits(channel.streamId)) {
+      body << ",\"streamId\":" << channel.streamId;
+    } else {
+      body << ",\"streamId\":\"" << jsonEscape(channel.streamId) << "\"";
+    }
+    body << ",\"limit\":" << pageSize;
   }
 
   body << "}";
