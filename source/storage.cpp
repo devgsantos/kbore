@@ -7,6 +7,8 @@
 
 namespace nstv {
 
+static std::string safeFilePart(const std::string &value);
+
 std::string dataDir() {
 #ifdef __SWITCH__
   return "sdmc:/switch/kbore";
@@ -16,7 +18,19 @@ std::string dataDir() {
 }
 
 std::string activeManifestPath() {
+  return dataDir() + "/manifests/active-manifest.json";
+}
+
+std::string manifestPath(const std::string &playlistId) {
+  return dataDir() + "/manifests/manifest-" + safeFilePart(playlistId.empty() ? "active" : playlistId) + ".json";
+}
+
+static std::string legacyActiveManifestPath() {
   return dataDir() + "/active-manifest.json";
+}
+
+static std::string legacyManifestPath(const std::string &playlistId) {
+  return dataDir() + "/manifest-" + safeFilePart(playlistId.empty() ? "active" : playlistId) + ".json";
 }
 
 std::string cacheDir() {
@@ -32,9 +46,11 @@ static void ensureDataDir() {
   mkdir("sdmc:/switch", 0777);
   mkdir("sdmc:/switch/kbore", 0777);
   mkdir("sdmc:/switch/kbore/cache", 0777);
+  mkdir("sdmc:/switch/kbore/manifests", 0777);
 #else
   mkdir(".", 0777);
   mkdir("./cache", 0777);
+  mkdir("./manifests", 0777);
 #endif
 }
 
@@ -74,6 +90,19 @@ std::string channelPageCachePath(
     safeFilePart(toString(type)) + "_" +
     safeFilePart(categoryId) + "_page_" +
     std::to_string(page) + ".json";
+}
+
+std::string epgCacheKey(const Channel &channel) {
+  if (!channel.tvgId.empty()) return channel.tvgId;
+  if (!channel.streamId.empty()) return channel.streamId;
+  if (!channel.id.empty()) return channel.id;
+  return channel.name;
+}
+
+std::string epgCachePath(const std::string &playlistId, const Channel &channel) {
+  return cacheDir() + "/" +
+    safeFilePart(playlistId.empty() ? "active" : playlistId) + "_epg_" +
+    safeFilePart(epgCacheKey(channel)) + ".json";
 }
 
 static Json manifestToJson(const Manifest &manifest) {
@@ -142,6 +171,21 @@ static Manifest manifestFromJson(const Json &json) {
   return manifest;
 }
 
+static bool readManifestFile(const std::string &path, Manifest &manifest) {
+  std::ifstream file(path, std::ios::binary);
+  if (!file) return false;
+
+  std::ostringstream ss;
+  ss << file.rdbuf();
+
+  try {
+    manifest = manifestFromJson(Json::parse(ss.str()));
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
 static Json channelToJson(const Channel &channel) {
   Json json(Json::object_t{});
   json["id"] = channel.id;
@@ -150,6 +194,9 @@ static Json channelToJson(const Channel &channel) {
   json["logo"] = channel.logo;
   json["group"] = channel.group;
   json["groupId"] = channel.groupId;
+  json["tvgId"] = channel.tvgId;
+  json["tvgName"] = channel.tvgName;
+  json["streamId"] = channel.streamId;
   json["type"] = toString(channel.type);
   return json;
 }
@@ -162,6 +209,9 @@ static Channel channelFromJson(const Json &json) {
   channel.logo = json["logo"].asString("");
   channel.group = json["group"].asString("");
   channel.groupId = json["groupId"].asString("");
+  channel.tvgId = json["tvgId"].asString("");
+  channel.tvgName = json["tvgName"].asString("");
+  channel.streamId = json["streamId"].asString("");
   channel.type = streamTypeFromString(json["type"].asString("live"));
   return channel;
 }
@@ -205,7 +255,7 @@ static ChannelPage channelPageFromJson(const Json &json) {
 bool saveManifest(const Manifest &manifest) {
   ensureDataDir();
 
-  std::ofstream file(activeManifestPath(), std::ios::binary);
+  std::ofstream file(manifestPath(manifest.id), std::ios::binary);
   if (!file) return false;
 
   file << manifestToJson(manifest).stringify();
@@ -213,18 +263,33 @@ bool saveManifest(const Manifest &manifest) {
 }
 
 bool loadManifest(Manifest &manifest) {
-  std::ifstream file(activeManifestPath(), std::ios::binary);
-  if (!file) return false;
+  return readManifestFile(activeManifestPath(), manifest) ||
+    readManifestFile(legacyActiveManifestPath(), manifest);
+}
 
-  std::ostringstream ss;
-  ss << file.rdbuf();
-
-  try {
-    manifest = manifestFromJson(Json::parse(ss.str()));
+bool loadManifest(const std::string &playlistId, Manifest &manifest) {
+  if (readManifestFile(manifestPath(playlistId), manifest)) {
     return true;
-  } catch (...) {
-    return false;
   }
+
+  if (readManifestFile(legacyManifestPath(playlistId), manifest)) {
+    saveManifest(manifest);
+    return true;
+  }
+
+  Manifest legacy;
+  if (
+    !playlistId.empty() &&
+    readManifestFile(legacyActiveManifestPath(), legacy) &&
+    legacy.id == playlistId &&
+    !legacy.types.empty()
+  ) {
+    manifest = legacy;
+    saveManifest(manifest);
+    return true;
+  }
+
+  return false;
 }
 
 bool saveChannelPage(
@@ -259,6 +324,100 @@ bool loadChannelPage(
 
   try {
     page = channelPageFromJson(Json::parse(ss.str()));
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+
+static Json epgProgramToJson(const EpgProgram &program) {
+  Json json(Json::object_t{});
+  json["channelId"] = program.channelId;
+  json["channelName"] = program.channelName;
+  json["title"] = program.title;
+  json["description"] = program.description;
+  json["start"] = program.start;
+  json["stop"] = program.stop;
+  return json;
+}
+
+static EpgProgram epgProgramFromJson(const Json &json) {
+  EpgProgram program;
+  program.channelId = json["channelId"].asString("");
+  program.channelName = json["channelName"].asString("");
+  program.title = json["title"].asString("Program");
+  program.description = json["description"].asString("");
+  program.start = json["start"].asString("");
+  program.stop = json["stop"].asString("");
+  return program;
+}
+
+static Json epgPageToJson(const EpgPage &page) {
+  Json root(Json::object_t{});
+  root["page"] = page.page;
+  root["pageSize"] = page.pageSize;
+  root["totalPrograms"] = page.totalPrograms;
+  root["totalPages"] = page.totalPages;
+  root["hasNextPage"] = page.hasNextPage;
+
+  Json::array_t programs;
+  for (const auto &program : page.programs) {
+    programs.push_back(epgProgramToJson(program));
+  }
+  root["programs"] = Json(programs);
+  return root;
+}
+
+static EpgPage epgPageFromJson(const Json &json) {
+  EpgPage page;
+  page.page = json["page"].asInt(1);
+  page.pageSize = json["pageSize"].asInt(12);
+  page.totalPrograms = json["totalPrograms"].asInt(json["total"].asInt(0));
+  page.totalPages = json["totalPages"].asInt(1);
+  page.hasNextPage = json["hasNextPage"].asBool(page.page < page.totalPages);
+
+  const Json &programsJson = json["programs"].isArray() ? json["programs"] : json["items"];
+  if (programsJson.isArray()) {
+    for (const auto &item : programsJson.asArray()) {
+      page.programs.push_back(epgProgramFromJson(item));
+    }
+  }
+
+  if (page.totalPrograms == 0) {
+    page.totalPrograms = static_cast<int>(page.programs.size());
+  }
+
+  return page;
+}
+
+bool saveEpgPage(
+  const std::string &playlistId,
+  const Channel &channel,
+  const EpgPage &page
+) {
+  ensureDataDir();
+
+  std::ofstream file(epgCachePath(playlistId, channel), std::ios::binary);
+  if (!file) return false;
+
+  file << epgPageToJson(page).stringify();
+  return true;
+}
+
+bool loadEpgPage(
+  const std::string &playlistId,
+  const Channel &channel,
+  EpgPage &page
+) {
+  std::ifstream file(epgCachePath(playlistId, channel), std::ios::binary);
+  if (!file) return false;
+
+  std::ostringstream ss;
+  ss << file.rdbuf();
+
+  try {
+    page = epgPageFromJson(Json::parse(ss.str()));
     return true;
   } catch (...) {
     return false;

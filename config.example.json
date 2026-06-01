@@ -3,7 +3,17 @@
   "apiKey": "your-api-key",
   "defaultPlaylistUrl": "http://host:port/get.php?username=USER&password=PASS&type=m3u_plus&output=ts",
   "defaultXtreamUrl": "http://host?username=USER&password=PASS",
+  "active": "my-m3u-list",
   "pageSize": 20,
   "preloadThreshold": 8,
-  "useUnicodeIcons": false
+  "useUnicodeIcons": false,
+  "playlists": [
+    {
+      "id": "my-m3u-list",
+      "name": "My M3U List",
+      "type": "m3u",
+      "active": true,
+      "m3u_url": "http://host:port/get.php?username=USER&password=PASS&type=m3u_plus&output=ts"
+    }
+  ]
 }
