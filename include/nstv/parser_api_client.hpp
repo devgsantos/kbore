@@ -22,6 +22,15 @@ public:
     int page
   ) const;
 
+  EpgPage loadEpgPrograms(
+    const std::string &sourceUrl,
+    Provider provider,
+    const Channel &channel,
+    int page = 1,
+    int pageSize = 12,
+    const std::string &manualEpgUrl = ""
+  ) const;
+
 private:
   Manifest loadManifestEndpoint(const std::string &endpoint, const std::string &sourceUrl, Provider provider) const;
   ChannelPage loadChannelsEndpoint(
@@ -35,6 +44,7 @@ private:
 
   Manifest manifestFromJson(const Json &json, const std::string &sourceUrl, Provider provider) const;
   ChannelPage channelPageFromJson(const Json &json) const;
+  EpgPage epgPageFromJson(const Json &json) const;
   std::string endpoint(const std::string &path) const;
   std::map<std::string, std::string> authHeaders() const;
   Json requestJson(const std::string &url, const std::string &body) const;

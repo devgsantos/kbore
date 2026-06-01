@@ -14,6 +14,7 @@ struct PlaylistConfig {
 
   // M3U source.
   std::string m3uUrl;
+  std::string epgUrl;
 
   // Xtream source.
   std::string serverUrl;

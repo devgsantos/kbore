@@ -10,9 +10,16 @@
 #include "nstv/player_backend.hpp"
 #include "nstv/player_backend_factory.hpp"
 #include "nstv/video_player.hpp"
+#include <atomic>
+#include <condition_variable>
+#include <map>
+#include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <memory>
+#include <utility>
+#include <vector>
 
 namespace nstv {
 
@@ -31,6 +38,12 @@ struct AppState {
   int loadedTotal = 0;
   int loadedTotalPages = 1;
   std::string loadedCategoryKey;
+  bool channelListLoading = false;
+  std::string channelListLoadingKey;
+
+  std::map<std::string, EpgPage> epgByChannel;
+  std::string currentEpgKey;
+  bool currentEpgAvailable = false;
 
   int selectedType = 0;
   int selectedCategory = 0;
@@ -54,9 +67,51 @@ struct AppState {
 class App {
 public:
   App();
+  ~App();
   int run();
 
 private:
+  struct EpgJob {
+    Config config;
+    Channel channel;
+    std::string key;
+    std::string manifestId;
+    std::string source;
+    Provider provider = Provider::M3u;
+    std::string manualEpgUrl;
+    int pageSize = 4;
+  };
+
+  struct EpgResult {
+    std::string manifestId;
+    std::string key;
+    EpgPage page;
+  };
+
+  struct ChannelLoadJob {
+    Config config;
+    std::string manifestId;
+    std::string source;
+    Provider provider = Provider::M3u;
+    StreamType type = StreamType::Live;
+    std::string categoryId;
+    std::string categoryKey;
+    int page = 1;
+    bool append = false;
+  };
+
+  struct ChannelLoadResult {
+    std::string manifestId;
+    std::string categoryKey;
+    StreamType type = StreamType::Live;
+    std::string categoryId;
+    int page = 1;
+    bool append = false;
+    bool ok = false;
+    ChannelPage pageData;
+    std::string error;
+  };
+
   void render();
   void renderSplashGraphic();
   void renderDashboard();
@@ -88,6 +143,20 @@ private:
   void resetLoadedChannels();
   void normalizeIndexes();
   void maybePreloadNextPage();
+  void loadSelectedEpg(bool force = false, bool fetchRemote = true);
+  void loadEpgForChannels(const std::vector<Channel> &channels);
+  void loadVisibleEpgForChannelList();
+  void startChannelWorker();
+  void stopChannelWorker();
+  void channelWorkerLoop();
+  void drainFinishedChannelLoads();
+  void startEpgWorker();
+  void stopEpgWorker();
+  void epgWorkerLoop();
+  void drainFinishedEpg();
+  std::string channelEpgKey(const Channel &channel) const;
+  std::string epgLineForChannel(const Channel &channel) const;
+  std::string epgNowNextLine(const Channel &channel) const;
 
   std::vector<TypeGroup> visibleTypes() const;
   const TypeGroup *selectedTypeGroup() const;
@@ -118,6 +187,20 @@ private:
   Graphics gfx_;
   ImageCache imageCache_;
   std::unique_ptr<IPlayerBackend> player_;
+  std::thread channelWorker_;
+  std::mutex channelMutex_;
+  std::condition_variable channelCv_;
+  std::vector<ChannelLoadJob> channelQueue_;
+  std::set<std::string> channelQueuedKeys_;
+  std::vector<ChannelLoadResult> channelFinished_;
+  std::atomic<bool> channelStop_{false};
+  std::thread epgWorker_;
+  std::mutex epgMutex_;
+  std::condition_variable epgCv_;
+  std::vector<EpgJob> epgQueue_;
+  std::set<std::string> epgQueuedKeys_;
+  std::vector<EpgResult> epgFinished_;
+  std::atomic<bool> epgStop_{false};
 
   bool splashVisible_ = true;
   long long splashStartedAtMs_ = 0;

@@ -30,7 +30,33 @@ struct Channel {
   std::string logo;
   std::string group;
   std::string groupId;
+
+  // EPG matching fields returned by the parser when available.
+  // M3U/XMLTV usually matches by tvgId/tvgName/name.
+  // Xtream short EPG usually matches by streamId.
+  std::string tvgId;
+  std::string tvgName;
+  std::string streamId;
+
   StreamType type = StreamType::Live;
+};
+
+struct EpgProgram {
+  std::string channelId;
+  std::string channelName;
+  std::string title;
+  std::string description;
+  std::string start;
+  std::string stop;
+};
+
+struct EpgPage {
+  std::vector<EpgProgram> programs;
+  int page = 1;
+  int pageSize = 20;
+  int totalPrograms = 0;
+  int totalPages = 1;
+  bool hasNextPage = false;
 };
 
 struct Manifest {
