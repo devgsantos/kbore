@@ -349,10 +349,17 @@ bool NativeHwPlayerBackend::open(const std::string &url) {
     return false;
   }
 
-  if (preferNativeRenderer_) {
+  if (nativeVideoAllowed_ && preferNativeRenderer_) {
     nativeRenderer_ = createDeko3dVideoRenderer();
 
     if (nativeRenderer_ && nativeRenderer_->initialize()) {
+      nativeRenderer_->setOverlayVisible(nativeOverlayVisible_);
+      nativeRenderer_->setOverlayInfo(
+        nativeOverlayTitle_,
+        nativeOverlaySubtitle_,
+        nativeOverlayStatus_,
+        nativeOverlayControls_
+      );
       nativeRendererReady_ = true;
       nativeRendererStatus_ = std::string(nativeRenderer_->name()) + " initialized";
       std::printf("[KBORE][DEKO3D] %s\n", nativeRendererStatus_.c_str());
@@ -377,7 +384,7 @@ bool NativeHwPlayerBackend::open(const std::string &url) {
     }
   }
 
-  if (nativeRendererReady_ && nativeRenderer_) {
+  if (nativeVideoAllowed_ && nativeRendererReady_ && nativeRenderer_) {
 #ifdef NSTV_USE_FFMPEG
     if (decoder_.decodeNextHardwareFrame(demuxer_)) {
       const AVFrame *frame = decoder_.latestHardwareFrame();
@@ -475,6 +482,83 @@ void NativeHwPlayerBackend::close() {
   resetClock();
 }
 
+void NativeHwPlayerBackend::setNativeVideoAllowed(bool allowed) {
+  nativeVideoAllowed_ = allowed;
+
+  if (!allowed) {
+    if (nativeRenderer_) {
+      nativeRenderer_->shutdown();
+      nativeRenderer_.reset();
+    }
+
+    nativeRendererReady_ = false;
+    nativeFramePresented_ = false;
+    return;
+  }
+
+#ifdef NSTV_ENABLE_NATIVE_HW_PLAYER
+  if (
+    open_ &&
+    preferNativeRenderer_ &&
+    !nativeRendererReady_ &&
+    !nativeRendererFailed_
+  ) {
+    nativeRenderer_ = createDeko3dVideoRenderer();
+
+    if (nativeRenderer_ && nativeRenderer_->initialize()) {
+      nativeRenderer_->setOverlayVisible(nativeOverlayVisible_);
+      nativeRenderer_->setOverlayInfo(
+        nativeOverlayTitle_,
+        nativeOverlaySubtitle_,
+        nativeOverlayStatus_,
+        nativeOverlayControls_
+      );
+      nativeRendererReady_ = true;
+      nativeRendererStatus_ = std::string(nativeRenderer_->name()) + " initialized";
+      std::printf("[KBORE][DEKO3D] %s\n", nativeRendererStatus_.c_str());
+    } else {
+      nativeRendererReady_ = false;
+      nativeRendererFailed_ = true;
+      nativeRendererStatus_ =
+        nativeRenderer_
+          ? nativeRenderer_->error()
+          : "Deko3D renderer is unavailable for this build.";
+
+      std::printf("[KBORE][DEKO3D] unavailable: %s\n", nativeRendererStatus_.c_str());
+
+      if (nativeRenderer_) {
+        nativeRenderer_->shutdown();
+        nativeRenderer_.reset();
+      }
+    }
+  }
+#endif
+}
+
+void NativeHwPlayerBackend::setOverlayVisible(bool visible) {
+  nativeOverlayVisible_ = visible;
+
+  if (nativeRenderer_) {
+    nativeRenderer_->setOverlayVisible(visible);
+  }
+}
+
+void NativeHwPlayerBackend::setOverlayInfo(
+  const std::string &title,
+  const std::string &subtitle,
+  const std::string &status,
+  const std::string &controls
+) {
+  nativeOverlayTitle_ = title;
+  nativeOverlaySubtitle_ = subtitle;
+  nativeOverlayStatus_ = status;
+  nativeOverlayControls_ = controls;
+
+  if (nativeRenderer_) {
+    nativeRenderer_->setOverlayInfo(title, subtitle, status, controls);
+  }
+}
+
 bool NativeHwPlayerBackend::update() {
 #ifndef NSTV_ENABLE_NATIVE_HW_PLAYER
   return false;
@@ -537,7 +621,16 @@ bool NativeHwPlayerBackend::update() {
     return hasFrame();
   }
 
-  if (nativeRendererReady_ && nativeRenderer_) {
+  if (
+    nativeVideoAllowed_ &&
+    preferNativeRenderer_ &&
+    !nativeRendererReady_ &&
+    !nativeRendererFailed_
+  ) {
+    setNativeVideoAllowed(true);
+  }
+
+  if (nativeVideoAllowed_ && nativeRendererReady_ && nativeRenderer_) {
 #ifdef NSTV_USE_FFMPEG
     if (decoder_.decodeNextHardwareFrame(demuxer_)) {
       const AVFrame *frame = decoder_.latestHardwareFrame();

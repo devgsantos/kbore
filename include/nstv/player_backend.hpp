@@ -21,6 +21,19 @@ public:
   virtual const Bitmap &frame() const = 0;
   virtual const YuvFrame &yuvFrame() const = 0;
   virtual bool nativeVideoActive() const { return false; }
+  virtual void setNativeVideoAllowed(bool allowed) { (void)allowed; }
+  virtual void setOverlayVisible(bool visible) { (void)visible; }
+  virtual void setOverlayInfo(
+    const std::string &title,
+    const std::string &subtitle,
+    const std::string &status,
+    const std::string &controls
+  ) {
+    (void)title;
+    (void)subtitle;
+    (void)status;
+    (void)controls;
+  }
 
   virtual const std::string &error() const = 0;
   virtual const std::string &url() const = 0;
