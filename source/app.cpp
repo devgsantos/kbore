@@ -474,6 +474,12 @@ App::App() : api_(loadConfig()), player_(createPlayerBackend()) {
   } else {
     state_.message = "Press + to add an M3U or Xtream playlist";
   }
+
+  startEpgWorker();
+}
+
+App::~App() {
+  stopEpgWorker();
 }
 
 int App::run() {
@@ -505,9 +511,12 @@ int App::run() {
       continue;
     }
 
-    Button button = pollButtonBlocking();
-    handle(button);
+    Button button = pollButton();
+    if (button != Button::None) {
+      handle(button);
+    }
     render();
+    sleepMs(16);
   }
 
   return 0;
@@ -1295,31 +1304,53 @@ void App::loadEpgForChannels(const std::vector<Channel> &channels) {
 
   const PlaylistConfig *playlist = activePlaylist();
   const std::string manualEpgUrl = playlist && playlist->provider == Provider::M3u ? playlist->epgUrl : "";
-  int loaded = 0;
+  std::vector<EpgJob> jobs;
 
   for (const Channel &channel : missing) {
-    if (loaded >= 8) {
+    if (jobs.size() >= 8) {
       break;
     }
 
     const std::string key = channelEpgKey(channel);
+    const std::string queuedKey = state_.manifest.id + ":" + key;
 
-    try {
-      EpgPage epg = api_.loadEpgPrograms(
-        state_.manifest.source,
-        state_.manifest.provider,
-        channel,
-        1,
-        4,
-        manualEpgUrl
-      );
-      state_.epgByChannel[key] = epg;
-      saveEpgPage(state_.manifest.id, channel, epg);
-      ++loaded;
-    } catch (const std::exception &ex) {
-      std::printf("[KBORE] loadEpgForChannels failed for %s: %s\n", channel.name.c_str(), ex.what());
+    {
+      std::lock_guard<std::mutex> lock(epgMutex_);
+      if (epgQueuedKeys_.count(queuedKey)) {
+        continue;
+      }
+      epgQueuedKeys_.insert(queuedKey);
+    }
+
+    jobs.push_back(EpgJob{
+      state_.config,
+      channel,
+      key,
+      state_.manifest.id,
+      state_.manifest.source,
+      state_.manifest.provider,
+      manualEpgUrl,
+      4
+    });
+  }
+
+  if (jobs.empty()) {
+    return;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(epgMutex_);
+    epgQueue_.insert(epgQueue_.begin(), jobs.begin(), jobs.end());
+
+    constexpr std::size_t maxPendingEpgJobs = 24;
+    while (epgQueue_.size() > maxPendingEpgJobs) {
+      const EpgJob &stale = epgQueue_.back();
+      epgQueuedKeys_.erase(stale.manifestId + ":" + stale.key);
+      epgQueue_.pop_back();
     }
   }
+
+  epgCv_.notify_one();
 }
 
 void App::loadVisibleEpgForChannelList() {
@@ -1344,6 +1375,84 @@ void App::loadVisibleEpgForChannelList() {
   }
 
   loadEpgForChannels(visible);
+}
+
+void App::startEpgWorker() {
+  epgStop_ = false;
+  epgWorker_ = std::thread(&App::epgWorkerLoop, this);
+}
+
+void App::stopEpgWorker() {
+  epgStop_ = true;
+  epgCv_.notify_all();
+
+  if (epgWorker_.joinable()) {
+    epgWorker_.join();
+  }
+}
+
+void App::epgWorkerLoop() {
+  while (!epgStop_) {
+    EpgJob job;
+
+    {
+      std::unique_lock<std::mutex> lock(epgMutex_);
+      epgCv_.wait(lock, [this]() {
+        return epgStop_ || !epgQueue_.empty();
+      });
+
+      if (epgStop_) {
+        break;
+      }
+
+      job = epgQueue_.front();
+      epgQueue_.erase(epgQueue_.begin());
+    }
+
+    const std::string queuedKey = job.manifestId + ":" + job.key;
+
+    try {
+      ParserApiClient epgApi(job.config);
+      EpgPage epg = epgApi.loadEpgPrograms(
+        job.source,
+        job.provider,
+        job.channel,
+        1,
+        job.pageSize,
+        job.manualEpgUrl
+      );
+      saveEpgPage(job.manifestId, job.channel, epg);
+
+      std::lock_guard<std::mutex> lock(epgMutex_);
+      epgFinished_.push_back(EpgResult{job.manifestId, job.key, epg});
+      epgQueuedKeys_.erase(queuedKey);
+    } catch (const std::exception &ex) {
+      std::printf("[KBORE] background EPG failed for %s: %s\n", job.channel.name.c_str(), ex.what());
+      std::lock_guard<std::mutex> lock(epgMutex_);
+      epgQueuedKeys_.erase(queuedKey);
+    }
+  }
+}
+
+void App::drainFinishedEpg() {
+  std::vector<EpgResult> finished;
+
+  {
+    std::lock_guard<std::mutex> lock(epgMutex_);
+    finished.swap(epgFinished_);
+  }
+
+  for (const EpgResult &result : finished) {
+    if (!state_.hasManifest || result.manifestId != state_.manifest.id) {
+      continue;
+    }
+
+    state_.epgByChannel[result.key] = result.page;
+
+    if (result.key == state_.currentEpgKey) {
+      state_.currentEpgAvailable = currentProgramIndex(result.page) >= 0;
+    }
+  }
 }
 
 std::string App::epgLineForChannel(const Channel &channel) const {
@@ -1422,7 +1531,8 @@ void App::playSelectedChannel() {
     return;
   }
 
-  loadSelectedEpg();
+  loadSelectedEpg(false, false);
+  loadEpgForChannels(std::vector<Channel>{*channel});
 
   state_.screen = ScreenId::Player;
   state_.message = "Loading video";
@@ -1515,6 +1625,7 @@ static int windowStart(int selected, int size, int maxRows) {
 }
 
 void App::render() {
+  drainFinishedEpg();
   gfx_.beginFrame();
 
   if (splashVisible_) {

@@ -10,10 +10,16 @@
 #include "nstv/player_backend.hpp"
 #include "nstv/player_backend_factory.hpp"
 #include "nstv/video_player.hpp"
+#include <atomic>
+#include <condition_variable>
 #include <map>
+#include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <memory>
+#include <utility>
+#include <vector>
 
 namespace nstv {
 
@@ -59,9 +65,27 @@ struct AppState {
 class App {
 public:
   App();
+  ~App();
   int run();
 
 private:
+  struct EpgJob {
+    Config config;
+    Channel channel;
+    std::string key;
+    std::string manifestId;
+    std::string source;
+    Provider provider = Provider::M3u;
+    std::string manualEpgUrl;
+    int pageSize = 4;
+  };
+
+  struct EpgResult {
+    std::string manifestId;
+    std::string key;
+    EpgPage page;
+  };
+
   void render();
   void renderSplashGraphic();
   void renderDashboard();
@@ -96,6 +120,10 @@ private:
   void loadSelectedEpg(bool force = false, bool fetchRemote = true);
   void loadEpgForChannels(const std::vector<Channel> &channels);
   void loadVisibleEpgForChannelList();
+  void startEpgWorker();
+  void stopEpgWorker();
+  void epgWorkerLoop();
+  void drainFinishedEpg();
   std::string channelEpgKey(const Channel &channel) const;
   std::string epgLineForChannel(const Channel &channel) const;
   std::string epgNowNextLine(const Channel &channel) const;
@@ -129,6 +157,13 @@ private:
   Graphics gfx_;
   ImageCache imageCache_;
   std::unique_ptr<IPlayerBackend> player_;
+  std::thread epgWorker_;
+  std::mutex epgMutex_;
+  std::condition_variable epgCv_;
+  std::vector<EpgJob> epgQueue_;
+  std::set<std::string> epgQueuedKeys_;
+  std::vector<EpgResult> epgFinished_;
+  std::atomic<bool> epgStop_{false};
 
   bool splashVisible_ = true;
   long long splashStartedAtMs_ = 0;
