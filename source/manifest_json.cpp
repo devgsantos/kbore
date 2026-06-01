@@ -404,6 +404,16 @@ static MediaNode parseNodeObject(FastJsonReader &reader, const std::string &fall
       node.group = reader.parseString();
     } else if (key == "groupId" || key == "categoryId" || key == "category_id") {
       node.groupId = reader.parseString();
+    } else if (key == "tvgId" || key == "tvg-id" || key == "epgChannelId") {
+      node.tvgId = reader.parseString();
+    } else if (key == "tvgName" || key == "tvg-name") {
+      node.tvgName = reader.parseString();
+    } else if (key == "streamId" || key == "stream_id") {
+      if (reader.peek() == '"') {
+        node.streamId = reader.parseString();
+      } else {
+        node.streamId = std::to_string(reader.parseInt(0));
+      }
     } else if (key == "totalItems" || key == "totalChannels" || key == "count") {
       int value = reader.parseInt(0);
       if (key == "totalChannels") {

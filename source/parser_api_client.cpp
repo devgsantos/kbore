@@ -140,6 +140,12 @@ std::string gunzipBytes(const std::string &gzipBytes) {
 ParserApiClient::ParserApiClient(Config config, ProgressCallback progress)
   : config_(std::move(config)), progress_(std::move(progress)) {}
 
+void ParserApiClient::progress(const std::string &message) const {
+  if (progress_) {
+    progress_(message);
+  }
+}
+
 std::string ParserApiClient::endpoint(const std::string &path) const {
   if (config_.parserApiBaseUrl.empty()) {
     throw std::runtime_error("Internal parser API base URL is empty.");
@@ -153,14 +159,20 @@ std::map<std::string, std::string> ParserApiClient::authHeaders() const {
   return headers;
 }
 
-void ParserApiClient::progress(const std::string &message) const {
-  if (progress_) {
-    progress_(message);
+Json ParserApiClient::requestJson(const std::string &url, const std::string &body) const {
+  if (url.find("/epg/") != std::string::npos) {
+    std::printf("[KBORE] Parser API EPG POST %s\n", url.c_str());
+  }
+  HttpResponse res = http_.postJson(url, body, authHeaders());
+  if (!res.error.empty()) throw std::runtime_error("HTTP request failed: " + res.error);
+  Json json = Json::parse(res.body);
+  if (res.status < 200 || res.status >= 300) {
+    std::string message = json["error"]["message"].asString("HTTP " + std::to_string(res.status));
+    throw std::runtime_error(message);
   }
   if (!json["ok"].asBool(json["success"].asBool(false))) {
     throw std::runtime_error(json["error"]["message"].asString(json["message"].asString("Parser API returned ok=false")));
   }
-
   return json;
 }
 
@@ -398,6 +410,15 @@ MediaNode ParserApiClient::nodeFromJson(const Json &json, const std::string &fal
   node.logo = json["logo"].asString(json["stream_icon"].asString(json["cover"].asString("")));
   node.group = json["group"].asString(json["category"].asString(""));
   node.groupId = json["groupId"].asString(json["categoryId"].asString(json["category_id"].asString("")));
+  node.tvgId = json["tvgId"].asString(json["tvg-id"].asString(json["epgChannelId"].asString("")));
+  node.tvgName = json["tvgName"].asString(json["tvg-name"].asString(""));
+  node.streamId = json["streamId"].asString(json["stream_id"].asString(""));
+  if (node.streamId.empty() && json["stream_id"].isNumber()) {
+    node.streamId = std::to_string(json["stream_id"].asInt(0));
+  }
+  if (node.streamId.empty() && json["streamId"].isNumber()) {
+    node.streamId = std::to_string(json["streamId"].asInt(0));
+  }
   node.totalItems = json["totalItems"].asInt(json["totalChannels"].asInt(0));
   node.totalChannels = json["totalChannels"].asInt(node.totalItems);
   node.childCount = json["childCount"].asInt(json["childrenCount"].asInt(json["count"].asInt(0)));
@@ -623,21 +644,35 @@ EpgPage ParserApiClient::loadEpgPrograms(
     ? (!channel.streamId.empty() ? "/api/xtream/epg/short" : "/api/xtream/epg/programs")
     : "/api/epg/programs";
 
+  std::printf(
+    "[KBORE] EPG request path=%s channel='%s' tvgId='%s' tvgName='%s' streamId='%s' manualEpg=%s\n",
+    path.c_str(),
+    channel.name.c_str(),
+    channel.tvgId.c_str(),
+    channel.tvgName.c_str(),
+    channel.streamId.c_str(),
+    manualEpgUrl.empty() ? "no" : "yes"
+  );
+
   Json json = requestJson(endpoint(path), body.str());
   return epgPageFromJson(json);
 }
 
 EpgPage ParserApiClient::epgPageFromJson(const Json &json) const {
-  EpgPage page;
-  page.page = json["page"].asInt(1);
-  page.pageSize = json["pageSize"].asInt(12);
-  page.totalPrograms = json["totalPrograms"].asInt(json["total"].asInt(0));
-  page.totalPages = json["totalPages"].asInt(1);
-  page.hasNextPage = json["hasNextPage"].asBool(page.page < page.totalPages);
+  const Json &root = json["data"].isObject()
+    ? json["data"]
+    : (json["epg"].isObject() ? json["epg"] : json);
 
-  const Json &items = json["programs"].isArray()
-    ? json["programs"]
-    : (json["epg_listings"].isArray() ? json["epg_listings"] : json["items"]);
+  EpgPage page;
+  page.page = root["page"].asInt(json["page"].asInt(1));
+  page.pageSize = root["pageSize"].asInt(json["pageSize"].asInt(12));
+  page.totalPrograms = root["totalPrograms"].asInt(root["total"].asInt(json["totalPrograms"].asInt(json["total"].asInt(0))));
+  page.totalPages = root["totalPages"].asInt(json["totalPages"].asInt(1));
+  page.hasNextPage = root["hasNextPage"].asBool(json["hasNextPage"].asBool(page.page < page.totalPages));
+
+  const Json &items = root["programs"].isArray()
+    ? root["programs"]
+    : (root["epg_listings"].isArray() ? root["epg_listings"] : (root["items"].isArray() ? root["items"] : json["programs"]));
 
   if (items.isArray()) {
     for (const Json &item : items.asArray()) {

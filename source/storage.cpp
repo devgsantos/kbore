@@ -151,6 +151,9 @@ static Json mediaNodeToJson(const MediaNode &node) {
   json["logo"] = node.logo;
   json["group"] = node.group;
   json["groupId"] = node.groupId;
+  json["tvgId"] = node.tvgId;
+  json["tvgName"] = node.tvgName;
+  json["streamId"] = node.streamId;
   json["totalItems"] = node.totalItems;
   json["totalChannels"] = node.totalChannels;
   json["childCount"] = node.childCount;
@@ -181,6 +184,14 @@ static MediaNode mediaNodeFromJson(const Json &json, const std::string &fallback
   node.logo = json["logo"].asString(json["stream_icon"].asString(json["cover"].asString("")));
   node.group = json["group"].asString(json["category"].asString(""));
   node.groupId = json["groupId"].asString(json["categoryId"].asString(json["category_id"].asString("")));
+  node.tvgId = json["tvgId"].asString(json["tvg-id"].asString(json["epgChannelId"].asString("")));
+  node.tvgName = json["tvgName"].asString(json["tvg-name"].asString(json["name"].asString("")));
+  if (json["streamId"].isString()) {
+    node.streamId = json["streamId"].asString("");
+  } else {
+    int parsedStreamId = json["streamId"].asInt(json["stream_id"].asInt(0));
+    node.streamId = parsedStreamId > 0 ? std::to_string(parsedStreamId) : "";
+  }
   node.totalItems = json["totalItems"].asInt(json["totalChannels"].asInt(0));
   node.totalChannels = json["totalChannels"].asInt(node.totalItems);
   node.childCount = json["childCount"].asInt(json["childrenCount"].asInt(json["count"].asInt(0)));
@@ -869,6 +880,17 @@ bool loadEpgPage(
   EpgPage &page
 ) {
   std::ifstream file(epgCachePath(playlistId, channel), std::ios::binary);
+  if (!file) return false;
+
+  std::ostringstream ss;
+  ss << file.rdbuf();
+
+  try {
+    page = epgPageFromJson(Json::parse(ss.str()));
+    return true;
+  } catch (...) {
+    return false;
+  }
 }
 
 bool saveNodeChildrenPage(

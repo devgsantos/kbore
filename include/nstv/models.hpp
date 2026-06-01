@@ -33,6 +33,14 @@ struct MediaNode {
   std::string logo;
   std::string group;
   std::string groupId;
+
+  // EPG matching metadata propagated by the parser for node-tree manifests.
+  // These fields let the app request EPG for focused live items without
+  // depending on the legacy loadedChannels list.
+  std::string tvgId;
+  std::string tvgName;
+  std::string streamId;
+
   int totalItems = 0;
   int totalChannels = 0;
   int childCount = 0;

@@ -516,17 +516,6 @@ App::~App() {
   stopEpgWorker();
 }
 
-
-App::~App() {
-  if (playlistLoadThread_.joinable()) {
-    playlistLoadThread_.join();
-  }
-
-  if (cacheSaveThread_.joinable()) {
-    cacheSaveThread_.join();
-  }
-}
-
 int App::run() {
   render();
 
@@ -738,6 +727,8 @@ void App::handleDashboard(Button button) {
           state_.nodePath.clear();
           state_.selectedCategory = 0;
           state_.selectedChannel = 0;
+          loadVisibleEpgForChannelList();
+          loadSelectedEpg(false, false);
         }
         return;
       }
@@ -748,6 +739,8 @@ void App::handleDashboard(Button button) {
         } else {
           state_.selectedCategory--;
           state_.selectedChannel = 0;
+          loadVisibleEpgForChannelList();
+          loadSelectedEpg(false, false);
         }
         return;
       }
@@ -757,6 +750,8 @@ void App::handleDashboard(Button button) {
           state_.focus = FocusColumn::Categories;
         } else {
           state_.selectedChannel--;
+          loadVisibleEpgForChannelList();
+          loadSelectedEpg(false, false);
         }
         return;
       }
@@ -781,6 +776,8 @@ void App::handleDashboard(Button button) {
       }
 
       normalizeIndexes();
+      loadVisibleEpgForChannelList();
+      loadSelectedEpg(false, false);
       return;
     }
 
@@ -814,6 +811,8 @@ void App::handleDashboard(Button button) {
         state_.selectedCategory = 0;
         state_.selectedChannel = 0;
         state_.focus = FocusColumn::Categories;
+        loadVisibleEpgForChannelList();
+        loadSelectedEpg(false, false);
         return;
       }
 
@@ -833,10 +832,14 @@ void App::handleDashboard(Button button) {
             state_.focus = FocusColumn::Categories;
             state_.selectedChannel = 0;
             normalizeIndexes();
+            loadVisibleEpgForChannelList();
+            loadSelectedEpg(false, false);
             return;
           }
 
           enterNode(*node, state_.selectedCategory);
+          loadVisibleEpgForChannelList();
+          loadSelectedEpg(false, false);
           return;
         }
 
@@ -868,6 +871,8 @@ void App::handleDashboard(Button button) {
           state_.selectedChannel = 0;
           state_.focus = FocusColumn::Categories;
           normalizeIndexes();
+          loadVisibleEpgForChannelList();
+          loadSelectedEpg(false, false);
           return;
         }
 
@@ -1899,7 +1904,18 @@ std::string App::channelEpgKey(const Channel &channel) const {
 }
 
 void App::loadSelectedEpg(bool force, bool fetchRemote) {
-  const Channel *channel = selectedChannelPtr();
+  Channel nodeChannel;
+  const Channel *channel = nullptr;
+
+  if (usingNodeTree()) {
+    const MediaNode *node = selectedPreviewNode();
+    if (node && (node->playable || !node->url.empty())) {
+      nodeChannel = channelFromNode(*node);
+      channel = &nodeChannel;
+    }
+  } else {
+    channel = selectedChannelPtr();
+  }
 
   if (!channel || !state_.hasManifest || channel->type != StreamType::Live) {
     state_.currentEpgKey.clear();
@@ -1936,6 +1952,7 @@ void App::loadSelectedEpg(bool force, bool fetchRemote) {
   try {
     const PlaylistConfig *playlist = activePlaylist();
     const std::string manualEpgUrl = playlist && playlist->provider == Provider::M3u ? playlist->epgUrl : "";
+    std::printf("[KBORE] loading selected EPG channel='%s' provider='%s' key='%s' remote=%s\n", channel->name.c_str(), toString(state_.manifest.provider).c_str(), key.c_str(), fetchRemote ? "yes" : "no");
     EpgPage epg = api_.loadEpgPrograms(state_.manifest.source, state_.manifest.provider, *channel, 1, 12, manualEpgUrl);
     state_.epgByChannel[key] = epg;
     state_.currentEpgAvailable = !epg.programs.empty();
@@ -2016,6 +2033,8 @@ void App::loadEpgForChannels(const std::vector<Channel> &channels) {
     return;
   }
 
+  std::printf("[KBORE] queueing %zu EPG request(s) for visible live channels\n", jobs.size());
+
   {
     std::lock_guard<std::mutex> lock(epgMutex_);
     epgQueue_.insert(epgQueue_.begin(), jobs.begin(), jobs.end());
@@ -2032,11 +2051,46 @@ void App::loadEpgForChannels(const std::vector<Channel> &channels) {
 }
 
 void App::loadVisibleEpgForChannelList() {
+  constexpr int channelRows = 7;
+
+  if (usingNodeTree()) {
+    std::vector<const MediaNode *> nodes = previewNodeChildren();
+    if (nodes.empty()) {
+      return;
+    }
+
+    const int size = static_cast<int>(nodes.size());
+    const int half = channelRows / 2;
+    const int start = size <= channelRows
+      ? 0
+      : std::max(0, std::min(state_.selectedChannel - half, size - channelRows));
+
+    std::vector<Channel> visible;
+    for (int i = 0; i < channelRows; ++i) {
+      const int index = start + i;
+      if (index >= static_cast<int>(nodes.size())) {
+        break;
+      }
+
+      const MediaNode *node = nodes[static_cast<std::size_t>(index)];
+      if (!node || !(node->playable || !node->url.empty())) {
+        continue;
+      }
+
+      Channel channel = channelFromNode(*node);
+      if (channel.type == StreamType::Live) {
+        visible.push_back(channel);
+      }
+    }
+
+    loadEpgForChannels(visible);
+    return;
+  }
+
   if (state_.loadedChannels.empty()) {
     return;
   }
 
-  constexpr int channelRows = 7;
   const int size = static_cast<int>(state_.loadedChannels.size());
   const int half = channelRows / 2;
   const int start = size <= channelRows
@@ -2090,6 +2144,7 @@ void App::epgWorkerLoop() {
     const std::string queuedKey = job.manifestId + ":" + job.key;
 
     try {
+      std::printf("[KBORE] loading EPG for channel='%s' provider='%s' key='%s'\n", job.channel.name.c_str(), toString(job.provider).c_str(), job.key.c_str());
       ParserApiClient epgApi(job.config);
       EpgPage epg = epgApi.loadEpgPrograms(
         job.source,
@@ -2100,6 +2155,7 @@ void App::epgWorkerLoop() {
         job.manualEpgUrl
       );
       saveEpgPage(job.manifestId, job.channel, epg);
+      std::printf("[KBORE] EPG loaded for channel='%s': %zu program(s)\n", job.channel.name.c_str(), epg.programs.size());
 
       std::lock_guard<std::mutex> lock(epgMutex_);
       epgFinished_.push_back(EpgResult{job.manifestId, job.key, epg});
@@ -2209,7 +2265,7 @@ void App::playSelectedChannel() {
     return;
   }
 
-  loadSelectedEpg(false, false);
+  loadSelectedEpg(false, true);
   loadEpgForChannels(std::vector<Channel>{*channel});
 
   state_.screen = ScreenId::Player;
@@ -2657,11 +2713,15 @@ bool App::ensureNodeChildrenLoaded(MediaNode &node) {
       node.totalChannels = firstPage.totalItems;
     }
   }
+  // Mark the node as loaded even when the API legitimately returns an empty
+  // list. The dashboard must be able to enter/render this empty child list
+  // based on the parent currently in focus instead of treating the A press as
+  // a failed load.
   node.hasChildren = !node.children.empty() || node.childCount > 0;
 
   if (node.children.empty()) {
     state_.message = usedOnlyCache ? "Folder cache is empty" : "Folder has no items";
-    return false;
+    return true;
   }
 
   state_.message = usedOnlyCache ? "Loaded folder from cache" : "Loaded folder from API";
@@ -2676,6 +2736,9 @@ Channel App::channelFromNode(const MediaNode &node) const {
   channel.logo = node.logo;
   channel.group = node.group;
   channel.groupId = node.groupId;
+  channel.tvgId = node.tvgId;
+  channel.tvgName = node.tvgName;
+  channel.streamId = node.streamId;
   channel.type = streamTypeFromString(node.type);
   return channel;
 }
@@ -2685,10 +2748,9 @@ void App::enterNode(const MediaNode &node, int childIndex) {
     return;
   }
 
-  if (node.children.empty()) {
-    return;
-  }
-
+  // Empty children are valid after pressing A: the selected parent may have
+  // been loaded from the API and legitimately returned zero items. Enter it so
+  // the UI can render the empty list for that parent.
   state_.nodePath.push_back(childIndex);
   state_.selectedCategory = 0;
   state_.selectedChannel = 0;
@@ -3112,9 +3174,9 @@ void App::renderDashboardGraphic() {
 
       std::string sub = folder
         ? ("FOLDER • " + std::to_string(nodeCount(*node)) + " ITEMS")
-        : (playable ? "PLAYABLE" : "EMPTY");
+        : (playable ? epgLineForChannel(ch) : "EMPTY");
 
-      gfx_.drawText(sub, nameX, y + 32, 2, muted, false);
+      gfx_.drawText(Graphics::fitText(sub, 42), nameX, y + 32, 2, muted, false);
       gfx_.drawText(state_.favorites.count(node->id) ? "*" : (folder ? ">" : "<3"), channelsPanel.x + channelsPanel.w - 42, y + 15, 2, muted, false);
     }
 
@@ -3138,7 +3200,7 @@ void App::renderDashboardGraphic() {
 
       const int nameX = channelsPanel.x + 94;
       gfx_.drawText(Graphics::fitText(ch.name, 35), nameX, y + 9, 3, text, true);
-      gfx_.drawText("EPG unavailable", nameX, y + 32, 2, muted, false);
+      gfx_.drawText(Graphics::fitText(epgLineForChannel(ch), 42), nameX, y + 32, 2, muted, false);
       gfx_.drawText(state_.favorites.count(ch.id) ? "*" : "<3", channelsPanel.x + channelsPanel.w - 42, y + 15, 2, muted, false);
     }
     if (state_.loadedChannels.empty()) {
