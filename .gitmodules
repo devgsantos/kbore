@@ -1,0 +1,8 @@
+[submodule "external/ffmpeg-nx"]
+	path = external/ffmpeg-nx
+	url = https://github.com/devgsantos/ffmpeg-nx.git
+	branch = feat/updated-readme
+[submodule "external/mpv-nx"]
+	path = external/mpv-nx
+	url = https://github.com/devgsantos/mpv-nx.git
+	branch = main
