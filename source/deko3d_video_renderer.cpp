@@ -10,6 +10,7 @@
 
 #ifdef NSTV_USE_FFMPEG
 extern "C" {
+#include <libavutil/frame.h>
 #include <libavutil/hwcontext_nvtegra.h>
 #include <libavutil/pixfmt.h>
 }
@@ -25,6 +26,7 @@ namespace nstv {
 namespace {
 
 constexpr uint32_t FramebufferCount = 2;
+constexpr uint32_t FrameInFlightCount = 3;
 constexpr uint32_t ScreenWidth = 1280;
 constexpr uint32_t ScreenHeight = 720;
 constexpr uint32_t CodeMemSize = 128 * 1024;
@@ -42,6 +44,63 @@ uint32_t alignUp(uint32_t value, uint32_t alignment) {
 }
 
 #ifdef __SWITCH__
+struct ColorCoefficients {
+  float kr = 0.299f;
+  float kb = 0.114f;
+};
+
+ColorCoefficients colorCoefficientsForFrame(const AVFrame *frame) {
+  if (!frame) {
+    return {};
+  }
+
+  switch (frame->colorspace) {
+    case AVCOL_SPC_BT709:
+      return {0.2126f, 0.0722f};
+    case AVCOL_SPC_BT2020_NCL:
+    case AVCOL_SPC_BT2020_CL:
+      return {0.2627f, 0.0593f};
+    case AVCOL_SPC_BT470BG:
+    case AVCOL_SPC_SMPTE170M:
+    case AVCOL_SPC_SMPTE240M:
+      return {0.299f, 0.114f};
+    default:
+      return frame->width >= 1280 || frame->height > 576
+        ? ColorCoefficients{0.2126f, 0.0722f}
+        : ColorCoefficients{0.299f, 0.114f};
+  }
+}
+
+void setYuvCoefficients(float *r, float *g, float *b, const AVFrame *frame) {
+  const ColorCoefficients coeff = colorCoefficientsForFrame(frame);
+  const float kg = 1.0f - coeff.kr - coeff.kb;
+  const bool fullRange = frame && frame->color_range == AVCOL_RANGE_JPEG;
+  const float yScale = fullRange ? 1.0f : 255.0f / 219.0f;
+  const float cScale = fullRange ? 1.0f : 255.0f / 224.0f;
+  const float yOffset = fullRange ? 0.0f : 16.0f / 255.0f;
+  const float uOffset = 0.5f;
+  const float vOffset = 0.5f;
+  const float rV = cScale * (2.0f - 2.0f * coeff.kr);
+  const float bU = cScale * (2.0f - 2.0f * coeff.kb);
+  const float gU = cScale * (coeff.kb * (2.0f - 2.0f * coeff.kb) / kg);
+  const float gV = cScale * (coeff.kr * (2.0f - 2.0f * coeff.kr) / kg);
+
+  r[0] = yScale;
+  r[1] = 0.0f;
+  r[2] = rV;
+  r[3] = -yScale * yOffset - rV * vOffset;
+
+  g[0] = yScale;
+  g[1] = -gU;
+  g[2] = -gV;
+  g[3] = -yScale * yOffset + gU * uOffset + gV * vOffset;
+
+  b[0] = yScale;
+  b[1] = bU;
+  b[2] = 0.0f;
+  b[3] = -yScale * yOffset - bU * uOffset;
+}
+
 std::array<uint8_t, 7> glyph(char ch) {
   if (ch >= 'a' && ch <= 'z') ch = static_cast<char>(ch - 'a' + 'A');
 
@@ -267,12 +326,21 @@ struct Deko3dVideoRenderer::SwitchState {
     float yScaleY = 1.0f;
     float uvScaleX = 1.0f;
     float uvScaleY = 1.0f;
+    float coeffR[4] = {1.16438356f, 0.0f, 1.59602678f, -0.8707854f};
+    float coeffG[4] = {1.16438356f, -0.39176229f, -0.81296764f, 0.529593f};
+    float coeffB[4] = {1.16438356f, 2.01723214f, 0.0f, -1.08139f};
   };
 
   struct ExternalFrameMem {
     void *addr = nullptr;
     uint32_t size = 0;
     dk::MemBlock mem;
+  };
+
+  struct FrameSlot {
+    dk::Fence fence;
+    bool submitted = false;
+    AVFrame *retainedFrame = nullptr;
   };
 
   dk::Device device;
@@ -298,9 +366,36 @@ struct Deko3dVideoRenderer::SwitchState {
   uint32_t framebufferSize = 0;
   uint32_t codeOffset = 0;
   VideoParams videoParams;
+  dk::SamplerDescriptor samplerDescriptor;
+  dk::RasterizerState rasterizerState;
+  dk::ColorState videoColorState;
+  dk::ColorWriteState colorWriteState;
+  dk::BlendState overlayBlendState;
+  dk::ColorState overlayColorState;
   bool overlayReady = false;
+  uint32_t nextFrameSlot = 0;
 
   std::vector<ExternalFrameMem> externalFrameMems;
+  std::array<FrameSlot, FrameInFlightCount> frameSlots;
+
+  void waitForFrameSlot(FrameSlot &slot) {
+    if (!slot.submitted) {
+      return;
+    }
+
+    slot.fence.wait();
+    slot.submitted = false;
+
+    if (slot.retainedFrame) {
+      av_frame_free(&slot.retainedFrame);
+    }
+  }
+
+  void waitForInFlightFrames() {
+    for (FrameSlot &slot : frameSlots) {
+      waitForFrameSlot(slot);
+    }
+  }
 
   dk::MemBlock frameMemFor(void *addr, uint32_t size) {
     for (const ExternalFrameMem &item : externalFrameMems) {
@@ -436,13 +531,13 @@ bool Deko3dVideoRenderer::initialize() {
   switchState_->codeMem = dk::MemBlockMaker{switchState_->device, CodeMemSize}
     .setFlags(DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached | DkMemBlockFlags_Code)
     .create();
-  switchState_->cmdMem = dk::MemBlockMaker{switchState_->device, CmdMemSize}
+  switchState_->cmdMem = dk::MemBlockMaker{switchState_->device, CmdMemSize * FrameInFlightCount}
     .setFlags(DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached)
     .create();
-  switchState_->descriptorMem = dk::MemBlockMaker{switchState_->device, DescriptorMemSize}
+  switchState_->descriptorMem = dk::MemBlockMaker{switchState_->device, DescriptorMemSize * FrameInFlightCount}
     .setFlags(DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached)
     .create();
-  switchState_->uniformMem = dk::MemBlockMaker{switchState_->device, UniformMemSize}
+  switchState_->uniformMem = dk::MemBlockMaker{switchState_->device, UniformMemSize * FrameInFlightCount}
     .setFlags(DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached)
     .create();
 
@@ -496,7 +591,11 @@ bool Deko3dVideoRenderer::initialize() {
     return false;
   }
 
-  switchState_->cmdBuf.addMemory(switchState_->cmdMem, 0, CmdMemSize);
+  dk::Sampler sampler;
+  sampler.setFilter(DkFilter_Linear, DkFilter_Linear);
+  sampler.setWrapMode(DkWrapMode_ClampToEdge, DkWrapMode_ClampToEdge, DkWrapMode_ClampToEdge);
+  switchState_->samplerDescriptor.initialize(sampler);
+  switchState_->overlayColorState.setBlendEnable(0, true);
 
   initialized_ = true;
   std::printf("[KBORE][DEKO3D] initialized NVTEGRA renderer\n");
@@ -510,6 +609,8 @@ void Deko3dVideoRenderer::shutdown() {
     if (switchState_->queue) {
       switchState_->queue.waitIdle();
     }
+
+    switchState_->waitForInFlightFrames();
 
     for (auto &item : switchState_->externalFrameMems) {
       if (item.mem) {
@@ -675,51 +776,61 @@ bool Deko3dVideoRenderer::renderFrame(const AVFrame *frame) {
   yDescriptor.initialize(yView, false, false);
   uvDescriptor.initialize(uvView, false, false);
 
-  dk::Sampler sampler;
-  sampler.setFilter(DkFilter_Linear, DkFilter_Linear);
-  sampler.setWrapMode(DkWrapMode_ClampToEdge, DkWrapMode_ClampToEdge, DkWrapMode_ClampToEdge);
-
-  dk::SamplerDescriptor samplerDescriptor;
-  samplerDescriptor.initialize(sampler);
-
   switchState_->videoParams.yScaleX = static_cast<float>(visibleYWidth) / static_cast<float>(yWidth);
   switchState_->videoParams.yScaleY = static_cast<float>(visibleYHeight) / static_cast<float>(yHeight);
   switchState_->videoParams.uvScaleX = static_cast<float>(visibleUvWidth) / static_cast<float>(uvWidth);
   switchState_->videoParams.uvScaleY = static_cast<float>(visibleUvHeight) / static_cast<float>(uvHeight);
+  setYuvCoefficients(
+    switchState_->videoParams.coeffR,
+    switchState_->videoParams.coeffG,
+    switchState_->videoParams.coeffB,
+    frame
+  );
+
+  SwitchState::FrameSlot &frameSlot = switchState_->frameSlots[switchState_->nextFrameSlot];
+  switchState_->waitForFrameSlot(frameSlot);
 
   switchState_->cmdBuf.clear();
-  switchState_->cmdBuf.addMemory(switchState_->cmdMem, 0, CmdMemSize);
+  switchState_->cmdBuf.addMemory(
+    switchState_->cmdMem,
+    switchState_->nextFrameSlot * CmdMemSize,
+    CmdMemSize
+  );
 
   constexpr uint32_t imageDescriptorOffset = 0;
   constexpr uint32_t overlayDescriptorOffset = 2 * sizeof(DkImageDescriptor);
   constexpr uint32_t samplerDescriptorOffset = 3 * sizeof(DkImageDescriptor);
+  const DkGpuAddr descriptorBase =
+    switchState_->descriptorMem.getGpuAddr() + switchState_->nextFrameSlot * DescriptorMemSize;
+  const DkGpuAddr uniformBase =
+    switchState_->uniformMem.getGpuAddr() + switchState_->nextFrameSlot * UniformMemSize;
 
   switchState_->cmdBuf.pushData(
-    switchState_->descriptorMem.getGpuAddr() + imageDescriptorOffset,
+    descriptorBase + imageDescriptorOffset,
     &yDescriptor,
     sizeof(yDescriptor)
   );
   switchState_->cmdBuf.pushData(
-    switchState_->descriptorMem.getGpuAddr() + imageDescriptorOffset + sizeof(DkImageDescriptor),
+    descriptorBase + imageDescriptorOffset + sizeof(DkImageDescriptor),
     &uvDescriptor,
     sizeof(uvDescriptor)
   );
   switchState_->cmdBuf.pushData(
-    switchState_->descriptorMem.getGpuAddr() + samplerDescriptorOffset,
-    &samplerDescriptor,
-    sizeof(samplerDescriptor)
+    descriptorBase + samplerDescriptorOffset,
+    &switchState_->samplerDescriptor,
+    sizeof(switchState_->samplerDescriptor)
   );
 
   switchState_->cmdBuf.bindImageDescriptorSet(
-    switchState_->descriptorMem.getGpuAddr() + imageDescriptorOffset,
+    descriptorBase + imageDescriptorOffset,
     3
   );
   switchState_->cmdBuf.bindSamplerDescriptorSet(
-    switchState_->descriptorMem.getGpuAddr() + samplerDescriptorOffset,
+    descriptorBase + samplerDescriptorOffset,
     1
   );
   switchState_->cmdBuf.pushConstants(
-    switchState_->uniformMem.getGpuAddr(),
+    uniformBase,
     UniformMemSize,
     0,
     sizeof(switchState_->videoParams),
@@ -728,7 +839,13 @@ bool Deko3dVideoRenderer::renderFrame(const AVFrame *frame) {
   switchState_->cmdBuf.bindUniformBuffer(
     DkStage_Vertex,
     0,
-    switchState_->uniformMem.getGpuAddr(),
+    uniformBase,
+    UniformMemSize
+  );
+  switchState_->cmdBuf.bindUniformBuffer(
+    DkStage_Fragment,
+    0,
+    uniformBase,
     UniformMemSize
   );
 
@@ -752,18 +869,14 @@ bool Deko3dVideoRenderer::renderFrame(const AVFrame *frame) {
     dkMakeTextureHandle(1, 0)
   };
 
-  dk::RasterizerState rasterizerState;
-  dk::ColorState colorState;
-  dk::ColorWriteState colorWriteState;
-
   switchState_->cmdBuf.bindRenderTargets(&framebufferView);
   switchState_->cmdBuf.setViewports(0, viewport);
   switchState_->cmdBuf.setScissors(0, scissor);
   switchState_->cmdBuf.clearColor(0, DkColorMask_RGBA, 0.0f, 0.0f, 0.0f, 1.0f);
   switchState_->cmdBuf.bindShaders(DkStageFlag_GraphicsMask, shaders);
-  switchState_->cmdBuf.bindRasterizerState(rasterizerState);
-  switchState_->cmdBuf.bindColorState(colorState);
-  switchState_->cmdBuf.bindColorWriteState(colorWriteState);
+  switchState_->cmdBuf.bindRasterizerState(switchState_->rasterizerState);
+  switchState_->cmdBuf.bindColorState(switchState_->videoColorState);
+  switchState_->cmdBuf.bindColorWriteState(switchState_->colorWriteState);
   switchState_->cmdBuf.bindTextures(DkStage_Fragment, 0, textureHandles);
   switchState_->cmdBuf.draw(DkPrimitive_Triangles, 3, 1, 0, 0);
 
@@ -773,6 +886,7 @@ bool Deko3dVideoRenderer::renderFrame(const AVFrame *frame) {
     }
 
     if (overlayDirty_) {
+      switchState_->waitForInFlightFrames();
       buildOverlayBitmap(
         static_cast<uint8_t *>(switchState_->overlayMem.getCpuAddr()),
         overlayTitle_,
@@ -789,7 +903,7 @@ bool Deko3dVideoRenderer::renderFrame(const AVFrame *frame) {
     overlayDescriptor.initialize(overlayView, false, false);
 
     switchState_->cmdBuf.pushData(
-      switchState_->descriptorMem.getGpuAddr() + overlayDescriptorOffset,
+      descriptorBase + overlayDescriptorOffset,
       &overlayDescriptor,
       sizeof(overlayDescriptor)
     );
@@ -801,8 +915,6 @@ bool Deko3dVideoRenderer::renderFrame(const AVFrame *frame) {
     std::array<DkResHandle, 1> overlayHandle = {
       dkMakeTextureHandle(2, 0)
     };
-    dk::ColorState overlayColorState;
-    dk::BlendState overlayBlendState;
     DkViewport overlayViewport{
       0.0f,
       0.0f,
@@ -820,17 +932,24 @@ bool Deko3dVideoRenderer::renderFrame(const AVFrame *frame) {
 
     switchState_->cmdBuf.setViewports(0, overlayViewport);
     switchState_->cmdBuf.setScissors(0, overlayScissor);
-    overlayColorState.setBlendEnable(0, true);
     switchState_->cmdBuf.bindShaders(DkStageFlag_GraphicsMask, overlayShaders);
-    switchState_->cmdBuf.bindColorState(overlayColorState);
-    switchState_->cmdBuf.bindBlendStates(0, overlayBlendState);
+    switchState_->cmdBuf.bindColorState(switchState_->overlayColorState);
+    switchState_->cmdBuf.bindBlendStates(0, switchState_->overlayBlendState);
     switchState_->cmdBuf.bindTextures(DkStage_Fragment, 0, overlayHandle);
     switchState_->cmdBuf.draw(DkPrimitive_Triangles, 6, 1, 0, 0);
   }
 
+  frameSlot.retainedFrame = av_frame_clone(frame);
+  if (!frameSlot.retainedFrame) {
+    error_ = "could not retain NVTEGRA frame for asynchronous Deko3D rendering.";
+    return false;
+  }
+
+  switchState_->cmdBuf.signalFence(frameSlot.fence);
   switchState_->queue.submitCommands(switchState_->cmdBuf.finishList());
-  switchState_->queue.waitIdle();
   switchState_->queue.presentImage(switchState_->swapchain, slot);
+  frameSlot.submitted = true;
+  switchState_->nextFrameSlot = (switchState_->nextFrameSlot + 1) % FrameInFlightCount;
 
   error_.clear();
   return true;
