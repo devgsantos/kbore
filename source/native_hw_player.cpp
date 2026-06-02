@@ -136,6 +136,18 @@ void NativeHwPlayerBackend::syncClockFromLatestFrame() {
     lastPtsMs_ += fallbackFrameIntervalMs_;
   }
 
+  if (nativeRendererReady_ && nativeRenderer_) {
+    const long long delay = playbackDelayMs(now);
+
+    if (delay > 120) {
+      const int reduction = std::min(
+        std::max(1, interval / 4),
+        std::max(1, static_cast<int>((delay - 120) / 100))
+      );
+      interval = std::max(8, interval - reduction);
+    }
+  }
+
   currentFrameIntervalMs_ = interval;
   lastFrameWallMs_ = now;
   nextFrameDueMs_ = now + currentFrameIntervalMs_;
@@ -252,7 +264,7 @@ int NativeHwPlayerBackend::maxDropsPerUpdate() const {
 
 int NativeHwPlayerBackend::dropDelayThresholdMs() const {
   if (nativeRendererReady_ && nativeRenderer_) {
-    return 500;
+    return 1000;
   }
 
   const int interval = cpuPresentationIntervalMs();
