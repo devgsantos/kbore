@@ -14,12 +14,15 @@
 #include <condition_variable>
 #include <map>
 #include <mutex>
+#include <cstddef>
 #include <set>
 #include <string>
 #include <thread>
 #include <memory>
 #include <utility>
 #include <vector>
+#include <mutex>
+#include <thread>
 
 namespace nstv {
 
@@ -44,6 +47,11 @@ struct AppState {
   std::map<std::string, EpgPage> epgByChannel;
   std::string currentEpgKey;
   bool currentEpgAvailable = false;
+
+  // Dynamic tree navigation. When manifest.nodes is available, the dashboard
+  // behaves as a three-column tree browser:
+  //   roots -> current folder children -> selected child preview/items.
+  std::vector<int> nodePath;
 
   int selectedType = 0;
   int selectedCategory = 0;
@@ -85,6 +93,7 @@ private:
   struct EpgResult {
     std::string manifestId;
     std::string key;
+    Channel channel;
     EpgPage page;
   };
 
@@ -132,6 +141,13 @@ private:
   bool loadCachedPlaylist(const PlaylistConfig &playlist);
   void activatePlaylist(int index);
   void importPlaylist(const PlaylistConfig &playlist);
+  void startPlaylistLoad(const PlaylistConfig &playlist, bool forceRefresh = false);
+  void updatePlaylistLoad();
+  bool playlistLoadActive() const;
+
+  void updateCacheSave();
+  bool cacheSaveActive() const;
+
   void addM3uPlaylist();
   void addXtreamPlaylist();
   void deletePlaylist(int index);
@@ -155,6 +171,8 @@ private:
   void epgWorkerLoop();
   void drainFinishedEpg();
   std::string channelEpgKey(const Channel &channel) const;
+  std::vector<std::string> channelEpgKeys(const Channel &channel) const;
+  const EpgPage *cachedEpgForChannel(const Channel &channel) const;
   std::string epgLineForChannel(const Channel &channel) const;
   std::string epgNowNextLine(const Channel &channel) const;
 
@@ -162,6 +180,26 @@ private:
   const TypeGroup *selectedTypeGroup() const;
   const Category *selectedCategoryPtr() const;
   const Channel *selectedChannelPtr() const;
+
+  bool usingNodeTree() const;
+  const MediaNode *selectedRootNode() const;
+  MediaNode *selectedRootNode();
+  const MediaNode *nodeAtPath(const MediaNode *root, const std::vector<int> &path) const;
+  MediaNode *nodeAtPath(MediaNode *root, const std::vector<int> &path);
+  const MediaNode *currentNodeParent() const;
+  MediaNode *currentNodeParent();
+  const MediaNode *selectedCurrentNode() const;
+  MediaNode *selectedCurrentNode();
+  const MediaNode *selectedPreviewNode() const;
+  MediaNode *selectedPreviewNode();
+  std::vector<const MediaNode *> currentNodeChildren() const;
+  std::vector<const MediaNode *> previewNodeChildren() const;
+  bool currentNodeChildrenAreItems() const;
+  bool ensureNodeChildrenLoaded(MediaNode &node);
+  Channel channelFromNode(const MediaNode &node) const;
+  void enterNode(const MediaNode &node, int childIndex);
+  void playNode(const MediaNode &node);
+  std::string breadcrumbText() const;
 
   template <typename T, typename LabelFn>
   std::vector<std::string> buildWindowRows(
@@ -201,6 +239,27 @@ private:
   std::set<std::string> epgQueuedKeys_;
   std::vector<EpgResult> epgFinished_;
   std::atomic<bool> epgStop_{false};
+
+  std::thread playlistLoadThread_;
+  mutable std::mutex playlistLoadMutex_;
+  bool playlistLoadActive_ = false;
+  bool playlistLoadDone_ = false;
+  bool playlistLoadSuccess_ = false;
+  bool playlistLoadForceRefresh_ = false;
+  PlaylistConfig playlistLoadPlaylist_;
+  Manifest playlistLoadManifest_;
+  std::string playlistLoadMessage_;
+  std::string playlistLoadError_;
+
+  std::thread cacheSaveThread_;
+  mutable std::mutex cacheSaveMutex_;
+  bool cacheSaveActive_ = false;
+  bool cacheSaveDone_ = false;
+  bool cacheSaveSuccess_ = false;
+  std::string cacheSavePlaylistId_;
+  std::string cacheSaveError_;
+  std::size_t cacheSaveWritten_ = 0;
+  std::size_t cacheSaveTotal_ = 0;
 
   bool splashVisible_ = true;
   long long splashStartedAtMs_ = 0;

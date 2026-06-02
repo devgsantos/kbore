@@ -23,6 +23,32 @@ struct TypeGroup {
   std::vector<Category> categories;
 };
 
+struct MediaNode {
+  std::string id;
+  std::string title;
+  std::string name;
+  std::string type;
+  std::string kind;
+  std::string url;
+  std::string logo;
+  std::string group;
+  std::string groupId;
+
+  // EPG matching metadata propagated by the parser for node-tree manifests.
+  // These fields let the app request EPG for focused live items without
+  // depending on the legacy loadedChannels list.
+  std::string tvgId;
+  std::string tvgName;
+  std::string streamId;
+
+  int totalItems = 0;
+  int totalChannels = 0;
+  int childCount = 0;
+  bool hasChildren = false;
+  bool playable = false;
+  std::vector<MediaNode> children;
+};
+
 struct Channel {
   std::string id;
   std::string name;
@@ -65,7 +91,9 @@ struct Manifest {
   std::string source;
   Provider provider = Provider::Local;
   int totalChannels = 0;
+  int totalItems = 0;
   std::vector<TypeGroup> types;
+  std::vector<MediaNode> nodes;
 };
 
 struct ChannelPage {
@@ -73,6 +101,15 @@ struct ChannelPage {
   int page = 1;
   int pageSize = 20;
   int totalChannels = 0;
+  int totalPages = 1;
+  bool hasNextPage = false;
+};
+
+struct NodeChildrenPage {
+  std::vector<MediaNode> items;
+  int page = 1;
+  int pageSize = 100;
+  int totalItems = 0;
   int totalPages = 1;
   bool hasNextPage = false;
 };
