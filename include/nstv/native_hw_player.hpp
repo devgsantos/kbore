@@ -85,6 +85,8 @@ private:
   int cpuFrameCostAvgMs_ = 0;
 
   int decodedFrames_ = 0;
+  int droppedFrames_ = 0;
+  long long lastDropLogWallMs_ = 0;
 
   void resetClock();
   void syncClockFromLatestFrame();

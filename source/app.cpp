@@ -1,4 +1,5 @@
 #include "nstv/app.hpp"
+#include "nstv/log.hpp"
 #include <algorithm>
 #include <cctype>
 #include <iostream>
@@ -2337,16 +2338,28 @@ void App::playSelectedChannel() {
     player_ = createPlayerBackend();
   }
 
-  player_->setNativeVideoAllowed(false);
+  gfx_.suspendForNativeVideo();
+  player_->setNativeVideoAllowed(true);
   player_->setOverlayVisible(true);
 
   if (player_->open(channel->url)) {
+    if (!player_->nativeVideoActive() && gfx_.isSuspendedForNativeVideo()) {
+      gfx_.resumeAfterNativeVideo();
+    }
+
     state_.message = "Playing: " + channel->name;
     state_.playerStarted = true;
     state_.playerLoading = false;
     state_.playerLoadFailed = false;
     state_.playerErrorMessage.clear();
   } else {
+    logLinef(
+      "[KBORE][PLAYBACK] failed to load %s stream name='%s' error='%s' url=%s",
+      toString(channel->type).c_str(),
+      channel->name.c_str(),
+      player_->error().c_str(),
+      channel->url.c_str()
+    );
     state_.message = "Failed to load video";
     state_.playerStarted = false;
     state_.playerLoading = false;
@@ -3444,12 +3457,9 @@ void App::renderPlayerGraphic() {
     if (player_->nativeVideoActive() || gfx_.isSuspendedForNativeVideo()) {
       player_->setOverlayVisible(overlayRequested);
       player_->setNativeVideoAllowed(true);
-    } else if (overlayRequested) {
-      player_->setOverlayVisible(false);
-      player_->setNativeVideoAllowed(false);
     } else {
       gfx_.suspendForNativeVideo();
-      player_->setOverlayVisible(false);
+      player_->setOverlayVisible(overlayRequested);
       player_->setNativeVideoAllowed(true);
     }
 

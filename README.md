@@ -443,6 +443,12 @@ Useful log filters:
 [KBORE][DEKO3D]
 ```
 
+On Switch, runtime diagnostics are appended to:
+
+```text
+sdmc:/switch/kbore/kbore.log
+```
+
 ---
 
 ## Common Build Issues
