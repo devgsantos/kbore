@@ -81,6 +81,20 @@ bool isAllDigits(const std::string &value) {
   });
 }
 
+std::string jsonStringOrNumber(const Json &value, const std::string &fallback = "") {
+  if (value.isString()) {
+    return value.asString("");
+  }
+
+  if (value.isNumber()) {
+    char buffer[64] = {};
+    std::snprintf(buffer, sizeof(buffer), "%.0f", value.asNumber(0));
+    return buffer;
+  }
+
+  return fallback;
+}
+
 bool isGzipEncoding(const std::string &encoding) {
   std::string lower;
   lower.reserve(encoding.size());
@@ -655,7 +669,18 @@ EpgPage ParserApiClient::loadEpgPrograms(
   );
 
   Json json = requestJson(endpoint(path), body.str());
-  return epgPageFromJson(json);
+  EpgPage pageResult = epgPageFromJson(json);
+
+  if (provider == Provider::Xtream && !channel.streamId.empty() && pageResult.programs.empty()) {
+    std::printf(
+      "[KBORE] Xtream short EPG returned no programs for streamId='%s'; trying XMLTV fallback\n",
+      channel.streamId.c_str()
+    );
+    Json fallbackJson = requestJson(endpoint("/api/xtream/epg/programs"), body.str());
+    pageResult = epgPageFromJson(fallbackJson);
+  }
+
+  return pageResult;
 }
 
 EpgPage ParserApiClient::epgPageFromJson(const Json &json) const {
@@ -666,30 +691,54 @@ EpgPage ParserApiClient::epgPageFromJson(const Json &json) const {
   EpgPage page;
   page.page = root["page"].asInt(json["page"].asInt(1));
   page.pageSize = root["pageSize"].asInt(json["pageSize"].asInt(12));
-  page.totalPrograms = root["totalPrograms"].asInt(root["total"].asInt(json["totalPrograms"].asInt(json["total"].asInt(0))));
+  page.totalPrograms = root["totalPrograms"].asInt(
+    root["total"].asInt(
+      root["totalItems"].asInt(
+        json["totalPrograms"].asInt(json["total"].asInt(json["totalItems"].asInt(0)))
+      )
+    )
+  );
   page.totalPages = root["totalPages"].asInt(json["totalPages"].asInt(1));
   page.hasNextPage = root["hasNextPage"].asBool(json["hasNextPage"].asBool(page.page < page.totalPages));
 
   const Json &items = root["programs"].isArray()
     ? root["programs"]
-    : (root["epg_listings"].isArray() ? root["epg_listings"] : (root["items"].isArray() ? root["items"] : json["programs"]));
+    : (root["programmes"].isArray()
+      ? root["programmes"]
+      : (root["epg_listings"].isArray()
+        ? root["epg_listings"]
+        : (root["epgListings"].isArray()
+          ? root["epgListings"]
+          : (root["items"].isArray()
+            ? root["items"]
+            : (root["results"].isArray()
+              ? root["results"]
+              : (json["data"].isArray() ? json["data"] : json["programs"]))))));
 
   if (items.isArray()) {
     for (const Json &item : items.asArray()) {
       EpgProgram program;
-      program.channelId = item["channelId"].asString(item["channel_id"].asString(item["id"].asString("")));
-      program.channelName = item["channelName"].asString(item["channel"].asString(""));
-      program.title = item["title"].asString(item["name"].asString("Program"));
-      program.description = item["description"].asString(item["desc"].asString(""));
-      program.start = item["start"].asString(item["start_timestamp"].asString(item["startTime"].asString("")));
-      program.stop = item["stop"].asString(item["end"].asString(item["end_timestamp"].asString(item["endTime"].asString(""))));
-
-      if (program.start.empty() && item["start_timestamp"].isNumber()) {
-        program.start = std::to_string(item["start_timestamp"].asInt(0));
-      }
-      if (program.stop.empty() && item["stop_timestamp"].isNumber()) {
-        program.stop = std::to_string(item["stop_timestamp"].asInt(0));
-      }
+      program.channelId = jsonStringOrNumber(
+        item["channelId"],
+        jsonStringOrNumber(item["channel"], jsonStringOrNumber(item["channel_id"], jsonStringOrNumber(item["stream_id"], "")))
+      );
+      program.channelName = jsonStringOrNumber(item["channelName"], jsonStringOrNumber(item["channel_name"], ""));
+      program.title = jsonStringOrNumber(item["title"], jsonStringOrNumber(item["name"], "Program"));
+      program.description = jsonStringOrNumber(item["description"], jsonStringOrNumber(item["desc"], ""));
+      program.start = jsonStringOrNumber(
+        item["start"],
+        jsonStringOrNumber(item["start_timestamp"], jsonStringOrNumber(item["startTime"], jsonStringOrNumber(item["rawStart"], "")))
+      );
+      program.stop = jsonStringOrNumber(
+        item["stop"],
+        jsonStringOrNumber(
+          item["end"],
+          jsonStringOrNumber(
+            item["stop_timestamp"],
+            jsonStringOrNumber(item["end_timestamp"], jsonStringOrNumber(item["endTime"], jsonStringOrNumber(item["rawStop"], "")))
+          )
+        )
+      );
 
       page.programs.push_back(program);
     }
@@ -697,6 +746,25 @@ EpgPage ParserApiClient::epgPageFromJson(const Json &json) const {
 
   if (page.totalPrograms == 0) {
     page.totalPrograms = static_cast<int>(page.programs.size());
+  }
+
+  std::printf(
+    "[KBORE] parsed EPG response: programs=%zu total=%d page=%d/%d\n",
+    page.programs.size(),
+    page.totalPrograms,
+    page.page,
+    page.totalPages
+  );
+
+  if (!page.programs.empty()) {
+    const EpgProgram &first = page.programs.front();
+    std::printf(
+      "[KBORE] first EPG program: channelId='%s' title='%s' start='%s' stop='%s'\n",
+      first.channelId.c_str(),
+      first.title.c_str(),
+      first.start.c_str(),
+      first.stop.c_str()
+    );
   }
 
   return page;

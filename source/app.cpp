@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <mutex>
 #include <thread>
+#include <limits>
 
 namespace nstv {
 
@@ -268,12 +269,17 @@ int currentProgramIndex(const EpgPage &page) {
 
   const std::time_t now = std::time(nullptr);
   int nextIndex = -1;
+  int nearestIndex = -1;
+  long long nearestDistance = std::numeric_limits<long long>::max();
+  bool anyTimed = false;
 
   for (std::size_t i = 0; i < page.programs.size(); ++i) {
     std::time_t start{};
     std::time_t stop{};
     const bool hasStart = parseEpgTime(page.programs[i].start, start);
     const bool hasStop = parseEpgTime(page.programs[i].stop, stop);
+
+    anyTimed = anyTimed || hasStart || hasStop;
 
     if (hasStart && hasStop && now >= start && now < stop) {
       return static_cast<int>(i);
@@ -282,18 +288,29 @@ int currentProgramIndex(const EpgPage &page) {
     if (hasStart && start > now && nextIndex < 0) {
       nextIndex = static_cast<int>(i);
     }
+
+    if (hasStart) {
+      const long long distance = std::llabs(static_cast<long long>(start) - static_cast<long long>(now));
+      if (distance < nearestDistance) {
+        nearestDistance = distance;
+        nearestIndex = static_cast<int>(i);
+      }
+    }
   }
 
   if (nextIndex >= 0) {
     return nextIndex;
   }
 
-  const bool anyTimed = std::any_of(page.programs.begin(), page.programs.end(), [](const EpgProgram &program) {
-    std::time_t ignored{};
-    return parseEpgTime(program.start, ignored) || parseEpgTime(program.stop, ignored);
-  });
+  // If the parser returned programmes but none overlaps the console clock,
+  // still render the nearest item instead of showing EPG unavailable. This is
+  // important on Switch when the system clock/timezone is off or the provider
+  // returns a shifted XMLTV window.
+  if (nearestIndex >= 0) {
+    return nearestIndex;
+  }
 
-  return anyTimed ? -1 : 0;
+  return anyTimed ? 0 : 0;
 }
 
 std::string formatEpgRange(const EpgProgram &program) {
