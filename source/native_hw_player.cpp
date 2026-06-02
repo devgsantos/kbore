@@ -230,7 +230,7 @@ int NativeHwPlayerBackend::cpuPresentationIntervalMs() const {
 
 int NativeHwPlayerBackend::maxDropsPerUpdate() const {
   if (nativeRendererReady_ && nativeRenderer_) {
-    return 2;
+    return 1;
   }
 
   const int interval = cpuPresentationIntervalMs();
@@ -252,7 +252,7 @@ int NativeHwPlayerBackend::maxDropsPerUpdate() const {
 
 int NativeHwPlayerBackend::dropDelayThresholdMs() const {
   if (nativeRendererReady_ && nativeRenderer_) {
-    return 250;
+    return 500;
   }
 
   const int interval = cpuPresentationIntervalMs();
