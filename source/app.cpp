@@ -1914,10 +1914,38 @@ void App::drainFinishedChannelLoads() {
 
 
 std::string App::channelEpgKey(const Channel &channel) const {
-  if (!channel.tvgId.empty()) return channel.tvgId;
-  if (!channel.streamId.empty()) return channel.streamId;
-  if (!channel.id.empty()) return channel.id;
-  return channel.name;
+  const std::vector<std::string> keys = channelEpgKeys(channel);
+  return keys.empty() ? "" : keys.front();
+}
+
+std::vector<std::string> App::channelEpgKeys(const Channel &channel) const {
+  std::vector<std::string> keys;
+  auto addKey = [&keys](const std::string &key) {
+    if (key.empty()) {
+      return;
+    }
+    if (std::find(keys.begin(), keys.end(), key) == keys.end()) {
+      keys.push_back(key);
+    }
+  };
+
+  addKey(channel.tvgId);
+  addKey(channel.tvgName);
+  addKey(channel.streamId);
+  addKey(channel.id);
+  addKey(channel.name);
+  return keys;
+}
+
+const EpgPage *App::cachedEpgForChannel(const Channel &channel) const {
+  for (const std::string &key : channelEpgKeys(channel)) {
+    auto it = state_.epgByChannel.find(key);
+    if (it != state_.epgByChannel.end()) {
+      return &it->second;
+    }
+  }
+
+  return nullptr;
 }
 
 void App::loadSelectedEpg(bool force, bool fetchRemote) {
@@ -1944,9 +1972,9 @@ void App::loadSelectedEpg(bool force, bool fetchRemote) {
 
   state_.currentEpgKey = key;
 
-  auto memoryIt = state_.epgByChannel.find(key);
-  if (!force && memoryIt != state_.epgByChannel.end()) {
-    state_.currentEpgAvailable = currentProgramIndex(memoryIt->second) >= 0;
+  const EpgPage *memoryPage = cachedEpgForChannel(*channel);
+  if (!force && memoryPage) {
+    state_.currentEpgAvailable = currentProgramIndex(*memoryPage) >= 0;
     if (state_.currentEpgAvailable || !fetchRemote) {
       return;
     }
@@ -1954,7 +1982,9 @@ void App::loadSelectedEpg(bool force, bool fetchRemote) {
 
   EpgPage cached;
   if (!force && loadEpgPage(state_.manifest.id, *channel, cached)) {
-    state_.epgByChannel[key] = cached;
+    for (const std::string &alias : channelEpgKeys(*channel)) {
+      state_.epgByChannel[alias] = cached;
+    }
     state_.currentEpgAvailable = currentProgramIndex(cached) >= 0;
     if (state_.currentEpgAvailable || !fetchRemote) {
       return;
@@ -1971,12 +2001,16 @@ void App::loadSelectedEpg(bool force, bool fetchRemote) {
     const std::string manualEpgUrl = playlist && playlist->provider == Provider::M3u ? playlist->epgUrl : "";
     std::printf("[KBORE] loading selected EPG channel='%s' provider='%s' key='%s' remote=%s\n", channel->name.c_str(), toString(state_.manifest.provider).c_str(), key.c_str(), fetchRemote ? "yes" : "no");
     EpgPage epg = api_.loadEpgPrograms(state_.manifest.source, state_.manifest.provider, *channel, 1, 12, manualEpgUrl);
-    state_.epgByChannel[key] = epg;
+    for (const std::string &alias : channelEpgKeys(*channel)) {
+      state_.epgByChannel[alias] = epg;
+    }
     state_.currentEpgAvailable = !epg.programs.empty();
     saveEpgPage(state_.manifest.id, *channel, epg);
   } catch (const std::exception &ex) {
     std::printf("[KBORE] loadSelectedEpg failed: %s\n", ex.what());
-    state_.epgByChannel[key] = EpgPage{};
+    for (const std::string &alias : channelEpgKeys(*channel)) {
+      state_.epgByChannel[alias] = EpgPage{};
+    }
     state_.currentEpgAvailable = false;
   }
 }
@@ -1994,14 +2028,16 @@ void App::loadEpgForChannels(const std::vector<Channel> &channels) {
     }
 
     const std::string key = channelEpgKey(channel);
-    auto memoryIt = state_.epgByChannel.find(key);
-    if (memoryIt != state_.epgByChannel.end() && currentProgramIndex(memoryIt->second) >= 0) {
+    const EpgPage *memoryPage = cachedEpgForChannel(channel);
+    if (memoryPage && currentProgramIndex(*memoryPage) >= 0) {
       continue;
     }
 
     EpgPage cached;
     if (loadEpgPage(state_.manifest.id, channel, cached)) {
-      state_.epgByChannel[key] = cached;
+      for (const std::string &alias : channelEpgKeys(channel)) {
+        state_.epgByChannel[alias] = cached;
+      }
       if (currentProgramIndex(cached) >= 0) {
         continue;
       }
@@ -2175,7 +2211,7 @@ void App::epgWorkerLoop() {
       std::printf("[KBORE] EPG loaded for channel='%s': %zu program(s)\n", job.channel.name.c_str(), epg.programs.size());
 
       std::lock_guard<std::mutex> lock(epgMutex_);
-      epgFinished_.push_back(EpgResult{job.manifestId, job.key, epg});
+      epgFinished_.push_back(EpgResult{job.manifestId, job.key, job.channel, epg});
       epgQueuedKeys_.erase(queuedKey);
     } catch (const std::exception &ex) {
       std::printf("[KBORE] background EPG failed for %s: %s\n", job.channel.name.c_str(), ex.what());
@@ -2198,7 +2234,9 @@ void App::drainFinishedEpg() {
       continue;
     }
 
-    state_.epgByChannel[result.key] = result.page;
+    for (const std::string &alias : channelEpgKeys(result.channel)) {
+      state_.epgByChannel[alias] = result.page;
+    }
 
     if (result.key == state_.currentEpgKey) {
       state_.currentEpgAvailable = currentProgramIndex(result.page) >= 0;
@@ -2212,18 +2250,18 @@ std::string App::epgLineForChannel(const Channel &channel) const {
   }
 
   const std::string key = channelEpgKey(channel);
-  auto it = state_.epgByChannel.find(key);
+  const EpgPage *page = cachedEpgForChannel(channel);
 
-  if (it == state_.epgByChannel.end() || it->second.programs.empty()) {
+  if (!page || page->programs.empty()) {
     return key == state_.currentEpgKey ? "EPG unavailable" : "EPG not loaded";
   }
 
-  const int index = currentProgramIndex(it->second);
+  const int index = currentProgramIndex(*page);
   if (index < 0) {
     return "EPG unavailable";
   }
 
-  const EpgProgram &program = it->second.programs[static_cast<std::size_t>(index)];
+  const EpgProgram &program = page->programs[static_cast<std::size_t>(index)];
   const std::string timeRange = formatEpgRange(program);
 
   if (!timeRange.empty()) {
@@ -2238,14 +2276,13 @@ std::string App::epgNowNextLine(const Channel &channel) const {
     return "EPG is available only for live channels";
   }
 
-  const std::string key = channelEpgKey(channel);
-  auto it = state_.epgByChannel.find(key);
+  const EpgPage *cachedPage = cachedEpgForChannel(channel);
 
-  if (it == state_.epgByChannel.end() || it->second.programs.empty()) {
+  if (!cachedPage || cachedPage->programs.empty()) {
     return "EPG unavailable for this channel";
   }
 
-  const EpgPage &page = it->second;
+  const EpgPage &page = *cachedPage;
   const int nowIndex = currentProgramIndex(page);
   if (nowIndex < 0) {
     return "EPG unavailable for this channel";

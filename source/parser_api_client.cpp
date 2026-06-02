@@ -701,21 +701,11 @@ EpgPage ParserApiClient::epgPageFromJson(const Json &json) const {
   page.totalPages = root["totalPages"].asInt(json["totalPages"].asInt(1));
   page.hasNextPage = root["hasNextPage"].asBool(json["hasNextPage"].asBool(page.page < page.totalPages));
 
-  const Json &items = root["programs"].isArray()
-    ? root["programs"]
-    : (root["programmes"].isArray()
-      ? root["programmes"]
-      : (root["epg_listings"].isArray()
-        ? root["epg_listings"]
-        : (root["epgListings"].isArray()
-          ? root["epgListings"]
-          : (root["items"].isArray()
-            ? root["items"]
-            : (root["results"].isArray()
-              ? root["results"]
-              : (json["data"].isArray() ? json["data"] : json["programs"]))))));
+  auto appendProgramItems = [&page](const Json &items) {
+    if (!items.isArray()) {
+      return;
+    }
 
-  if (items.isArray()) {
     for (const Json &item : items.asArray()) {
       EpgProgram program;
       program.channelId = jsonStringOrNumber(
@@ -742,6 +732,63 @@ EpgPage ParserApiClient::epgPageFromJson(const Json &json) const {
 
       page.programs.push_back(program);
     }
+  };
+
+  auto appendProgramFields = [&appendProgramItems](const Json &container) {
+    if (!container.isObject()) {
+      return;
+    }
+
+    appendProgramItems(container["programs"]);
+    appendProgramItems(container["programmes"]);
+    appendProgramItems(container["epg_listings"]);
+    appendProgramItems(container["epgListings"]);
+    appendProgramItems(container["items"]);
+    appendProgramItems(container["results"]);
+    appendProgramItems(container["events"]);
+    appendProgramItems(container["listings"]);
+  };
+
+  appendProgramFields(root);
+
+  if (page.programs.empty()) {
+    appendProgramFields(json);
+  }
+
+  if (page.programs.empty() && json["data"].isArray()) {
+    appendProgramItems(json["data"]);
+  }
+
+  if (page.programs.empty() && root["data"].isArray()) {
+    appendProgramItems(root["data"]);
+  }
+
+  if (page.programs.empty() && root["raw"].isObject()) {
+    appendProgramFields(root["raw"]);
+  }
+
+  if (page.programs.empty() && json["raw"].isObject()) {
+    appendProgramFields(json["raw"]);
+  }
+
+  auto appendObjectMappedPrograms = [&appendProgramItems, &appendProgramFields](const Json &container) {
+    if (!container.isObject()) {
+      return;
+    }
+
+    for (const auto &entry : container.asObject()) {
+      if (entry.second.isArray()) {
+        appendProgramItems(entry.second);
+      } else if (entry.second.isObject()) {
+        appendProgramFields(entry.second);
+      }
+    }
+  };
+
+  if (page.programs.empty()) {
+    appendObjectMappedPrograms(root["programs"]);
+    appendObjectMappedPrograms(root["programmes"]);
+    appendObjectMappedPrograms(root["epg"]);
   }
 
   if (page.totalPrograms == 0) {

@@ -93,6 +93,7 @@ private:
   struct EpgResult {
     std::string manifestId;
     std::string key;
+    Channel channel;
     EpgPage page;
   };
 
@@ -170,6 +171,8 @@ private:
   void epgWorkerLoop();
   void drainFinishedEpg();
   std::string channelEpgKey(const Channel &channel) const;
+  std::vector<std::string> channelEpgKeys(const Channel &channel) const;
+  const EpgPage *cachedEpgForChannel(const Channel &channel) const;
   std::string epgLineForChannel(const Channel &channel) const;
   std::string epgNowNextLine(const Channel &channel) const;
 
