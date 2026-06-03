@@ -1,4 +1,5 @@
 #include "nstv/native_decoder.hpp"
+#include "nstv/log.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -74,6 +75,8 @@ struct NativeDecoder::Impl {
 
   NativeVideoSurfaceInfo latestNativeSurfaceInfo;
   bool latestHardwareFrameRetained = false;
+  unsigned int nativeSurfaceLogCount = 0;
+  unsigned int retainedHardwareFrameLogCount = 0;
 };
 #endif
 
@@ -463,6 +466,8 @@ void NativeDecoder::resetState() {
   latestFrameInfo_ = NativeFrameInfo{};
   if (impl_) {
     impl_->latestNativeSurfaceInfo = NativeVideoSurfaceInfo{};
+    impl_->nativeSurfaceLogCount = 0;
+    impl_->retainedHardwareFrameLogCount = 0;
   }
 
   firstYuvFrame_ = YuvFrame{};
@@ -1042,11 +1047,22 @@ bool NativeDecoder::decodeAudioPacketToSdl(AVPacket *packet) {
 
 #ifdef NSTV_USE_SDL
     if (impl_->audioDevice != 0 && convertedBytes > 0) {
-      SDL_QueueAudio(
-        impl_->audioDevice,
-        impl_->audioBuffer.data(),
-        static_cast<Uint32>(convertedBytes)
-      );
+      const Uint32 queued = SDL_GetQueuedAudioSize(impl_->audioDevice);
+      const Uint32 bytesPerSample = SDL_AUDIO_BITSIZE(impl_->audioSpec.format) / 8u;
+      const Uint32 bytesPerSecond =
+        static_cast<Uint32>(impl_->audioSpec.freq) *
+        static_cast<Uint32>(impl_->audioSpec.channels) *
+        bytesPerSample;
+      const Uint32 targetMaxQueue = bytesPerSecond * 2u; // ~2 segundos de áudio
+      const bool queueIsFull = queued >= targetMaxQueue;
+
+      if (!queueIsFull) {
+        SDL_QueueAudio(
+          impl_->audioDevice,
+          impl_->audioBuffer.data(),
+          static_cast<Uint32>(convertedBytes)
+        );
+      }
     }
 #endif
 
@@ -1173,10 +1189,14 @@ bool NativeDecoder::decodeNextVideoFrame(
         currentFrameInfo.nativeSurfaceAvailable = impl_->latestNativeSurfaceInfo.valid;
         currentFrameInfo.nativeSurfaceSummary = impl_->latestNativeSurfaceInfo.summary;
 
-        std::printf(
-          "[KBORE][NVTEGRA] %s\n",
-          impl_->latestNativeSurfaceInfo.summary.c_str()
-        );
+        ++impl_->nativeSurfaceLogCount;
+        if (impl_->nativeSurfaceLogCount <= 3 || impl_->nativeSurfaceLogCount % 120 == 0) {
+          logLinef(
+            "[KBORE][NVTEGRA] frame %u: %s",
+            impl_->nativeSurfaceLogCount,
+            impl_->latestNativeSurfaceInfo.summary.c_str()
+          );
+        }
       } else {
         impl_->latestNativeSurfaceInfo = NativeVideoSurfaceInfo{};
       }
@@ -1537,10 +1557,17 @@ bool NativeDecoder::decodeNextHardwareFrame(NativeDemuxer &demuxer) {
 
         impl_->latestHardwareFrameRetained = true;
 
-        std::printf(
-          "[KBORE][NVTEGRA] retained hardware frame without CPU transfer: %s\n",
-          impl_->latestNativeSurfaceInfo.summary.c_str()
-        );
+        ++impl_->retainedHardwareFrameLogCount;
+        if (
+          impl_->retainedHardwareFrameLogCount <= 3 ||
+          impl_->retainedHardwareFrameLogCount % 120 == 0
+        ) {
+          logLinef(
+            "[KBORE][NVTEGRA] retained hardware frame %u without CPU transfer: %s",
+            impl_->retainedHardwareFrameLogCount,
+            impl_->latestNativeSurfaceInfo.summary.c_str()
+          );
+        }
 
         rebuildSummary();
         return true;

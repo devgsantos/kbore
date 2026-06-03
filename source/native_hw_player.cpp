@@ -1,4 +1,5 @@
 #include "nstv/native_hw_player.hpp"
+#include "nstv/log.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -53,6 +54,8 @@ void NativeHwPlayerBackend::resetClock() {
   cpuFrameCostAvgMs_ = 0;
 
   decodedFrames_ = 0;
+  droppedFrames_ = 0;
+  lastDropLogWallMs_ = 0;
 }
 
 void NativeHwPlayerBackend::resetClockToCurrentFrame(long long now) {
@@ -96,9 +99,10 @@ void NativeHwPlayerBackend::syncClockFromLatestFrame() {
   }
 
   int interval = fallbackFrameIntervalMs_;
+  int64_t ptsDelta = -1;
 
   if (info.ptsMs >= 0 && lastPtsMs_ >= 0) {
-    const int64_t ptsDelta = info.ptsMs - lastPtsMs_;
+    ptsDelta = info.ptsMs - lastPtsMs_;
 
     /*
       PTS normal:
@@ -131,6 +135,30 @@ void NativeHwPlayerBackend::syncClockFromLatestFrame() {
     }
   } else {
     lastPtsMs_ += fallbackFrameIntervalMs_;
+  }
+
+  if (nativeRendererReady_ && nativeRenderer_) {
+    const long long delay = playbackDelayMs(now);
+
+    if (delay > 120 || decodedFrames_ <= 3 || decodedFrames_ % 120 == 0) {
+      logLinef(
+        "[KBORE][PLAYBACK] sync decoded=%u interval=%d delay=%lld ptsDelta=%lld firstPtsMs=%lld lastPtsMs=%lld",
+        decodedFrames_,
+        interval,
+        delay,
+        ptsDelta,
+        firstPtsMs_,
+        lastPtsMs_
+      );
+    }
+
+    if (delay > 120) {
+      const int reduction = std::min(
+        std::max(1, interval / 4),
+        std::max(1, static_cast<int>((delay - 120) / 100))
+      );
+      interval = std::max(8, interval - reduction);
+    }
   }
 
   currentFrameIntervalMs_ = interval;
@@ -225,7 +253,17 @@ int NativeHwPlayerBackend::cpuPresentationIntervalMs() const {
   return 0;
 }
 
-int NativeHwPlayerBackend::maxDropsPerUpdate() const {
+int NativeHwPlayerBackend::maxDropsPerUpdate(long long currentDelayMs) const {
+  if (nativeRendererReady_ && nativeRenderer_) {
+    // Para render nativo, usar drops o mais leve possível.
+    // Se o atraso não for extremamente grande, preferimos manter o frame
+    // atual para evitar sensação de passo a passo.
+    if (currentDelayMs > 2500) {
+      return 2;
+    }
+    return 1;
+  }
+
   const int interval = cpuPresentationIntervalMs();
 
   if (interval >= 100) {
@@ -244,25 +282,39 @@ int NativeHwPlayerBackend::maxDropsPerUpdate() const {
 }
 
 int NativeHwPlayerBackend::dropDelayThresholdMs() const {
+  if (nativeRendererReady_ && nativeRenderer_) {
+    // Durante os primeiros frames, permitir uma margem maior para o "warmup".
+    if (decodedFrames_ < 12) {
+      return 1800;
+    }
+
+    const int interval = cpuPresentationIntervalMs();
+    if (interval >= 40) {
+      return 1600;
+    }
+
+    return 1400;
+  }
+
   const int interval = cpuPresentationIntervalMs();
 
   if (interval >= 100) {
-    return 45;
+    return 60;
   }
 
   if (interval >= 67) {
-    return 55;
+    return 75;
   }
 
   if (interval >= 50) {
-    return 70;
+    return 95;
   }
 
   if (interval >= 40) {
-    return 90;
+    return 115;
   }
 
-  return 120;
+  return 140;
 }
 
 void NativeHwPlayerBackend::updateCpuFrameCost(long long elapsedMs) {
@@ -362,7 +414,7 @@ bool NativeHwPlayerBackend::open(const std::string &url) {
       );
       nativeRendererReady_ = true;
       nativeRendererStatus_ = std::string(nativeRenderer_->name()) + " initialized";
-      std::printf("[KBORE][DEKO3D] %s\n", nativeRendererStatus_.c_str());
+      logLinef("[KBORE][DEKO3D] %s", nativeRendererStatus_.c_str());
     } else {
       nativeRendererReady_ = false;
       nativeRendererFailed_ = true;
@@ -371,11 +423,11 @@ bool NativeHwPlayerBackend::open(const std::string &url) {
           ? nativeRenderer_->error()
           : "Deko3D renderer is unavailable for this build.";
 
-      std::printf(
-        "[KBORE][DEKO3D] unavailable: %s\n",
+      logLinef(
+        "[KBORE][DEKO3D] unavailable: %s",
         nativeRendererStatus_.c_str()
       );
-      std::printf("[KBORE][DEKO3D] fallback to SDL/YUV\n");
+      logLine("[KBORE][DEKO3D] fallback to SDL/YUV");
 
       if (nativeRenderer_) {
         nativeRenderer_->shutdown();
@@ -396,8 +448,8 @@ bool NativeHwPlayerBackend::open(const std::string &url) {
         nativeRendererReady_ = false;
         nativeRendererStatus_ = "Deko3D first-frame render failed: " + nativeRenderer_->error();
 
-        std::printf("[KBORE][DEKO3D] first frame failed: %s\n", nativeRendererStatus_.c_str());
-        std::printf("[KBORE][DEKO3D] fallback to SDL/YUV\n");
+        logLinef("[KBORE][DEKO3D] first frame failed: %s", nativeRendererStatus_.c_str());
+        logLine("[KBORE][DEKO3D] fallback to SDL/YUV");
 
         decoder_.releaseLatestHardwareFrame();
         nativeRenderer_->shutdown();
@@ -408,8 +460,8 @@ bool NativeHwPlayerBackend::open(const std::string &url) {
       nativeRendererReady_ = false;
       nativeRendererStatus_ = "Deko3D first hardware decode failed: " + decoder_.error();
 
-      std::printf("[KBORE][DEKO3D] first hardware frame failed: %s\n", nativeRendererStatus_.c_str());
-      std::printf("[KBORE][DEKO3D] fallback to SDL/YUV\n");
+      logLinef("[KBORE][DEKO3D] first hardware frame failed: %s", nativeRendererStatus_.c_str());
+      logLine("[KBORE][DEKO3D] fallback to SDL/YUV");
 
       nativeRenderer_->shutdown();
       nativeRenderer_.reset();
@@ -515,7 +567,7 @@ void NativeHwPlayerBackend::setNativeVideoAllowed(bool allowed) {
       );
       nativeRendererReady_ = true;
       nativeRendererStatus_ = std::string(nativeRenderer_->name()) + " initialized";
-      std::printf("[KBORE][DEKO3D] %s\n", nativeRendererStatus_.c_str());
+      logLinef("[KBORE][DEKO3D] %s", nativeRendererStatus_.c_str());
     } else {
       nativeRendererReady_ = false;
       nativeRendererFailed_ = true;
@@ -524,7 +576,7 @@ void NativeHwPlayerBackend::setNativeVideoAllowed(bool allowed) {
           ? nativeRenderer_->error()
           : "Deko3D renderer is unavailable for this build.";
 
-      std::printf("[KBORE][DEKO3D] unavailable: %s\n", nativeRendererStatus_.c_str());
+      logLinef("[KBORE][DEKO3D] unavailable: %s", nativeRendererStatus_.c_str());
 
       if (nativeRenderer_) {
         nativeRenderer_->shutdown();
@@ -584,6 +636,7 @@ bool NativeHwPlayerBackend::update() {
     Depois dos drops, decodificamos 1 frame real para exibição.
   */
   int dropped = 0;
+  const long long dropStartDelayMs = playbackDelayMs(nowMs());
 
   /*
     Agora o drop é barato, porque dropNextVideoFrame()
@@ -591,7 +644,7 @@ bool NativeHwPlayerBackend::update() {
 
     Podemos permitir mais drops por update para HD/FHD.
   */
-  const int maxDrops = maxDropsPerUpdate();
+  const int maxDrops = maxDropsPerUpdate(dropStartDelayMs);
 
   while (dropped < maxDrops && shouldDropFrames(nowMs())) {
     if (!decoder_.dropNextVideoFrame(demuxer_)) {
@@ -601,6 +654,25 @@ bool NativeHwPlayerBackend::update() {
 
     syncClockFromLatestFrame();
     ++dropped;
+    ++droppedFrames_;
+  }
+
+  if (dropped > 0) {
+    const long long dropLogNow = nowMs();
+
+    if (dropLogNow - lastDropLogWallMs_ >= 1000) {
+      logLinef(
+        "[KBORE][PLAYBACK] dropped %d frame(s) this update total=%d delayBefore=%lldms delayAfter=%lldms threshold=%d maxDrops=%d native=%d",
+        dropped,
+        droppedFrames_,
+        dropStartDelayMs,
+        playbackDelayMs(dropLogNow),
+        dropDelayThresholdMs(),
+        maxDrops,
+        nativeRendererReady_ && nativeRenderer_ ? 1 : 0
+      );
+      lastDropLogWallMs_ = dropLogNow;
+    }
   }
 
   const int cpuInterval = cpuPresentationIntervalMs();
@@ -647,8 +719,8 @@ bool NativeHwPlayerBackend::update() {
       nativeFramePresented_ = false;
       nativeRendererStatus_ = "Deko3D render failed: " + nativeRenderer_->error();
 
-      std::printf("[KBORE][DEKO3D] render failed: %s\n", nativeRendererStatus_.c_str());
-      std::printf("[KBORE][DEKO3D] fallback to SDL/YUV\n");
+      logLinef("[KBORE][DEKO3D] render failed: %s", nativeRendererStatus_.c_str());
+      logLine("[KBORE][DEKO3D] fallback to SDL/YUV");
 
       decoder_.releaseLatestHardwareFrame();
       nativeRenderer_->shutdown();

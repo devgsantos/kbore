@@ -1,4 +1,5 @@
 #include "nstv/deko3d_video_renderer.hpp"
+#include "nstv/log.hpp"
 
 #include <algorithm>
 #include <array>
@@ -598,7 +599,7 @@ bool Deko3dVideoRenderer::initialize() {
   switchState_->overlayColorState.setBlendEnable(0, true);
 
   initialized_ = true;
-  std::printf("[KBORE][DEKO3D] initialized NVTEGRA renderer\n");
+  logLine("[KBORE][DEKO3D] initialized NVTEGRA renderer");
   return true;
 #endif
 }
@@ -636,6 +637,9 @@ void Deko3dVideoRenderer::shutdown() {
 #endif
 
   initialized_ = false;
+  loggedFrameImport_ = false;
+  loggedFirstPresent_ = false;
+  presentedFrames_ = 0;
 }
 
 void Deko3dVideoRenderer::setOverlayInfo(
@@ -732,6 +736,26 @@ bool Deko3dVideoRenderer::renderFrame(const AVFrame *frame) {
   const uint32_t visibleYHeight = static_cast<uint32_t>(std::max(frame->height, 1));
   const uint32_t visibleUvWidth = static_cast<uint32_t>(std::max((frame->width + 1) / 2, 1));
   const uint32_t visibleUvHeight = static_cast<uint32_t>(std::max((frame->height + 1) / 2, 1));
+
+  if (!loggedFrameImport_) {
+    logLinef(
+      "[KBORE][DEKO3D] importing NVTEGRA frame %dx%d map=%p size=%u layout=%s yOffset=%u uvOffset=%u yImage=%ux%u uvImage=%ux%u yPitch=%d uvPitch=%d",
+      frame->width,
+      frame->height,
+      mapAddr,
+      mapSize,
+      pitchLinear ? "pitch-linear" : "block-linear",
+      yOffset,
+      uvOffset,
+      yWidth,
+      yHeight,
+      uvWidth,
+      uvHeight,
+      frame->linesize[0],
+      frame->linesize[1]
+    );
+    loggedFrameImport_ = true;
+  }
 
   dk::ImageLayout yLayout;
   dk::ImageLayout uvLayout;
@@ -950,6 +974,25 @@ bool Deko3dVideoRenderer::renderFrame(const AVFrame *frame) {
   switchState_->queue.presentImage(switchState_->swapchain, slot);
   frameSlot.submitted = true;
   switchState_->nextFrameSlot = (switchState_->nextFrameSlot + 1) % FrameInFlightCount;
+  ++presentedFrames_;
+
+  if (!loggedFirstPresent_) {
+    logLinef(
+      "[KBORE][DEKO3D] presented first native frame slot=%d size=%dx%d",
+      slot,
+      frame->width,
+      frame->height
+    );
+    loggedFirstPresent_ = true;
+  } else if (presentedFrames_ % 120 == 0) {
+    logLinef(
+      "[KBORE][DEKO3D] presented %u native frames latestSlot=%d size=%dx%d",
+      presentedFrames_,
+      slot,
+      frame->width,
+      frame->height
+    );
+  }
 
   error_.clear();
   return true;

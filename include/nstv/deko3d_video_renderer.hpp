@@ -30,6 +30,9 @@ private:
   bool initialized_ = false;
   bool overlayVisible_ = false;
   bool overlayDirty_ = true;
+  bool loggedFrameImport_ = false;
+  bool loggedFirstPresent_ = false;
+  unsigned int presentedFrames_ = 0;
   std::string overlayTitle_;
   std::string overlaySubtitle_;
   std::string overlayStatus_;
