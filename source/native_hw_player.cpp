@@ -255,10 +255,10 @@ int NativeHwPlayerBackend::cpuPresentationIntervalMs() const {
 
 int NativeHwPlayerBackend::maxDropsPerUpdate(long long currentDelayMs) const {
   if (nativeRendererReady_ && nativeRenderer_) {
-    // Para render nativo, usar drops o mais leve possível.
-    // Se o atraso não for extremamente grande, preferimos manter o frame
-    // atual para evitar sensação de passo a passo.
-    if (currentDelayMs > 2500) {
+    // Para render nativo, usamos drops leves mas permitimos dois quando o
+    // atraso já está acima de 1,4s. Isso evita que o player fique preso em
+    // um atraso persistente enquanto ainda mantém o comportamento suave.
+    if (currentDelayMs > 1400) {
       return 2;
     }
     return 1;
@@ -285,15 +285,15 @@ int NativeHwPlayerBackend::dropDelayThresholdMs() const {
   if (nativeRendererReady_ && nativeRenderer_) {
     // Durante os primeiros frames, permitir uma margem maior para o "warmup".
     if (decodedFrames_ < 12) {
-      return 1800;
+      return 1400;
     }
 
     const int interval = cpuPresentationIntervalMs();
     if (interval >= 40) {
-      return 1600;
+      return 1000;
     }
 
-    return 1400;
+    return 900;
   }
 
   const int interval = cpuPresentationIntervalMs();
