@@ -1,6 +1,8 @@
 #include "nstv/native_demuxer.hpp"
+#include "nstv/log.hpp"
 
 #include <sstream>
+#include <string>
 
 #ifdef NSTV_USE_FFMPEG
 extern "C" {
@@ -27,6 +29,62 @@ std::string ffmpegError(int code) {
   av_strerror(code, buffer, sizeof(buffer));
   return buffer;
 }
+
+bool startsWithHttps(const std::string &url) {
+  return url.rfind("https://", 0) == 0 || url.rfind("HTTPS://", 0) == 0;
+}
+
+std::string httpFallbackUrl(const std::string &url) {
+  if (url.rfind("https://", 0) == 0) {
+    return "http://" + url.substr(8);
+  }
+
+  if (url.rfind("HTTPS://", 0) == 0) {
+    return "http://" + url.substr(8);
+  }
+
+  return url;
+}
+
+bool isProtocolNotFound(int code) {
+  return ffmpegError(code).find("Protocol not found") != std::string::npos;
+}
+
+void setLiveInputOptions(AVDictionary **options, const char *userAgent) {
+  av_dict_set(options, "user_agent", userAgent, 0);
+  av_dict_set(options, "reconnect", "1", 0);
+  av_dict_set(options, "reconnect_streamed", "1", 0);
+  av_dict_set(options, "reconnect_delay_max", "2", 0);
+  /*
+    IPTV ao vivo não pode deixar av_read_frame bloquear por muitos segundos.
+    O log de travadas mostrou o clock acumulando dezenas de segundos enquanto
+    o demuxer esperava dados. Timeouts menores fazem o player congelar menos
+    e permitem o resync de live latency agir.
+  */
+  av_dict_set(options, "timeout", "3000000", 0);
+  av_dict_set(options, "rw_timeout", "2000000", 0);
+  av_dict_set(options, "fflags", "nobuffer", 0);
+  av_dict_set(options, "flags", "low_delay", 0);
+  av_dict_set(options, "max_delay", "500000", 0);
+  av_dict_set(options, "analyzeduration", "1000000", 0);
+  av_dict_set(options, "probesize", "65536", 0);
+}
+
+int openLiveInput(AVFormatContext **format, const std::string &url, const char *userAgent) {
+  AVDictionary *options = nullptr;
+  setLiveInputOptions(&options, userAgent);
+
+  int ret = avformat_open_input(
+    format,
+    url.c_str(),
+    nullptr,
+    &options
+  );
+
+  av_dict_free(&options);
+  return ret;
+}
+
 
 std::string codecName(AVCodecID codecId) {
   const char *name = avcodec_get_name(codecId);
@@ -127,37 +185,47 @@ bool NativeDemuxer::open(const std::string &url) {
     return false;
   }
 
-  AVDictionary *options = nullptr;
+  int ret = openLiveInput(&impl_->format, url, "NSTV-NativeDemuxer/0.1");
 
-  av_dict_set(&options, "user_agent", "NSTV-NativeDemuxer/0.1", 0);
-  av_dict_set(&options, "reconnect", "1", 0);
-  av_dict_set(&options, "reconnect_streamed", "1", 0);
-  av_dict_set(&options, "reconnect_delay_max", "2", 0);
-  /*
-    IPTV ao vivo não pode deixar av_read_frame bloquear por muitos segundos.
-    O log de travadas mostrou o clock acumulando dezenas de segundos enquanto
-    o demuxer esperava dados. Timeouts menores fazem o player congelar menos
-    e permitem o resync de live latency agir.
-  */
-  av_dict_set(&options, "timeout", "3000000", 0);
-  av_dict_set(&options, "rw_timeout", "2000000", 0);
-  av_dict_set(&options, "fflags", "nobuffer", 0);
-  av_dict_set(&options, "flags", "low_delay", 0);
-  av_dict_set(&options, "max_delay", "500000", 0);
-  av_dict_set(&options, "analyzeduration", "1000000", 0);
-  av_dict_set(&options, "probesize", "65536", 0);
+  const bool httpsProtocolMissing = ret < 0 && startsWithHttps(url) && isProtocolNotFound(ret);
 
-  int ret = avformat_open_input(
-    &impl_->format,
-    url.c_str(),
-    nullptr,
-    &options
-  );
+  if (httpsProtocolMissing) {
+    const std::string fallback = httpFallbackUrl(url);
 
-  av_dict_free(&options);
+    logLinef(
+      "[KBORE][NETWORK][HTTPS] FFmpeg HTTPS protocol unavailable; retrying HTTP fallback url=%s",
+      fallback.c_str()
+    );
+
+    if (impl_->format) {
+      avformat_close_input(&impl_->format);
+      impl_->format = nullptr;
+    }
+
+    const int fallbackRet = openLiveInput(&impl_->format, fallback, "NSTV-NativeDemuxer/0.1");
+
+    if (fallbackRet >= 0) {
+      url_ = fallback;
+      ret = fallbackRet;
+      logLine("[KBORE][NETWORK][HTTPS] HTTP fallback opened stream successfully");
+    } else {
+      ret = fallbackRet;
+      logLinef(
+        "[KBORE][NETWORK][HTTPS] HTTP fallback also failed error=%s",
+        ffmpegError(fallbackRet).c_str()
+      );
+    }
+  }
 
   if (ret < 0) {
     error_ = "NativeDemuxer could not open input: " + ffmpegError(ret);
+
+    if (httpsProtocolMissing) {
+      error_ +=
+        " | The stream URL uses HTTPS, but this FFmpeg build does not expose the https/tls protocol. "
+        "Rebuild FFmpeg for Switch with TLS/HTTPS support or use an HTTP-compatible playlist/URL.";
+    }
+
     close();
     return false;
   }
