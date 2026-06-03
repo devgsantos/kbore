@@ -363,12 +363,38 @@ Example `config.json`:
 
 ```json
 {
+  "parserApiBaseUrl": "https://your-parser-api.example",
+  "apiKey": "your-api-key",
+  "active": "my-m3u-list",
+  "pageSize": 20,
+  "preloadThreshold": 8,
+  "useUnicodeIcons": false,
+  "playlists": [
+    {
+      "id": "my-m3u-list",
+      "name": "My M3U List",
+      "type": "m3u",
+      "active": true,
+      "m3u_url": "http://host:port/get.php?username=USER&password=PASS&type=m3u_plus&output=ts",
+      "epg_url": "http://host:port/xmltv.php?username=USER&password=PASS"
+    },
+    {
+      "id": "my-xtream-list",
+      "name": "My Xtream List",
+      "type": "xtream",
+      "server_url": "http://host:port",
+      "username": "USER",
+      "password": "PASS"
+    }
+  ],
   "defaultXtreamUrl": "http://server:port",
-  "username": "user",
-  "password": "password",
-  "cacheEnabled": true
+  "defaultPlaylistUrl": "http://host:port/playlist.m3u"
 }
 ```
+
+`defaultXtreamUrl` and `defaultPlaylistUrl` are legacy compatibility fields.
+New saved lists should live in `playlists`, and the selected list is stored in
+`active` / `active_playlist_id`.
 
 If text renders as boxes, verify the font file exists:
 
@@ -378,6 +404,50 @@ sdmc:/switch/kbore/fonts/OpenSans-Regular.ttf
 
 For playlist names, channel names, and categories with unsupported icon glyphs,
 normalize or remove the icons before rendering.
+
+---
+
+## Playlist Loading and Cache
+
+Kboré loads M3U and Xtream sources through the configured parser API. The app
+expects the parser to return a lightweight initial manifest and to load deeper
+folders through child-page requests instead of returning a full recursive tree
+on first import.
+
+The important parser endpoints are:
+
+```text
+POST /api/nodes/parse-url
+POST /api/nodes/xtream/manifest
+POST /api/nodes/children
+POST /api/xtream/epg/short
+```
+
+The app stores cached data by playlist id so switching saved lists does not
+force a full re-download every time.
+
+Current cache paths:
+
+```text
+sdmc:/switch/kbore/manifests/<playlist-id>_manifest.json
+sdmc:/switch/kbore/manifests/<playlist-id>_manifest.json.gz
+sdmc:/switch/kbore/cache/<playlist-id>_<provider>_<type>_<category>_page_<n>.json
+sdmc:/switch/kbore/cache/<playlist-id>_node_<node-id>_page_<n>.json
+sdmc:/switch/kbore/cache/<playlist-id>_epg_<channel-key>.json
+```
+
+Legacy manifest files are still read for compatibility:
+
+```text
+sdmc:/switch/kbore/manifests/active-manifest.json
+sdmc:/switch/kbore/active-manifest.json
+sdmc:/switch/kbore/manifest-<playlist-id>.json
+sdmc:/switch/kbore/cache/<playlist-id>_manifest.json
+sdmc:/switch/kbore/cache/<playlist-id>_manifest.json.gz
+```
+
+If an existing list keeps loading stale data, remove only that playlist's cached
+manifest and page files from `manifests/` and `cache/`, then import it again.
 
 ---
 
