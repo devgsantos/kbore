@@ -77,6 +77,7 @@ public:
   int audioQueuedBytes() const;
   int audioQueuedMs() const;
   void clearAudioQueue();
+  void flushForSeek();
 
   bool decodeFirstVideoFrame(NativeDemuxer &demuxer);
   bool decodeNextVideoFrame(

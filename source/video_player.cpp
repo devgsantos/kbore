@@ -107,6 +107,57 @@ static int openLiveInput(AVFormatContext **format, const std::string &url, const
   return ret;
 }
 
+static int64_t durationFromFormatMs(AVFormatContext *format) {
+  if (!format) return 0;
+
+  if (format->duration != AV_NOPTS_VALUE && format->duration > 0) {
+    return av_rescale(format->duration, 1000, AV_TIME_BASE);
+  }
+
+  int64_t bestMs = 0;
+
+  for (unsigned int i = 0; i < format->nb_streams; ++i) {
+    AVStream *stream = format->streams[i];
+    if (!stream || stream->duration == AV_NOPTS_VALUE || stream->duration <= 0) continue;
+
+    AVRational milliseconds{1, 1000};
+    bestMs = std::max<int64_t>(bestMs, av_rescale_q(stream->duration, stream->time_base, milliseconds));
+  }
+
+  return bestMs;
+}
+
+static int64_t startTimeFromFormatMs(AVFormatContext *format) {
+  if (!format) return 0;
+
+  if (format->start_time != AV_NOPTS_VALUE && format->start_time > 0) {
+    return av_rescale(format->start_time, 1000, AV_TIME_BASE);
+  }
+
+  int64_t bestMs = -1;
+
+  for (unsigned int i = 0; i < format->nb_streams; ++i) {
+    AVStream *stream = format->streams[i];
+    if (!stream || stream->start_time == AV_NOPTS_VALUE || stream->start_time < 0) continue;
+
+    AVRational milliseconds{1, 1000};
+    const int64_t value = av_rescale_q(stream->start_time, stream->time_base, milliseconds);
+    if (bestMs < 0 || value < bestMs) bestMs = value;
+  }
+
+  return bestMs > 0 ? bestMs : 0;
+}
+
+static int64_t framePtsMs(AVFrame *frame, AVStream *stream) {
+  if (!frame || !stream) return -1;
+
+  int64_t pts = frame->best_effort_timestamp;
+  if (pts == AV_NOPTS_VALUE) pts = frame->pts;
+  if (pts == AV_NOPTS_VALUE) return -1;
+
+  AVRational milliseconds{1, 1000};
+  return av_rescale_q(pts, stream->time_base, milliseconds);
+}
 
 static int scaledWidth(int width, int height, int maxWidth, int maxHeight) {
   if (width <= 0 || height <= 0) return width;
@@ -222,6 +273,10 @@ bool VideoPlayer::open(const std::string &url) {
     close();
     return false;
   }
+
+  durationMs_ = durationFromFormatMs(impl_->format);
+  startTimeMs_ = startTimeFromFormatMs(impl_->format);
+  currentPositionMs_ = 0;
 
   for (unsigned int i = 0; i < impl_->format->nb_streams; ++i) {
     AVCodecParameters *params = impl_->format->streams[i]->codecpar;
@@ -431,6 +486,9 @@ void VideoPlayer::close() {
   paused_ = false;
   frame_ = Bitmap{};
   yuvFrame_ = YuvFrame{};
+  durationMs_ = 0;
+  startTimeMs_ = 0;
+  currentPositionMs_ = 0;
 }
 
 bool VideoPlayer::update() {
@@ -484,6 +542,15 @@ bool VideoPlayer::update() {
 
         // Mark bitmap invalid. The renderer should use the YUV path.
         frame_ = Bitmap{};
+
+        AVStream *videoStream = impl_->format->streams[impl_->videoStream];
+        const int64_t ptsMs = framePtsMs(impl_->decodedVideo, videoStream);
+        if (ptsMs >= 0) {
+          currentPositionMs_ = std::max<int64_t>(0, ptsMs - startTimeMs_);
+          if (durationMs_ > 0 && currentPositionMs_ > durationMs_) {
+            currentPositionMs_ = durationMs_;
+          }
+        }
 
         av_frame_unref(impl_->decodedVideo);
         gotVideo = true;
@@ -570,6 +637,82 @@ void VideoPlayer::togglePause() {
 #ifdef NSTV_USE_SDL
   if (impl_ && impl_->audioDevice != 0) SDL_PauseAudioDevice(impl_->audioDevice, paused_ ? 1 : 0);
 #endif
+#endif
+}
+
+bool VideoPlayer::canSeek() const {
+#ifdef NSTV_USE_FFMPEG
+  return open_ && impl_ && impl_->format && durationMs_ > 0;
+#else
+  return false;
+#endif
+}
+
+int64_t VideoPlayer::durationMs() const {
+  return durationMs_;
+}
+
+int64_t VideoPlayer::positionMs() const {
+  if (durationMs_ > 0) {
+    return std::max<int64_t>(0, std::min<int64_t>(currentPositionMs_, durationMs_));
+  }
+
+  return std::max<int64_t>(0, currentPositionMs_);
+}
+
+bool VideoPlayer::seekToMs(int64_t positionMs) {
+#ifndef NSTV_USE_FFMPEG
+  return false;
+#else
+  if (!canSeek()) {
+    return false;
+  }
+
+  if (positionMs < 0) {
+    positionMs = 0;
+  }
+
+  if (durationMs_ > 0 && positionMs > durationMs_) {
+    positionMs = durationMs_;
+  }
+
+  const int64_t targetUs = av_rescale(positionMs + startTimeMs_, AV_TIME_BASE, 1000);
+  int ret = av_seek_frame(impl_->format, -1, targetUs, AVSEEK_FLAG_BACKWARD);
+
+  if (ret < 0 && impl_->videoStream >= 0) {
+    AVStream *stream = impl_->format->streams[impl_->videoStream];
+    if (stream) {
+      AVRational microseconds{1, AV_TIME_BASE};
+      const int64_t streamTs = av_rescale_q(targetUs, microseconds, stream->time_base);
+      ret = av_seek_frame(impl_->format, impl_->videoStream, streamTs, AVSEEK_FLAG_BACKWARD);
+    }
+  }
+
+  if (ret < 0) {
+    error_ = std::string("Could not seek: ") + ffmpegError(ret);
+    return false;
+  }
+
+  if (impl_->videoCodec) avcodec_flush_buffers(impl_->videoCodec);
+  if (impl_->audioCodec) avcodec_flush_buffers(impl_->audioCodec);
+  if (impl_->decodedVideo) av_frame_unref(impl_->decodedVideo);
+  if (impl_->decodedAudio) av_frame_unref(impl_->decodedAudio);
+  if (impl_->packet) av_packet_unref(impl_->packet);
+  if (impl_->swr) {
+    swr_close(impl_->swr);
+    swr_init(impl_->swr);
+  }
+
+#ifdef NSTV_USE_SDL
+  if (impl_->audioDevice != 0) {
+    SDL_ClearQueuedAudio(impl_->audioDevice);
+    SDL_PauseAudioDevice(impl_->audioDevice, paused_ ? 1 : 0);
+  }
+#endif
+
+  currentPositionMs_ = positionMs;
+  logLinef("[KBORE][PLAYBACK][VOD] fallback seek position=%lld duration=%lld", positionMs, durationMs_);
+  return true;
 #endif
 }
 

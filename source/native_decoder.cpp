@@ -464,11 +464,13 @@ void NativeDecoder::resetState() {
 
   firstVideoFrame_ = NativeFrameInfo{};
   latestFrameInfo_ = NativeFrameInfo{};
+#ifdef NSTV_USE_FFMPEG
   if (impl_) {
     impl_->latestNativeSurfaceInfo = NativeVideoSurfaceInfo{};
     impl_->nativeSurfaceLogCount = 0;
     impl_->retainedHardwareFrameLogCount = 0;
   }
+#endif
 
   firstYuvFrame_ = YuvFrame{};
   latestYuvFrame_ = YuvFrame{};
@@ -1019,6 +1021,55 @@ void NativeDecoder::clearAudioQueue() {
 #endif
 }
 
+void NativeDecoder::flushForSeek() {
+#ifdef NSTV_USE_FFMPEG
+  if (!impl_) {
+    return;
+  }
+
+  releaseLatestHardwareFrame();
+
+  if (impl_->videoCodec) {
+    avcodec_flush_buffers(impl_->videoCodec);
+  }
+
+  if (impl_->audioCodec) {
+    avcodec_flush_buffers(impl_->audioCodec);
+  }
+
+  if (impl_->videoFrame) {
+    av_frame_unref(impl_->videoFrame);
+  }
+
+  if (impl_->transferredFrame) {
+    av_frame_unref(impl_->transferredFrame);
+  }
+
+  if (impl_->convertedYuvFrame) {
+    av_frame_unref(impl_->convertedYuvFrame);
+  }
+
+  if (impl_->audioFrame) {
+    av_frame_unref(impl_->audioFrame);
+  }
+
+  if (impl_->packet) {
+    av_packet_unref(impl_->packet);
+  }
+
+  if (impl_->swr) {
+    swr_close(impl_->swr);
+    swr_init(impl_->swr);
+  }
+
+  clearAudioQueue();
+  firstVideoFrame_ = NativeFrameInfo{};
+  latestFrameInfo_ = NativeFrameInfo{};
+  firstYuvFrame_ = YuvFrame{};
+  latestYuvFrame_ = YuvFrame{};
+#endif
+}
+
 #ifdef NSTV_USE_FFMPEG
 bool NativeDecoder::decodeAudioPacketToSdl(AVPacket *packet) {
   if (!impl_ || !impl_->audioCodec || !impl_->audioFrame || !impl_->swr) {
@@ -1158,10 +1209,15 @@ bool NativeDecoder::decodeNextVideoFrame(
   }
 
   for (int i = 0; i < maxPackets; ++i) {
+    demuxer.beginIoGuard(900);
     int ret = av_read_frame(format, impl_->packet);
+    const bool interrupted = demuxer.wasIoInterrupted();
+    demuxer.endIoGuard();
 
-    if (ret < 0) {
-      error_ = "NativeDecoder could not read next video frame: " + ffmpegError(ret);
+    if (ret < 0 || interrupted) {
+      error_ = interrupted
+        ? "NativeDecoder video read interrupted by IO guard"
+        : "NativeDecoder could not read next video frame: " + ffmpegError(ret);
       return false;
     }
 
@@ -1536,10 +1592,15 @@ bool NativeDecoder::decodeNextHardwareFrame(NativeDemuxer &demuxer, int maxPacke
   }
 
   for (int i = 0; i < maxPackets; ++i) {
+    demuxer.beginIoGuard(900);
     int ret = av_read_frame(format, impl_->packet);
+    const bool interrupted = demuxer.wasIoInterrupted();
+    demuxer.endIoGuard();
 
-    if (ret < 0) {
-      error_ = "NativeDecoder could not read next hardware frame: " + ffmpegError(ret);
+    if (ret < 0 || interrupted) {
+      error_ = interrupted
+        ? "NativeDecoder hardware read interrupted by IO guard"
+        : "NativeDecoder could not read next hardware frame: " + ffmpegError(ret);
       return false;
     }
 

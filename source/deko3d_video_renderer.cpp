@@ -44,6 +44,28 @@ uint32_t alignUp(uint32_t value, uint32_t alignment) {
   return (value + alignment - 1) & ~(alignment - 1);
 }
 
+std::string formatOverlayTime(int64_t ms) {
+  if (ms < 0) {
+    ms = 0;
+  }
+
+  const int64_t totalSeconds = ms / 1000;
+  const int64_t hours = totalSeconds / 3600;
+  const int64_t minutes = (totalSeconds / 60) % 60;
+  const int64_t seconds = totalSeconds % 60;
+
+  char buffer[32] = {};
+
+  if (hours > 0) {
+    std::snprintf(buffer, sizeof(buffer), "%lld:%02lld:%02lld", hours, minutes, seconds);
+  } else {
+    std::snprintf(buffer, sizeof(buffer), "%lld:%02lld", minutes, seconds);
+  }
+
+  return buffer;
+}
+
+
 #ifdef __SWITCH__
 struct ColorCoefficients {
   float kr = 0.299f;
@@ -222,7 +244,10 @@ void buildOverlayBitmap(
   const std::string &title,
   const std::string &subtitle,
   const std::string &status,
-  const std::string &controls
+  const std::string &controls,
+  int64_t progressPositionMs,
+  int64_t progressDurationMs,
+  bool progressVisible
 ) {
   if (!rgba) {
     return;
@@ -250,9 +275,9 @@ void buildOverlayBitmap(
   drawText(rgba, initials, 42, 37, 3, 165, 190, 230, 255, true);
   drawText(rgba, fitText(title, 58), 122, 18, 2, 248, 250, 252, 255, true);
   drawText(rgba, fitText(subtitle, 98), 122, 46, 1, 150, 163, 190, 255, false);
-  drawText(rgba, fitText(status, 24), 122, 72, 1, 57, 220, 35, 255, true);
+  drawText(rgba, fitText(status, 32), 122, 72, 1, 57, 220, 35, 255, true);
 
-  const std::string fittedControls = fitText(controls, 34);
+  const std::string fittedControls = fitText(controls, 76);
   const int controlsWidth = static_cast<int>(fittedControls.size()) * 6 * 1;
   drawText(
     rgba,
@@ -266,6 +291,29 @@ void buildOverlayBitmap(
     255,
     true
   );
+
+  if (progressVisible && progressDurationMs > 0) {
+    const int labelY = 87;
+    const int barX = 220;
+    const int barY = 93;
+    const int barW = 780;
+    const int barH = 5;
+    const std::string startLabel = "0:00";
+    const std::string endLabel = formatOverlayTime(progressDurationMs);
+    const int endWidth = static_cast<int>(endLabel.size()) * 6;
+
+    drawText(rgba, startLabel, 122, labelY, 1, 203, 213, 225, 255, false);
+    drawText(rgba, endLabel, static_cast<int>(OverlayWidth) - 28 - endWidth, labelY, 1, 203, 213, 225, 255, false);
+
+    fillRect(rgba, barX, barY, barW, barH, 51, 65, 85, 230);
+
+    const int64_t clamped = std::max<int64_t>(0, std::min<int64_t>(progressPositionMs, progressDurationMs));
+    const int filled = static_cast<int>((clamped * barW) / progressDurationMs);
+
+    if (filled > 0) {
+      fillRect(rgba, barX, barY, std::min(barW, filled), barH, 0, 191, 255, 255);
+    }
+  }
 }
 
 bool loadShader(dk::Device device, dk::MemBlock codeMem, uint32_t &codeOffset, dk::Shader &shader, const char *path, std::string &error) {
@@ -664,6 +712,24 @@ void Deko3dVideoRenderer::setOverlayInfo(
   overlayDirty_ = true;
 }
 
+void Deko3dVideoRenderer::setOverlayProgress(int64_t positionMs, int64_t durationMs, bool visible) {
+  positionMs = std::max<int64_t>(0, positionMs);
+  durationMs = std::max<int64_t>(0, durationMs);
+
+  if (
+    overlayProgressPositionMs_ == positionMs &&
+    overlayProgressDurationMs_ == durationMs &&
+    overlayProgressVisible_ == visible
+  ) {
+    return;
+  }
+
+  overlayProgressPositionMs_ = positionMs;
+  overlayProgressDurationMs_ = durationMs;
+  overlayProgressVisible_ = visible;
+  overlayDirty_ = true;
+}
+
 #ifdef NSTV_USE_FFMPEG
 bool Deko3dVideoRenderer::canRender(const AVFrame *frame) const {
   if (!initialized_ || !frame || frame->format != AV_PIX_FMT_NVTEGRA) {
@@ -916,7 +982,10 @@ bool Deko3dVideoRenderer::renderFrame(const AVFrame *frame) {
         overlayTitle_,
         overlaySubtitle_,
         overlayStatus_,
-        overlayControls_
+        overlayControls_,
+        overlayProgressPositionMs_,
+        overlayProgressDurationMs_,
+        overlayProgressVisible_
       );
       switchState_->overlayMem.flushCpuCache(0, OverlayMemSize);
       overlayDirty_ = false;
