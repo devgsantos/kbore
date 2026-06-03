@@ -240,8 +240,15 @@ int NativeHwPlayerBackend::cpuPresentationIntervalMs() const {
   return 0;
 }
 
-int NativeHwPlayerBackend::maxDropsPerUpdate() const {
+int NativeHwPlayerBackend::maxDropsPerUpdate(long long currentDelayMs) const {
   if (nativeRendererReady_ && nativeRenderer_) {
+    // Para render nativo, usar drops controlados baseados no atraso atual.
+    if (currentDelayMs > 1200) {
+      return 3;
+    }
+    if (currentDelayMs > 800) {
+      return 2;
+    }
     return 1;
   }
 
@@ -264,7 +271,9 @@ int NativeHwPlayerBackend::maxDropsPerUpdate() const {
 
 int NativeHwPlayerBackend::dropDelayThresholdMs() const {
   if (nativeRendererReady_ && nativeRenderer_) {
-    return 1000;
+    // Ajusta o limiar para iniciar drops de forma equilibrada
+    // sem esperar até 1 segundo de atraso.
+    return 700;
   }
 
   const int interval = cpuPresentationIntervalMs();
@@ -615,7 +624,7 @@ bool NativeHwPlayerBackend::update() {
 
     Podemos permitir mais drops por update para HD/FHD.
   */
-  const int maxDrops = maxDropsPerUpdate();
+  const int maxDrops = maxDropsPerUpdate(dropStartDelayMs);
 
   while (dropped < maxDrops && shouldDropFrames(nowMs())) {
     if (!decoder_.dropNextVideoFrame(demuxer_)) {

@@ -95,7 +95,7 @@ private:
   long long playbackDelayMs(long long now) const;
   bool shouldDropFrames(long long now) const;
   int cpuPresentationIntervalMs() const;
-  int maxDropsPerUpdate() const;
+  int maxDropsPerUpdate(long long currentDelayMs) const;
   int dropDelayThresholdMs() const;
   void updateCpuFrameCost(long long elapsedMs);
 };
