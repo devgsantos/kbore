@@ -1,4 +1,5 @@
 #include "nstv/video_player.hpp"
+#include "nstv/log.hpp"
 #include <algorithm>
 #include <cstring>
 
@@ -63,6 +64,50 @@ static std::string ffmpegError(int code) {
   return err;
 }
 
+static bool startsWithHttps(const std::string &url) {
+  return url.rfind("https://", 0) == 0 || url.rfind("HTTPS://", 0) == 0;
+}
+
+static std::string httpFallbackUrl(const std::string &url) {
+  if (url.rfind("https://", 0) == 0) {
+    return "http://" + url.substr(8);
+  }
+
+  if (url.rfind("HTTPS://", 0) == 0) {
+    return "http://" + url.substr(8);
+  }
+
+  return url;
+}
+
+static bool isProtocolNotFound(int code) {
+  return ffmpegError(code).find("Protocol not found") != std::string::npos;
+}
+
+static void setLiveInputOptions(AVDictionary **options, const char *userAgent) {
+  av_dict_set(options, "user_agent", userAgent, 0);
+  av_dict_set(options, "reconnect", "1", 0);
+  av_dict_set(options, "reconnect_streamed", "1", 0);
+  av_dict_set(options, "reconnect_delay_max", "2", 0);
+  av_dict_set(options, "timeout", "3000000", 0);
+  av_dict_set(options, "rw_timeout", "2000000", 0);
+  av_dict_set(options, "fflags", "nobuffer", 0);
+  av_dict_set(options, "flags", "low_delay", 0);
+  av_dict_set(options, "max_delay", "500000", 0);
+  av_dict_set(options, "analyzeduration", "1000000", 0);
+  av_dict_set(options, "probesize", "65536", 0);
+}
+
+static int openLiveInput(AVFormatContext **format, const std::string &url, const char *userAgent) {
+  AVDictionary *options = nullptr;
+  setLiveInputOptions(&options, userAgent);
+
+  int ret = avformat_open_input(format, url.c_str(), nullptr, &options);
+  av_dict_free(&options);
+  return ret;
+}
+
+
 static int scaledWidth(int width, int height, int maxWidth, int maxHeight) {
   if (width <= 0 || height <= 0) return width;
   float scale = std::min(float(maxWidth) / float(width), float(maxHeight) / float(height));
@@ -126,24 +171,47 @@ bool VideoPlayer::open(const std::string &url) {
   SDL_InitSubSystem(SDL_INIT_AUDIO);
 #endif
 
-  AVDictionary *options = nullptr;
-  av_dict_set(&options, "user_agent", "NSTV-Switch/0.5", 0);
-  av_dict_set(&options, "reconnect", "1", 0);
-  av_dict_set(&options, "reconnect_streamed", "1", 0);
-  av_dict_set(&options, "reconnect_delay_max", "2", 0);
-  av_dict_set(&options, "timeout", "3000000", 0);
-  av_dict_set(&options, "rw_timeout", "2000000", 0);
-  av_dict_set(&options, "fflags", "nobuffer", 0);
-  av_dict_set(&options, "flags", "low_delay", 0);
-  av_dict_set(&options, "max_delay", "500000", 0);
-  av_dict_set(&options, "analyzeduration", "1000000", 0);
-  av_dict_set(&options, "probesize", "65536", 0);
+  int ret = openLiveInput(&impl_->format, url, "NSTV-Switch/0.5");
 
-  int ret = avformat_open_input(&impl_->format, url.c_str(), nullptr, &options);
-  av_dict_free(&options);
+  const bool httpsProtocolMissing = ret < 0 && startsWithHttps(url) && isProtocolNotFound(ret);
+
+  if (httpsProtocolMissing) {
+    const std::string fallback = httpFallbackUrl(url);
+
+    logLinef(
+      "[KBORE][NETWORK][HTTPS] FFmpeg HTTPS protocol unavailable in fallback player; retrying HTTP fallback url=%s",
+      fallback.c_str()
+    );
+
+    if (impl_->format) {
+      avformat_close_input(&impl_->format);
+      impl_->format = nullptr;
+    }
+
+    const int fallbackRet = openLiveInput(&impl_->format, fallback, "NSTV-Switch/0.5");
+
+    if (fallbackRet >= 0) {
+      url_ = fallback;
+      ret = fallbackRet;
+      logLine("[KBORE][NETWORK][HTTPS] HTTP fallback opened stream successfully in fallback player");
+    } else {
+      ret = fallbackRet;
+      logLinef(
+        "[KBORE][NETWORK][HTTPS] HTTP fallback also failed in fallback player error=%s",
+        ffmpegError(fallbackRet).c_str()
+      );
+    }
+  }
 
   if (ret < 0) {
     error_ = std::string("Could not open stream: ") + ffmpegError(ret);
+
+    if (httpsProtocolMissing) {
+      error_ +=
+        " | The stream URL uses HTTPS, but this FFmpeg build does not expose the https/tls protocol. "
+        "Rebuild FFmpeg for Switch with TLS/HTTPS support or use an HTTP-compatible playlist/URL.";
+    }
+
     close();
     return false;
   }
