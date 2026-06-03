@@ -75,17 +75,20 @@ public:
   void startAudio();
   void stopAudio();
   int audioQueuedBytes() const;
+  int audioQueuedMs() const;
+  void clearAudioQueue();
 
   bool decodeFirstVideoFrame(NativeDemuxer &demuxer);
   bool decodeNextVideoFrame(
     NativeDemuxer &demuxer,
     bool outputFrame = true,
-    YuvFrame *outputYuvFrame = nullptr
+    YuvFrame *outputYuvFrame = nullptr,
+    int maxPackets = 80
   );
   bool dropNextVideoFrame(NativeDemuxer &demuxer);
 
 #ifdef NSTV_USE_FFMPEG
-  bool decodeNextHardwareFrame(NativeDemuxer &demuxer);
+  bool decodeNextHardwareFrame(NativeDemuxer &demuxer, int maxPackets = 80);
   const AVFrame *latestHardwareFrame() const;
   void releaseLatestHardwareFrame();
 #endif

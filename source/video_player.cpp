@@ -130,11 +130,12 @@ bool VideoPlayer::open(const std::string &url) {
   av_dict_set(&options, "user_agent", "NSTV-Switch/0.5", 0);
   av_dict_set(&options, "reconnect", "1", 0);
   av_dict_set(&options, "reconnect_streamed", "1", 0);
-  av_dict_set(&options, "reconnect_delay_max", "5", 0);
-  av_dict_set(&options, "timeout", "8000000", 0);
-  av_dict_set(&options, "rw_timeout", "8000000", 0);
+  av_dict_set(&options, "reconnect_delay_max", "2", 0);
+  av_dict_set(&options, "timeout", "3000000", 0);
+  av_dict_set(&options, "rw_timeout", "2000000", 0);
   av_dict_set(&options, "fflags", "nobuffer", 0);
   av_dict_set(&options, "flags", "low_delay", 0);
+  av_dict_set(&options, "max_delay", "500000", 0);
   av_dict_set(&options, "analyzeduration", "1000000", 0);
   av_dict_set(&options, "probesize", "65536", 0);
 
@@ -461,7 +462,16 @@ bool VideoPlayer::update() {
 #ifdef NSTV_USE_SDL
             if (impl_->audioDevice != 0) {
               Uint32 queued = SDL_GetQueuedAudioSize(impl_->audioDevice);
-              if (queued < 48000 * 2 * 2) {
+              const Uint32 bytesPerSecond = 48000u * 2u * 2u;
+              const Uint32 targetMaxQueue = (bytesPerSecond * 550u) / 1000u;
+              const Uint32 emergencyMaxQueue = (bytesPerSecond * 900u) / 1000u;
+
+              if (queued > emergencyMaxQueue) {
+                SDL_ClearQueuedAudio(impl_->audioDevice);
+                queued = SDL_GetQueuedAudioSize(impl_->audioDevice);
+              }
+
+              if (queued < targetMaxQueue) {
                 SDL_QueueAudio(impl_->audioDevice, impl_->audioBuffer.data(), Uint32(bytes));
               }
             }

@@ -56,12 +56,18 @@ void NativeHwPlayerBackend::resetClock() {
   decodedFrames_ = 0;
   droppedFrames_ = 0;
   lastDropLogWallMs_ = 0;
+  lastQualityLogWallMs_ = 0;
 }
 
 void NativeHwPlayerBackend::resetClockToCurrentFrame(long long now) {
   const NativeFrameInfo &info = decoder_.latestFrameInfo();
 
-  playbackStartMs_ = now;
+  /*
+    Rebase para streaming ao vivo. Se a rede/decoder travou, não faz sentido
+    tentar "pagar" segundos antigos: isso só cria engasgos e A/V drift.
+    Mantemos uma latência curta como alvo e seguimos do frame mais recente.
+  */
+  playbackStartMs_ = now - targetPlaybackDelayMs();
   lastFrameWallMs_ = now;
   lastPresentedVideoWallMs_ = now;
   nextFrameDueMs_ = now + currentFrameIntervalMs_;
@@ -140,24 +146,48 @@ void NativeHwPlayerBackend::syncClockFromLatestFrame() {
   if (nativeRendererReady_ && nativeRenderer_) {
     const long long delay = playbackDelayMs(now);
 
-    if (delay > 120 || decodedFrames_ <= 3 || decodedFrames_ % 120 == 0) {
+    const int audioQueuedMs = decoder_.audioQueuedMs();
+    const int effectiveTargetMs = effectiveTargetPlaybackDelayMs(audioQueuedMs);
+
+    if (
+      delay > effectiveTargetMs ||
+      delay < -targetPlaybackDelayMs() ||
+      decodedFrames_ <= 3 ||
+      decodedFrames_ % 120 == 0
+    ) {
       logLinef(
-        "[KBORE][PLAYBACK] sync decoded=%u interval=%d delay=%lld ptsDelta=%lld firstPtsMs=%lld lastPtsMs=%lld",
+        "[KBORE][PLAYBACK] sync decoded=%u interval=%d delay=%lld target=%d audioQ=%dms ptsDelta=%lld firstPtsMs=%lld lastPtsMs=%lld",
         decodedFrames_,
         interval,
         delay,
+        effectiveTargetMs,
+        audioQueuedMs,
         ptsDelta,
         firstPtsMs_,
         lastPtsMs_
       );
     }
 
-    if (delay > 120) {
+    /*
+      Controlador inteligente de clock:
+      - recuperação usa o alvo base, não o alvo efetivo de A/V.
+        Isso mantém a folga contra o dropThreshold e evita que a
+        compensação visual de áudio vire atraso acumulado.
+    */
+    const int recoveryTargetMs = targetPlaybackDelayMs();
+
+    if (delay > recoveryTargetMs) {
       const int reduction = std::min(
-        std::max(1, interval / 4),
-        std::max(1, static_cast<int>((delay - 120) / 100))
+        std::max(1, interval - 8),
+        std::max(2, static_cast<int>((delay - recoveryTargetMs) / 30))
       );
       interval = std::max(8, interval - reduction);
+    } else if (delay < -targetPlaybackDelayMs()) {
+      const int expansion = std::min(
+        30,
+        std::max(1, static_cast<int>((-delay - targetPlaybackDelayMs()) / 20))
+      );
+      interval = clampFrameInterval(interval + expansion);
     }
   }
 
@@ -173,12 +203,44 @@ bool NativeHwPlayerBackend::shouldDecodeNow(long long now) const {
     return true;
   }
 
-  /*
-    Essa é a correção principal do SD em 2x.
+  const long long delay = playbackDelayMs(now);
+  const int audioQueuedMs = decoder_.audioQueuedMs();
+  const int effectiveTargetMs = effectiveTargetPlaybackDelayMs(audioQueuedMs);
 
-    Antes o update podia consumir frames do buffer sempre que a UI rodava.
-    Agora só decodificamos o próximo frame quando o relógio permitir.
+  /*
+    Recuperação de atraso continua usando o alvo base. O alvo efetivo serve
+    apenas para micro-hold visual, não para decidir que o player pode esperar
+    mais antes de decodificar. Isso evita o retorno dos engasgos.
   */
+  if (delay > targetPlaybackDelayMs()) {
+    return true;
+  }
+
+  /*
+    Ajuste fino A/V: quando o áudio tem fila suficiente e o vídeo está um
+    pouco cedo em relação ao alvo efetivo, seguramos só alguns milissegundos.
+    O cap baixo mantém a fluidez e evita acumular delay até o frame drop.
+  */
+  if (
+    nativeRendererReady_ &&
+    nativeRenderer_ &&
+    decodedFrames_ > 12 &&
+    audioQueuedMs >= 250 &&
+    delay + 8 < effectiveTargetMs
+  ) {
+    const long long holdMs = std::min(14LL, static_cast<long long>(effectiveTargetMs - delay) / 3);
+    return now >= nextFrameDueMs_ + holdMs;
+  }
+
+  /*
+    Se o vídeo ficou adiantado em relação ao relógio, seguramos um pouco
+    mais antes de decodificar o próximo frame.
+  */
+  if (delay < -targetPlaybackDelayMs()) {
+    const long long holdMs = std::min(80LL, (-delay) / 2);
+    return now >= nextFrameDueMs_ + holdMs;
+  }
+
   return now >= nextFrameDueMs_;
 }
 
@@ -255,12 +317,35 @@ int NativeHwPlayerBackend::cpuPresentationIntervalMs() const {
 
 int NativeHwPlayerBackend::maxDropsPerUpdate(long long currentDelayMs) const {
   if (nativeRendererReady_ && nativeRenderer_) {
-    // Para render nativo, usar drops o mais leve possível.
-    // Se o atraso não for extremamente grande, preferimos manter o frame
-    // atual para evitar sensação de passo a passo.
+    /*
+      Render nativo consegue descartar frames sem transferência para CPU.
+      O limite antigo de 1 drop por update deixava o atraso preso perto
+      de 800ms por muitos segundos. Aqui a recuperação é proporcional.
+    */
+    if (currentDelayMs > 5000) {
+      return 24;
+    }
+
     if (currentDelayMs > 2500) {
+      return 16;
+    }
+
+    if (currentDelayMs > 1500) {
+      return 10;
+    }
+
+    if (currentDelayMs > 900) {
+      return 6;
+    }
+
+    if (currentDelayMs > 500) {
+      return 4;
+    }
+
+    if (currentDelayMs > dropDelayThresholdMs()) {
       return 2;
     }
+
     return 1;
   }
 
@@ -283,17 +368,16 @@ int NativeHwPlayerBackend::maxDropsPerUpdate(long long currentDelayMs) const {
 
 int NativeHwPlayerBackend::dropDelayThresholdMs() const {
   if (nativeRendererReady_ && nativeRenderer_) {
-    // Durante os primeiros frames, permitir uma margem maior para o "warmup".
+    // Warmup curto: tolera buffer inicial, mas não permite drift longo.
     if (decodedFrames_ < 12) {
-      return 1800;
+      return 600;
     }
 
-    const int interval = cpuPresentationIntervalMs();
-    if (interval >= 40) {
-      return 1600;
+    if (decodedFrames_ < 60) {
+      return 350;
     }
 
-    return 1400;
+    return 220;
   }
 
   const int interval = cpuPresentationIntervalMs();
@@ -315,6 +399,166 @@ int NativeHwPlayerBackend::dropDelayThresholdMs() const {
   }
 
   return 140;
+}
+
+int NativeHwPlayerBackend::targetPlaybackDelayMs() const {
+  /*
+    Alvo base do relógio de live IPTV. Mantemos 90ms no render nativo porque
+    foi o ponto que eliminou engasgos e drift em testes longos. O ajuste fino
+    de A/V não deve aumentar este alvo base, senão o player espera demais,
+    chega perto do threshold de drop e volta a produzir microtravadas.
+  */
+  return nativeRendererReady_ && nativeRenderer_ ? 90 : 120;
+}
+
+int NativeHwPlayerBackend::audioLeadCompensationMs(int audioQueuedMs) const {
+  if (!nativeRendererReady_ || !nativeRenderer_) {
+    return 0;
+  }
+
+  /*
+    Compensação visual pequena para a latência de saída do SDL. Ela é usada
+    apenas como margem de apresentação, não como novo alvo de recuperação.
+    Assim o vídeo pode esperar alguns ms pelo áudio sem reintroduzir drops.
+  */
+  if (audioQueuedMs >= 450) {
+    return 24;
+  }
+
+  if (audioQueuedMs >= 350) {
+    return 18;
+  }
+
+  if (audioQueuedMs >= 250) {
+    return 12;
+  }
+
+  return 0;
+}
+
+int NativeHwPlayerBackend::effectiveTargetPlaybackDelayMs(int audioQueuedMs) const {
+  return targetPlaybackDelayMs() + audioLeadCompensationMs(audioQueuedMs);
+}
+
+int NativeHwPlayerBackend::streamPanicDelayMs() const {
+  /*
+    Acima disso não é mais caso de descartar alguns frames. O log de travadas
+    mostrou o delay saltando de ~700ms para vários segundos enquanto av_read_frame
+    bloqueava. Para live IPTV, a recuperação correta é rebase de clock.
+  */
+  return nativeRendererReady_ && nativeRenderer_ ? 1200 : 900;
+}
+
+int NativeHwPlayerBackend::decodeStallBudgetMs() const {
+  /*
+    Um único decode/drop não deve prender o update por muito tempo. Se prendeu,
+    a fonte atrasou e precisamos abandonar a compensação acumulada.
+  */
+  return nativeRendererReady_ && nativeRenderer_ ? 650 : 450;
+}
+
+int NativeHwPlayerBackend::dropLoopBudgetMs() const {
+  /*
+    Mesmo com drop barato, o loop de recuperação não pode consumir o frame loop.
+  */
+  return nativeRendererReady_ && nativeRenderer_ ? 180 : 120;
+}
+
+bool NativeHwPlayerBackend::recoverIfPlaybackPanic(long long now, const char *reason) {
+  if (!clockStarted_) {
+    return false;
+  }
+
+  const long long delayBefore = playbackDelayMs(now);
+  const long long sincePresentedMs =
+    lastPresentedVideoWallMs_ > 0 ? now - lastPresentedVideoWallMs_ : 0;
+
+  const bool delayPanic = delayBefore > streamPanicDelayMs();
+  const bool frameStarved = sincePresentedMs > 2000 && delayBefore > dropDelayThresholdMs();
+
+  if (!delayPanic && !frameStarved) {
+    return false;
+  }
+
+  const int audioQueuedMs = decoder_.audioQueuedMs();
+
+  if (audioQueuedMs > 0) {
+    decoder_.clearAudioQueue();
+  }
+
+  resetClockToCurrentFrame(now);
+
+  logLinef(
+    "[KBORE][PLAYBACK][RECOVER] live resync reason=%s delayBefore=%lldms delayAfter=%lldms panic=%d threshold=%d sinceFrame=%lldms audioQ=%dms decoded=%d dropped=%d",
+    reason ? reason : "unknown",
+    delayBefore,
+    playbackDelayMs(now),
+    delayPanic ? 1 : 0,
+    streamPanicDelayMs(),
+    sincePresentedMs,
+    audioQueuedMs,
+    decodedFrames_,
+    droppedFrames_
+  );
+
+  return true;
+}
+
+void NativeHwPlayerBackend::rebalanceAudioQueue(long long now) {
+  const int audioQueuedMs = decoder_.audioQueuedMs();
+
+  if (audioQueuedMs <= 0) {
+    return;
+  }
+
+  const long long delay = playbackDelayMs(now);
+
+  /*
+    Se o áudio acumulou muita fila, ele passa a tocar tarde.
+    Limpamos somente em caso alto/seguro, para evitar o cenário inverso
+    relatado: vídeo adiantado e áudio atrasado.
+  */
+  if (audioQueuedMs > 800 || (audioQueuedMs > 600 && delay < -targetPlaybackDelayMs())) {
+    decoder_.clearAudioQueue();
+
+    logLinef(
+      "[KBORE][PLAYBACK][QUALITY] cleared audio queue audioQ=%dms delay=%lldms target=%d",
+      audioQueuedMs,
+      delay,
+      effectiveTargetPlaybackDelayMs(audioQueuedMs)
+    );
+
+    return;
+  }
+
+  logStreamQuality(now, delay, audioQueuedMs);
+}
+
+void NativeHwPlayerBackend::logStreamQuality(long long now, long long delayMs, int audioQueuedMs) {
+  const bool unstable =
+    delayMs > dropDelayThresholdMs() ||
+    delayMs < -dropDelayThresholdMs() ||
+    audioQueuedMs > 600;
+
+  if (!unstable && now - lastQualityLogWallMs_ < 5000) {
+    return;
+  }
+
+  if (now - lastQualityLogWallMs_ < 1000) {
+    return;
+  }
+
+  logLinef(
+    "[KBORE][PLAYBACK][QUALITY] delay=%lldms target=%d dropThreshold=%d audioQ=%dms decoded=%d dropped=%d",
+    delayMs,
+    effectiveTargetPlaybackDelayMs(audioQueuedMs),
+    dropDelayThresholdMs(),
+    audioQueuedMs,
+    decodedFrames_,
+    droppedFrames_
+  );
+
+  lastQualityLogWallMs_ = now;
 }
 
 void NativeHwPlayerBackend::updateCpuFrameCost(long long elapsedMs) {
@@ -342,42 +586,40 @@ bool NativeHwPlayerBackend::open(const std::string &url) {
   nativeRendererStatus_.clear();
   resetClock();
 
-#ifndef NSTV_ENABLE_NATIVE_HW_PLAYER
-  error_ =
-    "Native hardware player is not enabled. "
-    "Build with NSTV_ENABLE_NATIVE_HW_PLAYER to run the native hardware player.";
-
-  open_ = false;
-  return false;
-#else
-  if (!demuxer_.open(url)) {
-    error_ = demuxer_.error();
+  auto failOpen = [this](const std::string &message) -> bool {
+    const std::string preserved = message;
+    close();
+    error_ = preserved;
     open_ = false;
     return false;
+  };
+
+#ifndef NSTV_ENABLE_NATIVE_HW_PLAYER
+  return failOpen(
+    "Native hardware player is not enabled. "
+    "Build with NSTV_ENABLE_NATIVE_HW_PLAYER to run the native hardware player."
+  );
+#else
+  if (!demuxer_.open(url)) {
+    return failOpen(demuxer_.error());
   }
 
   if (!hwProbe_.probeVideo(demuxer_)) {
-    error_ = hwProbe_.error();
-    open_ = false;
-    return false;
+    return failOpen(hwProbe_.error());
   }
 
   if (!hwProbe_.hasUsableDeviceConfig()) {
-    error_ =
+    return failOpen(
       hwProbe_.summary() +
-      " | result: current FFmpeg exposes no usable hardware device config.";
-
-    open_ = false;
-    return false;
+      " | result: current FFmpeg exposes no usable hardware device config."
+    );
   }
 
   if (!hwProbe_.createBestDevice()) {
-    error_ =
+    return failOpen(
       hwProbe_.summary() +
-      " | result: FFmpeg exposes a hardware config, but AVHWDeviceContext creation failed.";
-
-    open_ = false;
-    return false;
+      " | result: FFmpeg exposes a hardware config, but AVHWDeviceContext creation failed."
+    );
   }
 
   if (!decoder_.openVideoHardware(
@@ -385,20 +627,16 @@ bool NativeHwPlayerBackend::open(const std::string &url) {
         hwProbe_.deviceContext(),
         hwProbe_.selectedHwPixelFormat()
       )) {
-    error_ =
+    return failOpen(
       "Native HW device created, but decoder hardware open failed: " +
       decoder_.error() +
       " | hwProbe=" +
-      hwProbe_.summary();
-
-    open_ = false;
-    return false;
+      hwProbe_.summary()
+    );
   }
 
   if (!decoder_.openAudio(demuxer_)) {
-    error_ = decoder_.error();
-    open_ = false;
-    return false;
+    return failOpen(decoder_.error());
   }
 
   if (nativeVideoAllowed_ && preferNativeRenderer_) {
@@ -438,7 +676,7 @@ bool NativeHwPlayerBackend::open(const std::string &url) {
 
   if (nativeVideoAllowed_ && nativeRendererReady_ && nativeRenderer_) {
 #ifdef NSTV_USE_FFMPEG
-    if (decoder_.decodeNextHardwareFrame(demuxer_)) {
+    if (decoder_.decodeNextHardwareFrame(demuxer_, 1200)) {
       const AVFrame *frame = decoder_.latestHardwareFrame();
 
       if (nativeRenderer_->canRender(frame) && nativeRenderer_->renderFrame(frame)) {
@@ -472,28 +710,24 @@ bool NativeHwPlayerBackend::open(const std::string &url) {
   if (!nativeFramePresented_) {
     const long long firstDecodeStartMs = nowMs();
 
-    if (!decoder_.decodeNextVideoFrame(demuxer_, true, &yuvFrame_)) {
-      error_ =
+    if (!decoder_.decodeNextVideoFrame(demuxer_, true, &yuvFrame_, 1200)) {
+      return failOpen(
         "Native HW decoder opened, but first frame decode failed: " +
         decoder_.error() +
         " | decoder=" +
         decoder_.summary() +
         " | hwProbe=" +
-        hwProbe_.summary();
-
-      open_ = false;
-      return false;
+        hwProbe_.summary()
+      );
     }
 
     updateCpuFrameCost(nowMs() - firstDecodeStartMs);
 
     if (!yuvFrame_.valid()) {
-      error_ =
+      return failOpen(
         "Native HW first frame decoded, but YuvFrame is invalid: " +
-        decoder_.summary();
-
-      open_ = false;
-      return false;
+        decoder_.summary()
+      );
     }
   }
 
@@ -511,12 +745,13 @@ bool NativeHwPlayerBackend::open(const std::string &url) {
 
 void NativeHwPlayerBackend::close() {
 #ifdef NSTV_ENABLE_NATIVE_HW_PLAYER
+  decoder_.stopAudio();
+
   if (nativeRenderer_) {
     nativeRenderer_->shutdown();
     nativeRenderer_.reset();
   }
 
-  decoder_.stopAudio();
   decoder_.close();
   demuxer_.close();
   hwProbe_.closeDevice();
@@ -621,12 +856,18 @@ bool NativeHwPlayerBackend::update() {
 
   const long long now = nowMs();
 
+  rebalanceAudioQueue(now);
+
+  if (recoverIfPlaybackPanic(now, "pre-decode")) {
+    return hasFrame();
+  }
+
   if (!shouldDecodeNow(now)) {
     return hasFrame();
   }
 
   /*
-    Se estamos atrasados, pulamos até 2 frames SEM transferir para CPU.
+    Se estamos atrasados, pulamos frames proporcionalmente SEM transferir para CPU.
 
     Isso reduz bastante o custo em HD/FHD, porque evita:
       - av_hwframe_transfer_data()
@@ -645,16 +886,37 @@ bool NativeHwPlayerBackend::update() {
     Podemos permitir mais drops por update para HD/FHD.
   */
   const int maxDrops = maxDropsPerUpdate(dropStartDelayMs);
+  const long long dropLoopStartMs = nowMs();
 
   while (dropped < maxDrops && shouldDropFrames(nowMs())) {
+    const long long singleDropStartMs = nowMs();
+
     if (!decoder_.dropNextVideoFrame(demuxer_)) {
       error_ = decoder_.error();
       break;
     }
 
+    const long long singleDropEndMs = nowMs();
+
     syncClockFromLatestFrame();
     ++dropped;
     ++droppedFrames_;
+
+    if (singleDropEndMs - singleDropStartMs > decodeStallBudgetMs()) {
+      recoverIfPlaybackPanic(singleDropEndMs, "drop-read-stall");
+      break;
+    }
+
+    if (singleDropEndMs - dropLoopStartMs > dropLoopBudgetMs()) {
+      logLinef(
+        "[KBORE][PLAYBACK][RECOVER] capped drop loop elapsed=%lldms dropped=%d delay=%lldms budget=%d",
+        singleDropEndMs - dropLoopStartMs,
+        dropped,
+        playbackDelayMs(singleDropEndMs),
+        dropLoopBudgetMs()
+      );
+      break;
+    }
   }
 
   if (dropped > 0) {
@@ -683,8 +945,16 @@ bool NativeHwPlayerBackend::update() {
     lastPresentedVideoWallMs_ > 0 &&
     nowMs() - lastPresentedVideoWallMs_ < cpuInterval
   ) {
+    const long long skipStartMs = nowMs();
+
     if (decoder_.dropNextVideoFrame(demuxer_)) {
+      const long long skipEndMs = nowMs();
       syncClockFromLatestFrame();
+
+      if (skipEndMs - skipStartMs > decodeStallBudgetMs()) {
+        recoverIfPlaybackPanic(skipEndMs, "cpu-rate-skip-stall");
+      }
+
       error_.clear();
     } else {
       error_ = decoder_.error();
@@ -704,12 +974,23 @@ bool NativeHwPlayerBackend::update() {
 
   if (nativeVideoAllowed_ && nativeRendererReady_ && nativeRenderer_) {
 #ifdef NSTV_USE_FFMPEG
+    const long long decodeStartMs = nowMs();
+
     if (decoder_.decodeNextHardwareFrame(demuxer_)) {
+      const long long decodeEndMs = nowMs();
       const AVFrame *frame = decoder_.latestHardwareFrame();
 
       if (nativeRenderer_->canRender(frame) && nativeRenderer_->renderFrame(frame)) {
         nativeFramePresented_ = true;
         syncClockFromLatestFrame();
+        lastPresentedVideoWallMs_ = nowMs();
+
+        if (decodeEndMs - decodeStartMs > decodeStallBudgetMs()) {
+          recoverIfPlaybackPanic(lastPresentedVideoWallMs_, "hardware-decode-stall");
+        } else {
+          recoverIfPlaybackPanic(lastPresentedVideoWallMs_, "hardware-delay-panic");
+        }
+
         error_.clear();
         return true;
       }
@@ -739,7 +1020,9 @@ bool NativeHwPlayerBackend::update() {
     return hasFrame();
   }
 
-  updateCpuFrameCost(nowMs() - decodeStartMs);
+  const long long decodeEndMs = nowMs();
+
+  updateCpuFrameCost(decodeEndMs - decodeStartMs);
 
   if (!yuvFrame_.valid()) {
     error_ = "Native decoded frame is invalid: " + decoder_.summary();
@@ -748,6 +1031,12 @@ bool NativeHwPlayerBackend::update() {
 
   syncClockFromLatestFrame();
   lastPresentedVideoWallMs_ = nowMs();
+
+  if (decodeEndMs - decodeStartMs > decodeStallBudgetMs()) {
+    recoverIfPlaybackPanic(lastPresentedVideoWallMs_, "cpu-decode-stall");
+  } else {
+    recoverIfPlaybackPanic(lastPresentedVideoWallMs_, "cpu-delay-panic");
+  }
 
   error_.clear();
 

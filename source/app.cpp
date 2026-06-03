@@ -613,7 +613,9 @@ void App::handle(Button button) {
 
       if (button == Button::Back) {
         if (player_) {
+          logLine("[KBORE][PLAYBACK][LIFECYCLE] closing player on Back");
           player_->close();
+          player_.reset();
         }
 
         gfx_.resumeAfterNativeVideo();
@@ -2320,6 +2322,20 @@ void App::playSelectedChannel() {
     return;
   }
 
+  /*
+    Troca de stream no Switch precisa ser tratada como troca de sessão.
+    Reutilizar o mesmo backend depois de Deko3D/NVTEGRA ativo pode deixar
+    frames, audio device ou wrappers de memória da sessão anterior vivos por
+    tempo suficiente para quebrar a próxima inicialização.
+  */
+  if (player_) {
+    logLine("[KBORE][PLAYBACK][LIFECYCLE] closing previous player before opening another stream");
+    player_->close();
+    player_.reset();
+    gfx_.resumeAfterNativeVideo();
+    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+  }
+
   loadSelectedEpg(false, true);
   loadEpgForChannels(std::vector<Channel>{*channel});
 
@@ -2334,9 +2350,7 @@ void App::playSelectedChannel() {
 
   render();
 
-  if (!player_) {
-    player_ = createPlayerBackend();
-  }
+  player_ = createPlayerBackend();
 
   gfx_.suspendForNativeVideo();
   player_->setNativeVideoAllowed(true);
@@ -2353,19 +2367,26 @@ void App::playSelectedChannel() {
     state_.playerLoadFailed = false;
     state_.playerErrorMessage.clear();
   } else {
+    const std::string openError = player_ ? player_->error() : "Player backend not available";
+
     logLinef(
       "[KBORE][PLAYBACK] failed to load %s stream name='%s' error='%s' url=%s",
       toString(channel->type).c_str(),
       channel->name.c_str(),
-      player_->error().c_str(),
+      openError.c_str(),
       channel->url.c_str()
     );
     state_.message = "Failed to load video";
     state_.playerStarted = false;
     state_.playerLoading = false;
     state_.playerLoadFailed = true;
-    state_.playerErrorMessage = player_->error();
+    state_.playerErrorMessage = openError;
     gfx_.resumeAfterNativeVideo();
+
+    if (player_) {
+      player_->close();
+      player_.reset();
+    }
   }
 }
 
