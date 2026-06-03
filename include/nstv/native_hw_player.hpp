@@ -99,6 +99,8 @@ private:
   int maxDropsPerUpdate(long long currentDelayMs) const;
   int dropDelayThresholdMs() const;
   int targetPlaybackDelayMs() const;
+  int audioLeadCompensationMs(int audioQueuedMs) const;
+  int effectiveTargetPlaybackDelayMs(int audioQueuedMs) const;
   void rebalanceAudioQueue(long long now);
   void logStreamQuality(long long now, long long delayMs, int audioQueuedMs);
   bool recoverIfPlaybackPanic(long long now, const char *reason);

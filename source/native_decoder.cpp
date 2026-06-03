@@ -1097,8 +1097,8 @@ bool NativeDecoder::decodeAudioPacketToSdl(AVPacket *packet) {
         precisava recuperar. Para streaming ao vivo, mantemos uma fila
         curta e descartamos áudio excedente em vez de acumular latência.
       */
-      const Uint32 targetMaxQueue = (bytesPerSecond * 550u) / 1000u; // ~550ms
-      const Uint32 emergencyMaxQueue = (bytesPerSecond * 900u) / 1000u; // ~900ms
+      const Uint32 targetMaxQueue = (bytesPerSecond * 450u) / 1000u; // ~450ms
+      const Uint32 emergencyMaxQueue = (bytesPerSecond * 800u) / 1000u; // ~800ms
 
       if (queued > emergencyMaxQueue) {
         SDL_ClearQueuedAudio(impl_->audioDevice);

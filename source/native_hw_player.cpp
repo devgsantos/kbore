@@ -147,9 +147,10 @@ void NativeHwPlayerBackend::syncClockFromLatestFrame() {
     const long long delay = playbackDelayMs(now);
 
     const int audioQueuedMs = decoder_.audioQueuedMs();
+    const int effectiveTargetMs = effectiveTargetPlaybackDelayMs(audioQueuedMs);
 
     if (
-      delay > targetPlaybackDelayMs() ||
+      delay > effectiveTargetMs ||
       delay < -targetPlaybackDelayMs() ||
       decodedFrames_ <= 3 ||
       decodedFrames_ % 120 == 0
@@ -159,7 +160,7 @@ void NativeHwPlayerBackend::syncClockFromLatestFrame() {
         decodedFrames_,
         interval,
         delay,
-        targetPlaybackDelayMs(),
+        effectiveTargetMs,
         audioQueuedMs,
         ptsDelta,
         firstPtsMs_,
@@ -169,15 +170,16 @@ void NativeHwPlayerBackend::syncClockFromLatestFrame() {
 
     /*
       Controlador inteligente de clock:
-      - se o vídeo está atrasado, reduzimos agressivamente o intervalo
-        para recuperar sem esperar o atraso chegar a quase 1s;
-      - se o vídeo ficou adiantado demais, desaceleramos levemente para
-        evitar o efeito contrário, onde o áudio parece vir depois.
+      - se o vídeo está atrasado, reduzimos agressivamente o intervalo;
+      - se o áudio está com fila alta, aumentamos suavemente o alvo efetivo
+        do vídeo para compensar a latência real de saída do áudio no SDL.
+        Isso corrige o caso de vídeo levemente adiantado sem mexer no
+        resync de emergência que estabilizou transmissões longas.
     */
-    if (delay > targetPlaybackDelayMs()) {
+    if (delay > effectiveTargetMs) {
       const int reduction = std::min(
         std::max(1, interval - 8),
-        std::max(2, static_cast<int>((delay - targetPlaybackDelayMs()) / 30))
+        std::max(2, static_cast<int>((delay - effectiveTargetMs) / 30))
       );
       interval = std::max(8, interval - reduction);
     } else if (delay < -targetPlaybackDelayMs()) {
@@ -202,14 +204,32 @@ bool NativeHwPlayerBackend::shouldDecodeNow(long long now) const {
   }
 
   const long long delay = playbackDelayMs(now);
+  const int audioQueuedMs = decoder_.audioQueuedMs();
+  const int effectiveTargetMs = effectiveTargetPlaybackDelayMs(audioQueuedMs);
 
   /*
     Atraso de vídeo é tratado como emergência progressiva.
-    Não esperamos o próximo due-time quando o vídeo já passou do alvo,
-    porque isso só acumula drift e obriga o áudio a andar sozinho.
+    Usamos o alvo efetivo com compensação de áudio para não acelerar o vídeo
+    quando ele já está visualmente um pouco à frente da saída de áudio.
   */
-  if (delay > targetPlaybackDelayMs()) {
+  if (delay > effectiveTargetMs) {
     return true;
+  }
+
+  /*
+    Ajuste fino A/V: se a fila de áudio está saudável, mas o vídeo está
+    chegando cedo demais em relação ao alvo efetivo, seguramos pouquíssimo
+    o próximo frame. O limite baixo evita perda perceptível de fluidez.
+  */
+  if (
+    nativeRendererReady_ &&
+    nativeRenderer_ &&
+    decodedFrames_ > 12 &&
+    audioQueuedMs >= 250 &&
+    delay + 12 < effectiveTargetMs
+  ) {
+    const long long holdMs = std::min(36LL, static_cast<long long>(effectiveTargetMs - delay) / 2);
+    return now >= nextFrameDueMs_ + holdMs;
   }
 
   /*
@@ -383,11 +403,40 @@ int NativeHwPlayerBackend::dropDelayThresholdMs() const {
 
 int NativeHwPlayerBackend::targetPlaybackDelayMs() const {
   /*
-    Alvo conservador para IPTV ao vivo no Switch.
-    90ms é baixo o suficiente para manter áudio/vídeo colados e ainda
-    dá pequena folga contra jitter de rede/renderização.
+    Alvo base para IPTV ao vivo no Switch. O ajuste fino de A/V é aplicado
+    separadamente em effectiveTargetPlaybackDelayMs(), porque depende da fila
+    real de áudio no SDL.
   */
   return nativeRendererReady_ && nativeRenderer_ ? 90 : 120;
+}
+
+int NativeHwPlayerBackend::audioLeadCompensationMs(int audioQueuedMs) const {
+  if (!nativeRendererReady_ || !nativeRenderer_) {
+    return 0;
+  }
+
+  /*
+    SDL_QueueAudio introduz uma pequena latência de saída. Quando a fila está
+    entre ~350-550ms, o vídeo pode parecer levemente adiantado mesmo com o
+    relógio de vídeo em ~90ms. Compensamos de forma suave, sem forçar drops.
+  */
+  if (audioQueuedMs >= 450) {
+    return 35;
+  }
+
+  if (audioQueuedMs >= 350) {
+    return 25;
+  }
+
+  if (audioQueuedMs >= 250) {
+    return 15;
+  }
+
+  return 0;
+}
+
+int NativeHwPlayerBackend::effectiveTargetPlaybackDelayMs(int audioQueuedMs) const {
+  return targetPlaybackDelayMs() + audioLeadCompensationMs(audioQueuedMs);
 }
 
 int NativeHwPlayerBackend::streamPanicDelayMs() const {
@@ -468,7 +517,7 @@ void NativeHwPlayerBackend::rebalanceAudioQueue(long long now) {
     Limpamos somente em caso alto/seguro, para evitar o cenário inverso
     relatado: vídeo adiantado e áudio atrasado.
   */
-  if (audioQueuedMs > 900 || (audioQueuedMs > 650 && delay < -targetPlaybackDelayMs())) {
+  if (audioQueuedMs > 800 || (audioQueuedMs > 600 && delay < -targetPlaybackDelayMs())) {
     decoder_.clearAudioQueue();
 
     logLinef(
@@ -536,42 +585,40 @@ bool NativeHwPlayerBackend::open(const std::string &url) {
   nativeRendererStatus_.clear();
   resetClock();
 
-#ifndef NSTV_ENABLE_NATIVE_HW_PLAYER
-  error_ =
-    "Native hardware player is not enabled. "
-    "Build with NSTV_ENABLE_NATIVE_HW_PLAYER to run the native hardware player.";
-
-  open_ = false;
-  return false;
-#else
-  if (!demuxer_.open(url)) {
-    error_ = demuxer_.error();
+  auto failOpen = [this](const std::string &message) -> bool {
+    const std::string preserved = message;
+    close();
+    error_ = preserved;
     open_ = false;
     return false;
+  };
+
+#ifndef NSTV_ENABLE_NATIVE_HW_PLAYER
+  return failOpen(
+    "Native hardware player is not enabled. "
+    "Build with NSTV_ENABLE_NATIVE_HW_PLAYER to run the native hardware player."
+  );
+#else
+  if (!demuxer_.open(url)) {
+    return failOpen(demuxer_.error());
   }
 
   if (!hwProbe_.probeVideo(demuxer_)) {
-    error_ = hwProbe_.error();
-    open_ = false;
-    return false;
+    return failOpen(hwProbe_.error());
   }
 
   if (!hwProbe_.hasUsableDeviceConfig()) {
-    error_ =
+    return failOpen(
       hwProbe_.summary() +
-      " | result: current FFmpeg exposes no usable hardware device config.";
-
-    open_ = false;
-    return false;
+      " | result: current FFmpeg exposes no usable hardware device config."
+    );
   }
 
   if (!hwProbe_.createBestDevice()) {
-    error_ =
+    return failOpen(
       hwProbe_.summary() +
-      " | result: FFmpeg exposes a hardware config, but AVHWDeviceContext creation failed.";
-
-    open_ = false;
-    return false;
+      " | result: FFmpeg exposes a hardware config, but AVHWDeviceContext creation failed."
+    );
   }
 
   if (!decoder_.openVideoHardware(
@@ -579,20 +626,16 @@ bool NativeHwPlayerBackend::open(const std::string &url) {
         hwProbe_.deviceContext(),
         hwProbe_.selectedHwPixelFormat()
       )) {
-    error_ =
+    return failOpen(
       "Native HW device created, but decoder hardware open failed: " +
       decoder_.error() +
       " | hwProbe=" +
-      hwProbe_.summary();
-
-    open_ = false;
-    return false;
+      hwProbe_.summary()
+    );
   }
 
   if (!decoder_.openAudio(demuxer_)) {
-    error_ = decoder_.error();
-    open_ = false;
-    return false;
+    return failOpen(decoder_.error());
   }
 
   if (nativeVideoAllowed_ && preferNativeRenderer_) {
@@ -667,27 +710,23 @@ bool NativeHwPlayerBackend::open(const std::string &url) {
     const long long firstDecodeStartMs = nowMs();
 
     if (!decoder_.decodeNextVideoFrame(demuxer_, true, &yuvFrame_, 1200)) {
-      error_ =
+      return failOpen(
         "Native HW decoder opened, but first frame decode failed: " +
         decoder_.error() +
         " | decoder=" +
         decoder_.summary() +
         " | hwProbe=" +
-        hwProbe_.summary();
-
-      open_ = false;
-      return false;
+        hwProbe_.summary()
+      );
     }
 
     updateCpuFrameCost(nowMs() - firstDecodeStartMs);
 
     if (!yuvFrame_.valid()) {
-      error_ =
+      return failOpen(
         "Native HW first frame decoded, but YuvFrame is invalid: " +
-        decoder_.summary();
-
-      open_ = false;
-      return false;
+        decoder_.summary()
+      );
     }
   }
 
@@ -705,12 +744,13 @@ bool NativeHwPlayerBackend::open(const std::string &url) {
 
 void NativeHwPlayerBackend::close() {
 #ifdef NSTV_ENABLE_NATIVE_HW_PLAYER
+  decoder_.stopAudio();
+
   if (nativeRenderer_) {
     nativeRenderer_->shutdown();
     nativeRenderer_.reset();
   }
 
-  decoder_.stopAudio();
   decoder_.close();
   demuxer_.close();
   hwProbe_.closeDevice();
