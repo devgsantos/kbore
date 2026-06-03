@@ -627,6 +627,7 @@ void App::handle(Button button) {
         state_.playerLoading = false;
         state_.playerLoadFailed = false;
         state_.playerErrorMessage.clear();
+        state_.hasPlaybackChannel = false;
       } else if (button == Button::Select) {
         if (player_) {
           player_->togglePause();
@@ -849,7 +850,7 @@ void App::handleDashboard(Button button) {
           }
 
           if (nodeChildrenAreItems(*node)) {
-            state_.focus = FocusColumn::Categories;
+            state_.focus = FocusColumn::Channels;
             state_.selectedChannel = 0;
             normalizeIndexes();
             loadVisibleEpgForChannelList();
@@ -876,6 +877,21 @@ void App::handleDashboard(Button button) {
         MediaNode *preview = selectedPreviewNode();
 
         if (!preview) {
+          // When the item list is focused but still empty, pressing A loads it
+          // from the parent/category currently in focus instead of doing
+          // nothing. This preserves the dynamic tree behavior for empty lists.
+          MediaNode *node = selectedCurrentNode();
+          if (node && nodeCanHaveChildren(*node)) {
+            if (!ensureNodeChildrenLoaded(*node)) {
+              return;
+            }
+            state_.selectedChannel = 0;
+            state_.focus = FocusColumn::Channels;
+            normalizeIndexes();
+            loadVisibleEpgForChannelList();
+            loadSelectedEpg(false, false);
+            return;
+          }
           return;
         }
 
@@ -884,12 +900,14 @@ void App::handleDashboard(Button button) {
             return;
           }
 
+          const bool previewContainsItems = nodeChildrenAreItems(*preview) || preview->children.empty();
+
           // Preview nodes are children of the currently selected category.
           state_.nodePath.push_back(state_.selectedCategory);
           state_.nodePath.push_back(state_.selectedChannel);
           state_.selectedCategory = 0;
           state_.selectedChannel = 0;
-          state_.focus = FocusColumn::Categories;
+          state_.focus = previewContainsItems ? FocusColumn::Channels : FocusColumn::Categories;
           normalizeIndexes();
           loadVisibleEpgForChannelList();
           loadSelectedEpg(false, false);
@@ -1065,7 +1083,8 @@ void App::handleAddPlaylist(Button button) {
   const int playlistCount = static_cast<int>(state_.config.playlists.size());
   const int addM3uIndex = playlistCount;
   const int addXtreamIndex = playlistCount + 1;
-  const int backIndex = playlistCount + 2;
+  const int settingsIndex = playlistCount + 2;
+  const int backIndex = playlistCount + 3;
   const int maxIndex = backIndex;
 
   if (button == Button::Back) {
@@ -1108,6 +1127,11 @@ void App::handleAddPlaylist(Button button) {
 
     if (state_.selectedAddOption == addXtreamIndex) {
       addXtreamPlaylist();
+      return;
+    }
+
+    if (state_.selectedAddOption == settingsIndex) {
+      state_.screen = ScreenId::Settings;
       return;
     }
 
@@ -2322,6 +2346,10 @@ void App::playSelectedChannel() {
     return;
   }
 
+  openChannel(*channel);
+}
+
+void App::openChannel(const Channel &channel) {
   /*
     Troca de stream no Switch precisa ser tratada como troca de sessão.
     Reutilizar o mesmo backend depois de Deko3D/NVTEGRA ativo pode deixar
@@ -2336,8 +2364,11 @@ void App::playSelectedChannel() {
     std::this_thread::sleep_for(std::chrono::milliseconds(40));
   }
 
+  state_.hasPlaybackChannel = true;
+  state_.playbackChannel = channel;
+
   loadSelectedEpg(false, true);
-  loadEpgForChannels(std::vector<Channel>{*channel});
+  loadEpgForChannels(std::vector<Channel>{channel});
 
   state_.screen = ScreenId::Player;
   state_.message = "Loading video";
@@ -2356,12 +2387,12 @@ void App::playSelectedChannel() {
   player_->setNativeVideoAllowed(true);
   player_->setOverlayVisible(true);
 
-  if (player_->open(channel->url)) {
+  if (player_->open(channel.url)) {
     if (!player_->nativeVideoActive() && gfx_.isSuspendedForNativeVideo()) {
       gfx_.resumeAfterNativeVideo();
     }
 
-    state_.message = "Playing: " + channel->name;
+    state_.message = "Playing: " + channel.name;
     state_.playerStarted = true;
     state_.playerLoading = false;
     state_.playerLoadFailed = false;
@@ -2371,10 +2402,10 @@ void App::playSelectedChannel() {
 
     logLinef(
       "[KBORE][PLAYBACK] failed to load %s stream name='%s' error='%s' url=%s",
-      toString(channel->type).c_str(),
-      channel->name.c_str(),
+      toString(channel.type).c_str(),
+      channel.name.c_str(),
       openError.c_str(),
-      channel->url.c_str()
+      channel.url.c_str()
     );
     state_.message = "Failed to load video";
     state_.playerStarted = false;
@@ -2725,9 +2756,13 @@ bool App::ensureNodeChildrenLoaded(MediaNode &node) {
   std::vector<MediaNode> items;
   bool usedOnlyCache = true;
 
+  const std::string loadingKey = "node:" + node.id;
+
   try {
-    state_.loading = true;
-    state_.loadingMessage = "Loading folder...";
+    state_.loading = false;
+    state_.loadingMessage.clear();
+    state_.channelListLoading = true;
+    state_.channelListLoadingKey = loadingKey;
     state_.message = "Loading " + (node.title.empty() ? node.name : node.title) + "...";
     render();
 
@@ -2785,6 +2820,10 @@ bool App::ensureNodeChildrenLoaded(MediaNode &node) {
   } catch (const std::exception &ex) {
     state_.loading = false;
     state_.loadingMessage.clear();
+    if (state_.channelListLoadingKey == loadingKey) {
+      state_.channelListLoading = false;
+      state_.channelListLoadingKey.clear();
+    }
     state_.message = "Failed to load folder items.";
     std::printf("[KBORE] node children load failed: %s\n", ex.what());
     return false;
@@ -2792,6 +2831,10 @@ bool App::ensureNodeChildrenLoaded(MediaNode &node) {
 
   state_.loading = false;
   state_.loadingMessage.clear();
+  if (state_.channelListLoadingKey == loadingKey) {
+    state_.channelListLoading = false;
+    state_.channelListLoadingKey.clear();
+  }
 
   node.children = std::move(items);
   node.childCount = std::max(node.childCount, static_cast<int>(node.children.size()));
@@ -2839,11 +2882,13 @@ void App::enterNode(const MediaNode &node, int childIndex) {
   // Empty children are valid after pressing A: the selected parent may have
   // been loaded from the API and legitimately returned zero items. Enter it so
   // the UI can render the empty list for that parent.
+  const bool enteredNodeContainsItems = nodeChildrenAreItems(node) || node.children.empty();
+
   state_.nodePath.push_back(childIndex);
   state_.selectedCategory = 0;
   state_.selectedChannel = 0;
   resetLoadedChannels();
-  state_.focus = FocusColumn::Categories;
+  state_.focus = enteredNodeContainsItems ? FocusColumn::Channels : FocusColumn::Categories;
 }
 
 void App::playNode(const MediaNode &node) {
@@ -2852,11 +2897,10 @@ void App::playNode(const MediaNode &node) {
     return;
   }
 
-  Channel channel = channelFromNode(node);
-  state_.loadedChannels.clear();
-  state_.loadedChannels.push_back(channel);
-  state_.selectedChannel = 0;
-  playSelectedChannel();
+  // Do not rewrite loadedChannels/selectedChannel here. In the dynamic tree
+  // browser the selected item lives in nodePreview, and replacing the channel
+  // list would make the cursor return to the top after playback.
+  openChannel(channelFromNode(node));
 }
 
 std::string App::breadcrumbText() const {
@@ -3082,11 +3126,14 @@ void App::renderDashboardGraphic() {
 
   auto drawLogoOrFallback = [&](const Channel &channel, int x, int y, int w, int h) {
     if (!channel.logo.empty()) {
-      const Bitmap *bitmap = imageCache_.get(channel.logo);
+      const Bitmap *bitmap = imageCache_.peek(channel.logo);
       if (bitmap && bitmap->valid()) {
         gfx_.drawImage(*bitmap, x, y, w, h);
         return;
       }
+
+      // Queue logo decoding/download without blocking list navigation.
+      imageCache_.request(channel.logo);
     }
 
     gfx_.drawLogoFallback(channel.name, x, y, w, h, 2);
@@ -3297,6 +3344,22 @@ void App::renderDashboardGraphic() {
     }
   }
 
+  const bool itemListLoading = state_.channelListLoading && (usingNodeTree() || channelPanelLoading);
+  if (itemListLoading) {
+    const char spinnerChars[4] = {'|', '/', '-', '\\'};
+    const int spinnerIndex = static_cast<int>((nowMs() / 140) % 4);
+    std::string spinner(1, spinnerChars[spinnerIndex]);
+    const int badgeW = 190;
+    const int badgeH = 34;
+    const int badgeX = channelsPanel.x + channelsPanel.w - badgeW - 22;
+    const int badgeY = channelsPanel.y + channelsPanel.h - badgeH - 18;
+
+    gfx_.fillRoundRect(badgeX, badgeY, badgeW, badgeH, 12, rgba(15, 23, 42, 235));
+    gfx_.strokeRoundRect(badgeX, badgeY, badgeW, badgeH, 12, rgba(0, 191, 255, 115), 1);
+    gfx_.drawText(spinner, badgeX + 16, badgeY + 8, 2, brightBlue, true);
+    gfx_.drawText("Loading items", badgeX + 42, badgeY + 10, 1, text, true);
+  }
+
   // Info panel: smaller footer text ----------------------------------------
   Rect info{18, 575, 1245, 88};
   gfx_.fillVerticalGradient(info.x, info.y, info.w, info.h, rgba(27,35,52,235), rgba(13,18,29,235));
@@ -3376,8 +3439,9 @@ void App::renderAddPlaylistGraphic() {
   const int playlistCount = static_cast<int>(state_.config.playlists.size());
   const int addM3uIndex = playlistCount;
   const int addXtreamIndex = playlistCount + 1;
-  const int backIndex = playlistCount + 2;
-  const int totalOptions = playlistCount + 3;
+  const int settingsIndex = playlistCount + 2;
+  const int backIndex = playlistCount + 3;
+  const int totalOptions = playlistCount + 4;
 
   const int rows = 6;
   const int start = windowStart(state_.selectedAddOption, totalOptions, rows);
@@ -3428,6 +3492,9 @@ void App::renderAddPlaylistGraphic() {
     } else if (optionIndex == addXtreamIndex) {
       title = "+ ADD XTREAM";
       subtitle = "Add server, username and password";
+    } else if (optionIndex == settingsIndex) {
+      title = "ABOUT / SETTINGS";
+      subtitle = "Disclaimer, credits and app information";
     } else {
       title = "BACK";
       subtitle = "Return to dashboard";
@@ -3446,7 +3513,7 @@ void App::renderAddPlaylistGraphic() {
 }
 
 void App::renderPlayerGraphic() {
-  const Channel *channel = selectedChannelPtr();
+  const Channel *channel = state_.hasPlaybackChannel ? &state_.playbackChannel : selectedChannelPtr();
 
   bool hasFrame = false;
   const bool isOpen = player_ && player_->isOpen();
@@ -3636,10 +3703,11 @@ void App::renderPlayerGraphic() {
       const int logoW = 76;
       const int logoH = 58;
       if (!channel->logo.empty()) {
-        const Bitmap *bitmap = imageCache_.get(channel->logo);
+        const Bitmap *bitmap = imageCache_.peek(channel->logo);
         if (bitmap && bitmap->valid()) {
           gfx_.drawImage(*bitmap, logoX, logoY, logoW, logoH);
         } else {
+          imageCache_.request(channel->logo);
           gfx_.drawLogoFallback(channel->name, logoX, logoY, logoW, logoH, 2);
         }
       } else {
@@ -3700,9 +3768,33 @@ void App::renderPlayerGraphic() {
 }
 
 void App::renderSettingsGraphic() {
-  gfx_.drawText("SETTINGS", 80, 80, 7, rgb(248,250,252), true);
-  gfx_.drawText("CONFIG: " + configPath(), 80, 160, 3, rgb(166,178,207), false);
-  gfx_.drawText("B BACK", 80, 620, 4, rgb(166,178,207), true);
+  const Color text = rgb(248, 250, 252);
+  const Color muted = rgb(166, 178, 207);
+  const Color blue = rgb(0, 191, 255);
+  const Color panelTop = rgb(16, 24, 45);
+  const Color panelBottom = rgb(7, 11, 22);
+
+  gfx_.fillVerticalGradient(0, 0, Graphics::Width, Graphics::Height, rgb(7, 11, 22), rgb(2, 5, 11));
+  gfx_.drawImageFileCentered("romfs:/logo/logo-horizontal.png", 34, 34, 300, 72);
+  gfx_.drawText("SETTINGS / ABOUT", 80, 120, 5, text, true);
+  gfx_.drawText("CONFIG: " + Graphics::fitText(configPath(), 72), 80, 158, 2, muted, false);
+
+  Rect about{80, 205, 1120, 365};
+  gfx_.fillVerticalGradient(about.x, about.y, about.w, about.h, panelTop, panelBottom);
+  gfx_.strokeRoundRect(about.x, about.y, about.w, about.h, 18, rgba(72, 92, 128, 55), 1);
+
+  gfx_.drawText("ABOUT KBORE", about.x + 34, about.y + 28, 4, text, true);
+  gfx_.drawText("Kboré is an IPTV/VOD player for user-provided playlists.", about.x + 34, about.y + 76, 2, muted, false);
+  gfx_.drawText("The app does not provide playlists, channels, movies, series or IPTV servers.", about.x + 34, about.y + 106, 2, muted, false);
+  gfx_.drawText("Kboré does not endorse, host, sponsor or verify any IPTV provider/server.", about.x + 34, about.y + 136, 2, muted, false);
+  gfx_.drawText("All content, playlist URLs, credentials and playback sources are the user's responsibility.", about.x + 34, about.y + 166, 2, muted, false);
+
+  gfx_.drawText("THIRD-PARTY LIBRARIES", about.x + 34, about.y + 220, 3, blue, true);
+  gfx_.drawText("Thanks to the open-source projects and third-party libraries used by this app,", about.x + 34, about.y + 256, 2, muted, false);
+  gfx_.drawText("including devkitPro/libnx, FFmpeg, Deko3D, SDL/cURL and related dependencies.", about.x + 34, about.y + 286, 2, muted, false);
+  gfx_.drawText("Thank you for using and supporting Kboré.", about.x + 34, about.y + 326, 2, text, true);
+
+  gfx_.drawText("A / B  BACK", 80, 632, 3, muted, true);
 }
 
 

@@ -70,6 +70,8 @@ struct AppState {
   bool playerLoading = false;
   bool playerLoadFailed = false;
   std::string playerErrorMessage;
+  bool hasPlaybackChannel = false;
+  Channel playbackChannel;
 };
 
 class App {
@@ -156,6 +158,7 @@ private:
   void importXtream();
   void loadCategory(bool append = false);
   void playSelectedChannel();
+  void openChannel(const Channel &channel);
   void resetLoadedChannels();
   void normalizeIndexes();
   void maybePreloadNextPage();

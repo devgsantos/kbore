@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <utility>
 #include <curl/curl.h>
 #include <zlib.h>
 #ifdef NSTV_USE_SDL_IMAGE
@@ -53,33 +54,145 @@ int paeth(int a, int b, int c) {
 
 } // namespace
 
+
+ImageCache::~ImageCache() {
+  stop_ = true;
+  cv_.notify_all();
+
+  if (worker_.joinable()) {
+    worker_.join();
+  }
+}
+
+void ImageCache::ensureWorkerLocked() {
+  if (!worker_.joinable()) {
+    stop_ = false;
+    worker_ = std::thread(&ImageCache::workerLoop, this);
+  }
+}
+
+void ImageCache::workerLoop() {
+  while (true) {
+    std::string url;
+
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      cv_.wait(lock, [this]() {
+        return stop_ || !queue_.empty();
+      });
+
+      if (stop_ && queue_.empty()) {
+        break;
+      }
+
+      url = queue_.front();
+      queue_.erase(queue_.begin());
+      queued_.erase(url);
+    }
+
+    Entry entry;
+    std::vector<uint8_t> bytes;
+
+    if (download(url, bytes) &&
+        (decodeSdlImage(bytes, entry.bitmap) || decodePng(bytes, entry.bitmap) || decodePpm(bytes, entry.bitmap))) {
+      entry.status = Status::Loaded;
+    } else {
+      entry.status = Status::Failed;
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      entries_[url] = std::move(entry);
+    }
+  }
+}
+
+const Bitmap *ImageCache::peek(const std::string &url) const {
+  if (url.empty()) {
+    return nullptr;
+  }
+
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto found = entries_.find(url);
+
+  if (found == entries_.end() || found->second.status != Status::Loaded) {
+    return nullptr;
+  }
+
+  return &found->second.bitmap;
+}
+
+bool ImageCache::isPending(const std::string &url) const {
+  if (url.empty()) {
+    return false;
+  }
+
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto found = entries_.find(url);
+  return found != entries_.end() && found->second.status == Status::Loading;
+}
+
+void ImageCache::request(const std::string &url) {
+  if (url.empty()) {
+    return;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto found = entries_.find(url);
+
+    if (found != entries_.end() && found->second.status != Status::Missing) {
+      return;
+    }
+
+    if (queued_.count(url)) {
+      return;
+    }
+
+    entries_[url].status = Status::Loading;
+    queue_.push_back(url);
+    queued_.insert(url);
+    ensureWorkerLocked();
+  }
+
+  cv_.notify_one();
+}
+
 const Bitmap *ImageCache::get(const std::string &url) {
   if (url.empty()) {
     return nullptr;
   }
 
-  auto found = entries_.find(url);
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto found = entries_.find(url);
 
-  if (found != entries_.end()) {
-    return found->second.status == Status::Loaded ? &found->second.bitmap : nullptr;
+    if (found != entries_.end()) {
+      return found->second.status == Status::Loaded ? &found->second.bitmap : nullptr;
+    }
   }
 
   Entry entry;
   std::vector<uint8_t> bytes;
 
-  if (download(url, bytes) && (decodeSdlImage(bytes, entry.bitmap) || decodePng(bytes, entry.bitmap) || decodePpm(bytes, entry.bitmap))) {
+  if (download(url, bytes) &&
+      (decodeSdlImage(bytes, entry.bitmap) || decodePng(bytes, entry.bitmap) || decodePpm(bytes, entry.bitmap))) {
     entry.status = Status::Loaded;
   } else {
     entry.status = Status::Failed;
   }
 
+  std::lock_guard<std::mutex> lock(mutex_);
   auto [it, _] = entries_.emplace(url, std::move(entry));
 
   return it->second.status == Status::Loaded ? &it->second.bitmap : nullptr;
 }
 
 void ImageCache::clear() {
+  std::lock_guard<std::mutex> lock(mutex_);
   entries_.clear();
+  queue_.clear();
+  queued_.clear();
 }
 
 bool ImageCache::download(const std::string &url, std::vector<uint8_t> &data) {
