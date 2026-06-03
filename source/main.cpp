@@ -7,7 +7,11 @@
 int main() {
   try {
     nstv::platformInit();
+#ifdef NSTV_PRODUCTION_BUILD
+    nstv::logLine("[KBORE] app started; production build; log file disabled");
+#else
     nstv::logLine("[KBORE] app started; log file: sdmc:/switch/kbore/kbore.log");
+#endif
     nstv::App app;
     int code = app.run();
     nstv::platformExit();

@@ -7,7 +7,9 @@ SOURCES        := source
 INCLUDES       := include
 
 HOST_CXX       ?= g++
-HOST_CXXFLAGS  = -std=c++17 -Wall -Wextra -O2 -DNSTV_USE_SDL -DNSTV_USE_SDL_TTF -DNSTV_USE_SDL_IMAGE $(HOST_FFMPEG_CFLAGS) -I$(INCLUDES)
+PRODUCTION     ?= 0
+HOST_PRODUCTION_FLAGS := $(if $(filter 1,$(PRODUCTION)),-DNSTV_PRODUCTION_BUILD,)
+HOST_CXXFLAGS  = -std=c++17 -Wall -Wextra -O2 -DNSTV_USE_SDL -DNSTV_USE_SDL_TTF -DNSTV_USE_SDL_IMAGE $(HOST_FFMPEG_CFLAGS) -I$(INCLUDES) $(HOST_PRODUCTION_FLAGS)
 HOST_SDL_CFLAGS := $(shell pkg-config --cflags sdl2 SDL2_ttf SDL2_image 2>/dev/null)
 HOST_SDL_LIBS   := $(shell pkg-config --libs sdl2 SDL2_ttf SDL2_image 2>/dev/null)
 HOST_CURL_LIBS  := $(shell pkg-config --libs libcurl 2>/dev/null || curl-config --libs)
