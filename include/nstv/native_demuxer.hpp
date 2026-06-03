@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 
 #ifdef NSTV_USE_FFMPEG
@@ -26,11 +27,23 @@ struct NativeStreamInfo {
 
 class NativeDemuxer {
 public:
+  struct Impl;
+
   NativeDemuxer();
   ~NativeDemuxer();
 
   bool open(const std::string &url);
   void close();
+
+  int64_t durationMs() const;
+  int64_t startTimeMs() const;
+  bool canSeek() const;
+  bool seekToMs(int64_t positionMs);
+
+  // Guard FFmpeg network/demux operations so VOD seek/read cannot lock the UI.
+  void beginIoGuard(int timeoutMs);
+  void endIoGuard();
+  bool wasIoInterrupted() const;
 
   bool isOpen() const { return open_; }
 
@@ -46,7 +59,6 @@ public:
 #endif
 
 private:
-  struct Impl;
   Impl *impl_ = nullptr;
 
   bool open_ = false;

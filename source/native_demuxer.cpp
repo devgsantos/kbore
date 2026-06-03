@@ -1,6 +1,8 @@
 #include "nstv/native_demuxer.hpp"
 #include "nstv/log.hpp"
 
+#include <algorithm>
+#include <chrono>
 #include <sstream>
 #include <string>
 
@@ -17,12 +19,46 @@ namespace nstv {
 #ifdef NSTV_USE_FFMPEG
 struct NativeDemuxer::Impl {
   AVFormatContext *format = nullptr;
+  long long ioDeadlineMs = 0;
+  bool ioInterrupted = false;
 };
 #endif
 
 namespace {
 
 #ifdef NSTV_USE_FFMPEG
+
+long long steadyNowMs() {
+  using clock = std::chrono::steady_clock;
+
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+    clock::now().time_since_epoch()
+  ).count();
+}
+
+int demuxInterruptCallback(void *opaque) {
+  auto *impl = static_cast<NativeDemuxer::Impl *>(opaque);
+
+  if (!impl || impl->ioDeadlineMs <= 0) {
+    return 0;
+  }
+
+  if (steadyNowMs() >= impl->ioDeadlineMs) {
+    impl->ioInterrupted = true;
+    return 1;
+  }
+
+  return 0;
+}
+
+void installInterruptCallback(NativeDemuxer::Impl *impl) {
+  if (!impl || !impl->format) {
+    return;
+  }
+
+  impl->format->interrupt_callback.callback = demuxInterruptCallback;
+  impl->format->interrupt_callback.opaque = impl;
+}
 
 std::string ffmpegError(int code) {
   char buffer[AV_ERROR_MAX_STRING_SIZE] = {};
@@ -85,6 +121,82 @@ int openLiveInput(AVFormatContext **format, const std::string &url, const char *
   return ret;
 }
 
+int64_t durationFromFormatMs(AVFormatContext *format) {
+  if (!format) {
+    return 0;
+  }
+
+  if (format->duration != AV_NOPTS_VALUE && format->duration > 0) {
+    return av_rescale(format->duration, 1000, AV_TIME_BASE);
+  }
+
+  int64_t bestMs = 0;
+
+  for (unsigned int i = 0; i < format->nb_streams; ++i) {
+    AVStream *stream = format->streams[i];
+
+    if (!stream || stream->duration == AV_NOPTS_VALUE || stream->duration <= 0) {
+      continue;
+    }
+
+    AVRational milliseconds{1, 1000};
+    const int64_t streamMs = av_rescale_q(stream->duration, stream->time_base, milliseconds);
+
+    if (streamMs > bestMs) {
+      bestMs = streamMs;
+    }
+  }
+
+  return bestMs;
+}
+
+int64_t startTimeFromFormatMs(AVFormatContext *format) {
+  if (!format) {
+    return 0;
+  }
+
+  if (format->start_time != AV_NOPTS_VALUE && format->start_time > 0) {
+    return av_rescale(format->start_time, 1000, AV_TIME_BASE);
+  }
+
+  int64_t bestMs = -1;
+
+  for (unsigned int i = 0; i < format->nb_streams; ++i) {
+    AVStream *stream = format->streams[i];
+
+    if (!stream || stream->start_time == AV_NOPTS_VALUE || stream->start_time < 0) {
+      continue;
+    }
+
+    AVRational milliseconds{1, 1000};
+    const int64_t streamMs = av_rescale_q(stream->start_time, stream->time_base, milliseconds);
+
+    if (bestMs < 0 || streamMs < bestMs) {
+      bestMs = streamMs;
+    }
+  }
+
+  return bestMs > 0 ? bestMs : 0;
+}
+
+bool formatCanSeek(AVFormatContext *format) {
+  if (!format) {
+    return false;
+  }
+
+  if (durationFromFormatMs(format) <= 0) {
+    return false;
+  }
+
+  if (format->pb && (format->pb->seekable & AVIO_SEEKABLE_NORMAL)) {
+    return true;
+  }
+
+  // HLS VOD and some HTTP sources do not always expose AVIO_SEEKABLE_NORMAL,
+  // but av_seek_frame can still seek using the demuxer. Treat finite duration
+  // as seekable and let seekToMs() report precise failure if unsupported.
+  return true;
+}
 
 std::string codecName(AVCodecID codecId) {
   const char *name = avcodec_get_name(codecId);
@@ -230,10 +342,18 @@ bool NativeDemuxer::open(const std::string &url) {
     return false;
   }
 
+  installInterruptCallback(impl_);
+
+  beginIoGuard(2500);
   ret = avformat_find_stream_info(impl_->format, nullptr);
+  const bool streamInfoInterrupted = wasIoInterrupted();
+  endIoGuard();
 
   if (ret < 0) {
     error_ = "NativeDemuxer could not read stream info: " + ffmpegError(ret);
+    if (streamInfoInterrupted) {
+      error_ += " | interrupted by IO guard";
+    }
     close();
     return false;
   }
@@ -302,6 +422,8 @@ bool NativeDemuxer::open(const std::string &url) {
 
 void NativeDemuxer::close() {
 #ifdef NSTV_USE_FFMPEG
+  endIoGuard();
+
   if (impl_ && impl_->format) {
     avformat_close_input(&impl_->format);
     impl_->format = nullptr;
@@ -309,6 +431,118 @@ void NativeDemuxer::close() {
 #endif
 
   open_ = false;
+}
+
+int64_t NativeDemuxer::durationMs() const {
+#ifndef NSTV_USE_FFMPEG
+  return 0;
+#else
+  return impl_ ? durationFromFormatMs(impl_->format) : 0;
+#endif
+}
+
+int64_t NativeDemuxer::startTimeMs() const {
+#ifndef NSTV_USE_FFMPEG
+  return 0;
+#else
+  return impl_ ? startTimeFromFormatMs(impl_->format) : 0;
+#endif
+}
+
+bool NativeDemuxer::canSeek() const {
+#ifndef NSTV_USE_FFMPEG
+  return false;
+#else
+  return impl_ ? formatCanSeek(impl_->format) : false;
+#endif
+}
+
+void NativeDemuxer::beginIoGuard(int timeoutMs) {
+#ifdef NSTV_USE_FFMPEG
+  if (!impl_) {
+    return;
+  }
+
+  impl_->ioInterrupted = false;
+
+  if (timeoutMs <= 0) {
+    impl_->ioDeadlineMs = 0;
+    return;
+  }
+
+  impl_->ioDeadlineMs = steadyNowMs() + std::max(50, timeoutMs);
+
+  if (impl_->format) {
+    installInterruptCallback(impl_);
+  }
+#else
+  (void)timeoutMs;
+#endif
+}
+
+void NativeDemuxer::endIoGuard() {
+#ifdef NSTV_USE_FFMPEG
+  if (!impl_) {
+    return;
+  }
+
+  impl_->ioDeadlineMs = 0;
+#endif
+}
+
+bool NativeDemuxer::wasIoInterrupted() const {
+#ifdef NSTV_USE_FFMPEG
+  return impl_ && impl_->ioInterrupted;
+#else
+  return false;
+#endif
+}
+
+bool NativeDemuxer::seekToMs(int64_t positionMs) {
+#ifndef NSTV_USE_FFMPEG
+  error_ = "NativeDemuxer seek requires NSTV_USE_FFMPEG.";
+  return false;
+#else
+  if (!impl_ || !impl_->format || !open_) {
+    error_ = "NativeDemuxer seek requires an open input.";
+    return false;
+  }
+
+  if (positionMs < 0) {
+    positionMs = 0;
+  }
+
+  const int64_t duration = durationMs();
+
+  if (duration > 0 && positionMs > duration) {
+    positionMs = duration;
+  }
+
+  const int64_t targetUs = av_rescale(positionMs + startTimeMs(), AV_TIME_BASE, 1000);
+
+  beginIoGuard(1800);
+  int ret = av_seek_frame(impl_->format, -1, targetUs, AVSEEK_FLAG_BACKWARD);
+
+  if (ret < 0 && !wasIoInterrupted() && video_.exists) {
+    AVStream *stream = impl_->format->streams[video_.index];
+
+    if (stream) {
+      AVRational microseconds{1, AV_TIME_BASE};
+      const int64_t streamTs = av_rescale_q(targetUs, microseconds, stream->time_base);
+      ret = av_seek_frame(impl_->format, video_.index, streamTs, AVSEEK_FLAG_BACKWARD);
+    }
+  }
+
+  const bool interrupted = wasIoInterrupted();
+  endIoGuard();
+
+  if (ret < 0 || interrupted) {
+    error_ = "NativeDemuxer could not seek: " + (interrupted ? std::string("interrupted by IO guard") : ffmpegError(ret));
+    return false;
+  }
+
+  return true;
+#endif
 }
 
 #ifdef NSTV_USE_FFMPEG

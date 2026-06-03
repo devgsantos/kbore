@@ -17,6 +17,7 @@ public:
     const std::string &status,
     const std::string &controls
   ) override;
+  void setOverlayProgress(int64_t positionMs, int64_t durationMs, bool visible) override;
 
 #ifdef NSTV_USE_FFMPEG
   bool canRender(const AVFrame *frame) const override;
@@ -37,6 +38,9 @@ private:
   std::string overlaySubtitle_;
   std::string overlayStatus_;
   std::string overlayControls_;
+  int64_t overlayProgressPositionMs_ = 0;
+  int64_t overlayProgressDurationMs_ = 0;
+  bool overlayProgressVisible_ = false;
   std::string error_;
 
 #ifdef __SWITCH__

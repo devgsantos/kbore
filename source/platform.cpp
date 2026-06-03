@@ -59,6 +59,8 @@ Button pollButton() {
   if (down & HidNpadButton_Right) return Button::Right;
   if (down & HidNpadButton_A) return Button::Select;
   if (down & HidNpadButton_B) return Button::Back;
+  if (down & HidNpadButton_L) return Button::ShoulderLeft;
+  if (down & HidNpadButton_R) return Button::ShoulderRight;
   if (down & HidNpadButton_X) return Button::Favorite;
   if (down & HidNpadButton_Plus) return Button::Menu;
   if (down & HidNpadButton_Minus) return Button::Quit;
@@ -94,6 +96,12 @@ Button pollButton() {
           return Button::Back;
         case SDLK_x:
           return Button::Favorite;
+        case SDLK_z:
+        case SDLK_LEFTBRACKET:
+          return Button::ShoulderLeft;
+        case SDLK_c:
+        case SDLK_RIGHTBRACKET:
+          return Button::ShoulderRight;
         case SDLK_m:
         case SDLK_PLUS:
         case SDLK_EQUALS:
@@ -147,6 +155,8 @@ Button pollButtonBlocking() {
     case 'e': return Button::Select;
     case 'b': return Button::Back;
     case 'x': return Button::Favorite;
+    case 'z': return Button::ShoulderLeft;
+    case 'c': return Button::ShoulderRight;
     case 'm': return Button::Menu;
     case 'q': return Button::Quit;
     default: return Button::None;

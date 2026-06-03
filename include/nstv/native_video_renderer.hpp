@@ -2,6 +2,7 @@
 
 #include "nstv/native_video_surface.hpp"
 
+#include <cstdint>
 #include <memory>
 #include <string>
 
@@ -24,6 +25,12 @@ public:
     (void)subtitle;
     (void)status;
     (void)controls;
+  }
+
+  virtual void setOverlayProgress(int64_t positionMs, int64_t durationMs, bool visible) {
+    (void)positionMs;
+    (void)durationMs;
+    (void)visible;
   }
 
 #ifdef NSTV_USE_FFMPEG

@@ -42,6 +42,31 @@ long long nowMs() {
   ).count();
 }
 
+std::string formatPlaybackTime(int64_t ms) {
+  if (ms < 0) {
+    ms = 0;
+  }
+
+  const int64_t totalSeconds = ms / 1000;
+  const int64_t hours = totalSeconds / 3600;
+  const int64_t minutes = (totalSeconds / 60) % 60;
+  const int64_t seconds = totalSeconds % 60;
+
+  char buffer[32] = {};
+
+  if (hours > 0) {
+    std::snprintf(buffer, sizeof(buffer), "%lld:%02lld:%02lld", hours, minutes, seconds);
+  } else {
+    std::snprintf(buffer, sizeof(buffer), "%lld:%02lld", minutes, seconds);
+  }
+
+  return buffer;
+}
+
+bool isVodType(StreamType type) {
+  return type == StreamType::Movies || type == StreamType::Series;
+}
+
 std::string formatSystemClockTime() {
   std::time_t rawTime = std::time(nullptr);
 
@@ -606,10 +631,15 @@ void App::handle(Button button) {
   switch (state_.screen) {
     case ScreenId::Dashboard: handleDashboard(button); break;
     case ScreenId::AddPlaylist: handleAddPlaylist(button); break;
-    case ScreenId::Player:
-      if (button != Button::None) {
-        state_.playerOverlayUntilMs = nowMs() + 5000;
-      }
+    case ScreenId::Player: {
+      const long long now = nowMs();
+      const bool isOpen = player_ && player_->isOpen();
+      const bool isPaused = player_ && player_->isPaused();
+      const bool overlayWasVisible =
+        !state_.playerFrameSeen ||
+        now < state_.playerOverlayUntilMs ||
+        isPaused ||
+        !isOpen;
 
       if (button == Button::Back) {
         if (player_) {
@@ -628,13 +658,49 @@ void App::handle(Button button) {
         state_.playerLoadFailed = false;
         state_.playerErrorMessage.clear();
         state_.hasPlaybackChannel = false;
-      } else if (button == Button::Select) {
+        break;
+      }
+
+      if (button != Button::None) {
+        state_.playerOverlayUntilMs = now + 5000;
+      }
+
+      // Playback commands are intentional only while the overlay is visible.
+      // The first button press wakes the overlay; B remains the immediate exit.
+      if (!overlayWasVisible) {
+        break;
+      }
+
+      const bool isVod =
+        state_.hasPlaybackChannel &&
+        isVodType(state_.playbackChannel.type) &&
+        player_ &&
+        player_->canSeek();
+
+      if (button == Button::Select) {
         if (player_) {
           player_->togglePause();
           state_.message = player_->isPaused() ? "Playback paused" : "Playback resumed";
         }
+      } else if (isVod && button == Button::ShoulderLeft) {
+        if (player_->seekByMs(-30000)) {
+          state_.message = "Rewind 30 seconds";
+        }
+      } else if (isVod && button == Button::ShoulderRight) {
+        if (player_->seekByMs(30000)) {
+          state_.message = "Forward 30 seconds";
+        }
+      } else if (isVod && button == Button::Left) {
+        if (player_->seekByMs(-10000)) {
+          state_.message = "Rewind 10 seconds";
+        }
+      } else if (isVod && button == Button::Right) {
+        if (player_->seekByMs(10000)) {
+          state_.message = "Forward 10 seconds";
+        }
       }
       break;
+    }
     case ScreenId::Settings:
       if (button == Button::Back || button == Button::Select) state_.screen = ScreenId::Dashboard;
       break;
@@ -3535,12 +3601,23 @@ void App::renderPlayerGraphic() {
       status = "LOADING";
     }
 
+    const bool vodPlayback = channel && isVodType(channel->type) && player_->canSeek();
+    const int64_t vodDurationMs = vodPlayback ? player_->durationMs() : 0;
+    const int64_t vodPositionMs = vodPlayback ? player_->positionMs() : 0;
+    const std::string vodCounter = vodPlayback
+      ? ("  " + formatPlaybackTime(vodPositionMs))
+      : "";
+    const std::string controls = vodPlayback
+      ? "A PAUSE/RESUME   L -30s   < -10s   > +10s   R +30s   B BACK"
+      : "A PAUSE/RESUME   B BACK";
+
     player_->setOverlayInfo(
       channel ? Graphics::fitText(channel->name, 58) : "",
       channel && channel->type == StreamType::Live ? Graphics::fitText(epgNowNextLine(*channel), 98) : "",
-      status,
-      "A PAUSE/RESUME   B BACK"
+      status + vodCounter,
+      controls
     );
+    player_->setOverlayProgress(vodPositionMs, vodDurationMs, vodPlayback && vodDurationMs > 0);
 
     if (player_->nativeVideoActive() || gfx_.isSuspendedForNativeVideo()) {
       player_->setOverlayVisible(overlayRequested);
@@ -3688,6 +3765,13 @@ void App::renderPlayerGraphic() {
     !isOpen;
 
   if (showOverlay && isOpen) {
+    const bool vodPlayback = channel && isVodType(channel->type) && player_ && player_->canSeek();
+    const int64_t vodDurationMs = vodPlayback ? player_->durationMs() : 0;
+    const int64_t vodPositionMs = vodPlayback ? player_->positionMs() : 0;
+    const std::string controls = vodPlayback
+      ? "A PAUSE/RESUME   L -30s   < -10s   > +10s   R +30s   B BACK"
+      : "A PAUSE/RESUME   B BACK";
+
     gfx_.fillHorizontalGradient(
       0,
       Graphics::Height - 104,
@@ -3746,6 +3830,10 @@ void App::renderPlayerGraphic() {
         status = "ERROR";
       }
 
+      if (vodPlayback && vodDurationMs > 0) {
+        status += "  " + formatPlaybackTime(vodPositionMs);
+      }
+
       gfx_.drawText(
         status,
         122,
@@ -3754,10 +3842,27 @@ void App::renderPlayerGraphic() {
         isOpen ? rgb(57, 220, 35) : rgb(248, 113, 113),
         true
       );
+
+      if (vodPlayback && vodDurationMs > 0) {
+        const int barX = 188;
+        const int barY = Graphics::Height - 18;
+        const int barW = Graphics::Width - 376;
+        const int barH = 5;
+        const int64_t clamped = std::max<int64_t>(0, std::min<int64_t>(vodPositionMs, vodDurationMs));
+        const int filled = static_cast<int>((clamped * barW) / vodDurationMs);
+
+        gfx_.drawText("0:00", 122, Graphics::Height - 24, 1, rgb(203, 213, 225), false);
+        gfx_.drawTextRight(formatPlaybackTime(vodDurationMs), Graphics::Width - 28, Graphics::Height - 24, 1, rgb(203, 213, 225), false);
+        gfx_.fillRect(barX, barY, barW, barH, rgba(51, 65, 85, 230));
+
+        if (filled > 0) {
+          gfx_.fillRect(barX, barY, std::min(barW, filled), barH, rgb(0, 191, 255));
+        }
+      }
     }
 
     gfx_.drawTextRight(
-      "A PAUSE/RESUME   B BACK",
+      controls,
       Graphics::Width - 28,
       Graphics::Height - 50,
       1,

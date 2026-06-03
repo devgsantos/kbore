@@ -14,6 +14,8 @@ enum class Button {
   Back,
   Menu,
   Favorite,
+  ShoulderLeft,
+  ShoulderRight,
   Quit
 };
 

@@ -17,6 +17,10 @@ public:
   bool update() override;
 
   void togglePause() override;
+  bool canSeek() const override;
+  int64_t durationMs() const override;
+  int64_t positionMs() const override;
+  bool seekToMs(int64_t positionMs) override;
 
   bool isPaused() const override { return paused_; }
   bool isOpen() const override { return open_; }
@@ -40,6 +44,9 @@ private:
   std::string error_;
   Bitmap frame_;
   YuvFrame yuvFrame_;
+  int64_t durationMs_ = 0;
+  int64_t startTimeMs_ = 0;
+  int64_t currentPositionMs_ = 0;
 
 #ifdef NSTV_USE_FFMPEG
   struct Impl;

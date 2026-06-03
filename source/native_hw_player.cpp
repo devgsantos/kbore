@@ -57,6 +57,13 @@ void NativeHwPlayerBackend::resetClock() {
   droppedFrames_ = 0;
   lastDropLogWallMs_ = 0;
   lastQualityLogWallMs_ = 0;
+  currentPositionMs_ = 0;
+  seekBasePositionMs_ = 0;
+  seekBaseValid_ = false;
+  seeking_ = false;
+  requestedSeekPositionMs_ = 0;
+  seekStartedWallMs_ = 0;
+  seekDecodeFailures_ = 0;
 }
 
 void NativeHwPlayerBackend::resetClockToCurrentFrame(long long now) {
@@ -141,6 +148,23 @@ void NativeHwPlayerBackend::syncClockFromLatestFrame() {
     }
   } else {
     lastPtsMs_ += fallbackFrameIntervalMs_;
+  }
+
+  if (info.ptsMs >= 0) {
+    const int64_t startTimeMs = demuxer_.startTimeMs();
+
+    if (startTimeMs > 0) {
+      currentPositionMs_ = std::max<int64_t>(0, info.ptsMs - startTimeMs);
+    } else if (seekBaseValid_) {
+      currentPositionMs_ = std::max<int64_t>(0, seekBasePositionMs_ + (lastPtsMs_ - firstPtsMs_));
+    } else {
+      currentPositionMs_ = std::max<int64_t>(0, lastPtsMs_ - firstPtsMs_);
+    }
+
+    const int64_t duration = durationMs();
+    if (duration > 0 && currentPositionMs_ > duration) {
+      currentPositionMs_ = duration;
+    }
   }
 
   if (nativeRendererReady_ && nativeRenderer_) {
@@ -504,6 +528,59 @@ bool NativeHwPlayerBackend::recoverIfPlaybackPanic(long long now, const char *re
   return true;
 }
 
+bool NativeHwPlayerBackend::finishSeekAfterFrame(long long now) {
+  if (!seeking_) {
+    return false;
+  }
+
+  seeking_ = false;
+  seekDecodeFailures_ = 0;
+  seekBasePositionMs_ = requestedSeekPositionMs_;
+  seekBaseValid_ = true;
+  currentPositionMs_ = requestedSeekPositionMs_;
+
+  // Rebase from the first decoded frame after seek. This avoids inheriting
+  // pre-seek PTS/wall-clock state and prevents the recovery loop from trying
+  // to drop through a VOD seek jump.
+  resetClockToCurrentFrame(now);
+  currentPositionMs_ = requestedSeekPositionMs_;
+  seekBasePositionMs_ = requestedSeekPositionMs_;
+  seekBaseValid_ = true;
+
+  if (!paused_) {
+    decoder_.startAudio();
+  }
+
+  logLinef(
+    "[KBORE][PLAYBACK][VOD] seek ready position=%lld duration=%lld",
+    requestedSeekPositionMs_,
+    durationMs()
+  );
+
+  return true;
+}
+
+void NativeHwPlayerBackend::cancelSeekRecovery(long long now, const char *reason) {
+  if (!seeking_) {
+    return;
+  }
+
+  seeking_ = false;
+  seekDecodeFailures_ = 0;
+  resetClockToCurrentFrame(now);
+
+  if (!paused_) {
+    decoder_.startAudio();
+  }
+
+  logLinef(
+    "[KBORE][PLAYBACK][VOD] seek recovery reason=%s position=%lld duration=%lld",
+    reason ? reason : "unknown",
+    requestedSeekPositionMs_,
+    durationMs()
+  );
+}
+
 void NativeHwPlayerBackend::rebalanceAudioQueue(long long now) {
   const int audioQueuedMs = decoder_.audioQueuedMs();
 
@@ -649,6 +726,11 @@ bool NativeHwPlayerBackend::open(const std::string &url) {
         nativeOverlaySubtitle_,
         nativeOverlayStatus_,
         nativeOverlayControls_
+      );
+      nativeRenderer_->setOverlayProgress(
+        nativeOverlayProgressPositionMs_,
+        nativeOverlayProgressDurationMs_,
+        nativeOverlayProgressVisible_
       );
       nativeRendererReady_ = true;
       nativeRendererStatus_ = std::string(nativeRenderer_->name()) + " initialized";
@@ -800,6 +882,11 @@ void NativeHwPlayerBackend::setNativeVideoAllowed(bool allowed) {
         nativeOverlayStatus_,
         nativeOverlayControls_
       );
+      nativeRenderer_->setOverlayProgress(
+        nativeOverlayProgressPositionMs_,
+        nativeOverlayProgressDurationMs_,
+        nativeOverlayProgressVisible_
+      );
       nativeRendererReady_ = true;
       nativeRendererStatus_ = std::string(nativeRenderer_->name()) + " initialized";
       logLinef("[KBORE][DEKO3D] %s", nativeRendererStatus_.c_str());
@@ -846,6 +933,16 @@ void NativeHwPlayerBackend::setOverlayInfo(
   }
 }
 
+void NativeHwPlayerBackend::setOverlayProgress(int64_t positionMs, int64_t durationMs, bool visible) {
+  nativeOverlayProgressPositionMs_ = positionMs;
+  nativeOverlayProgressDurationMs_ = durationMs;
+  nativeOverlayProgressVisible_ = visible;
+
+  if (nativeRenderer_) {
+    nativeRenderer_->setOverlayProgress(positionMs, durationMs, visible);
+  }
+}
+
 bool NativeHwPlayerBackend::update() {
 #ifndef NSTV_ENABLE_NATIVE_HW_PLAYER
   return false;
@@ -856,14 +953,24 @@ bool NativeHwPlayerBackend::update() {
 
   const long long now = nowMs();
 
-  rebalanceAudioQueue(now);
+  if (seeking_) {
+    // During VOD seek, never run the normal live recovery/drop pipeline.
+    // It can fight the demuxer while HLS/HTTP is repositioning and make the
+    // UI appear frozen. Decode one guarded frame and resume from there.
+    if (seekStartedWallMs_ > 0 && now - seekStartedWallMs_ > 5000) {
+      cancelSeekRecovery(now, "timeout");
+      return hasFrame();
+    }
+  } else {
+    rebalanceAudioQueue(now);
 
-  if (recoverIfPlaybackPanic(now, "pre-decode")) {
-    return hasFrame();
-  }
+    if (recoverIfPlaybackPanic(now, "pre-decode")) {
+      return hasFrame();
+    }
 
-  if (!shouldDecodeNow(now)) {
-    return hasFrame();
+    if (!shouldDecodeNow(now)) {
+      return hasFrame();
+    }
   }
 
   /*
@@ -885,7 +992,7 @@ bool NativeHwPlayerBackend::update() {
 
     Podemos permitir mais drops por update para HD/FHD.
   */
-  const int maxDrops = maxDropsPerUpdate(dropStartDelayMs);
+  const int maxDrops = seeking_ ? 0 : maxDropsPerUpdate(dropStartDelayMs);
   const long long dropLoopStartMs = nowMs();
 
   while (dropped < maxDrops && shouldDropFrames(nowMs())) {
@@ -940,6 +1047,7 @@ bool NativeHwPlayerBackend::update() {
   const int cpuInterval = cpuPresentationIntervalMs();
 
   if (
+    !seeking_ &&
     cpuInterval > 0 &&
     yuvFrame_.valid() &&
     lastPresentedVideoWallMs_ > 0 &&
@@ -976,7 +1084,7 @@ bool NativeHwPlayerBackend::update() {
 #ifdef NSTV_USE_FFMPEG
     const long long decodeStartMs = nowMs();
 
-    if (decoder_.decodeNextHardwareFrame(demuxer_)) {
+    if (decoder_.decodeNextHardwareFrame(demuxer_, seeking_ ? 600 : 80)) {
       const long long decodeEndMs = nowMs();
       const AVFrame *frame = decoder_.latestHardwareFrame();
 
@@ -985,9 +1093,12 @@ bool NativeHwPlayerBackend::update() {
         syncClockFromLatestFrame();
         lastPresentedVideoWallMs_ = nowMs();
 
-        if (decodeEndMs - decodeStartMs > decodeStallBudgetMs()) {
+        const bool wasSeeking = seeking_;
+        finishSeekAfterFrame(lastPresentedVideoWallMs_);
+
+        if (!wasSeeking && decodeEndMs - decodeStartMs > decodeStallBudgetMs()) {
           recoverIfPlaybackPanic(lastPresentedVideoWallMs_, "hardware-decode-stall");
-        } else {
+        } else if (!wasSeeking) {
           recoverIfPlaybackPanic(lastPresentedVideoWallMs_, "hardware-delay-panic");
         }
 
@@ -1008,6 +1119,15 @@ bool NativeHwPlayerBackend::update() {
       nativeRenderer_.reset();
     } else {
       error_ = decoder_.error();
+
+      if (seeking_) {
+        ++seekDecodeFailures_;
+
+        if (seekDecodeFailures_ >= 5) {
+          cancelSeekRecovery(nowMs(), error_.c_str());
+        }
+      }
+
       return hasFrame();
     }
 #endif
@@ -1015,8 +1135,17 @@ bool NativeHwPlayerBackend::update() {
 
   const long long decodeStartMs = nowMs();
 
-  if (!decoder_.decodeNextVideoFrame(demuxer_, true, &yuvFrame_)) {
+  if (!decoder_.decodeNextVideoFrame(demuxer_, true, &yuvFrame_, seeking_ ? 600 : 80)) {
     error_ = decoder_.error();
+
+    if (seeking_) {
+      ++seekDecodeFailures_;
+
+      if (seekDecodeFailures_ >= 5) {
+        cancelSeekRecovery(nowMs(), error_.c_str());
+      }
+    }
+
     return hasFrame();
   }
 
@@ -1032,9 +1161,12 @@ bool NativeHwPlayerBackend::update() {
   syncClockFromLatestFrame();
   lastPresentedVideoWallMs_ = nowMs();
 
-  if (decodeEndMs - decodeStartMs > decodeStallBudgetMs()) {
+  const bool wasSeeking = seeking_;
+  finishSeekAfterFrame(lastPresentedVideoWallMs_);
+
+  if (!wasSeeking && decodeEndMs - decodeStartMs > decodeStallBudgetMs()) {
     recoverIfPlaybackPanic(lastPresentedVideoWallMs_, "cpu-decode-stall");
-  } else {
+  } else if (!wasSeeking) {
     recoverIfPlaybackPanic(lastPresentedVideoWallMs_, "cpu-delay-panic");
   }
 
@@ -1061,6 +1193,98 @@ void NativeHwPlayerBackend::togglePause() {
     resetClockToCurrentFrame(nowMs());
     decoder_.startAudio();
   }
+}
+
+bool NativeHwPlayerBackend::canSeek() const {
+  return open_ && demuxer_.canSeek() && durationMs() > 0;
+}
+
+int64_t NativeHwPlayerBackend::durationMs() const {
+  return demuxer_.durationMs();
+}
+
+int64_t NativeHwPlayerBackend::positionMs() const {
+  const int64_t duration = durationMs();
+
+  if (duration > 0) {
+    return std::max<int64_t>(0, std::min<int64_t>(currentPositionMs_, duration));
+  }
+
+  return std::max<int64_t>(0, currentPositionMs_);
+}
+
+bool NativeHwPlayerBackend::seekToMs(int64_t positionMs) {
+  if (!canSeek() || seeking_) {
+    return false;
+  }
+
+  const int64_t duration = durationMs();
+
+  if (positionMs < 0) {
+    positionMs = 0;
+  }
+
+  if (duration > 0 && positionMs > duration) {
+    positionMs = duration;
+  }
+
+  const long long startWallMs = nowMs();
+
+  // A VOD seek must be a controlled transition. Stop/clear audio first and
+  // keep it paused until the first post-seek video frame is rendered; otherwise
+  // the audio queue can restart against stale video state.
+  decoder_.stopAudio();
+  decoder_.clearAudioQueue();
+
+  seeking_ = true;
+  requestedSeekPositionMs_ = positionMs;
+  seekStartedWallMs_ = startWallMs;
+  seekDecodeFailures_ = 0;
+
+  if (!demuxer_.seekToMs(positionMs)) {
+    error_ = demuxer_.error();
+    seeking_ = false;
+
+    if (!paused_) {
+      decoder_.startAudio();
+    }
+
+    logLinef(
+      "[KBORE][PLAYBACK][VOD] seek failed position=%lld duration=%lld error=%s",
+      positionMs,
+      duration,
+      error_.c_str()
+    );
+
+    return false;
+  }
+
+  decoder_.flushForSeek();
+  yuvFrame_ = YuvFrame{};
+  nativeFramePresented_ = false;
+
+  currentPositionMs_ = positionMs;
+  seekBasePositionMs_ = positionMs;
+  seekBaseValid_ = true;
+
+  clockStarted_ = false;
+  firstPtsMs_ = -1;
+  lastPtsMs_ = -1;
+  playbackStartMs_ = 0;
+  lastFrameWallMs_ = 0;
+  lastPresentedVideoWallMs_ = startWallMs;
+  nextFrameDueMs_ = 0;
+  currentFrameIntervalMs_ = fallbackFrameIntervalMs_;
+  lastDropLogWallMs_ = 0;
+
+  logLinef(
+    "[KBORE][PLAYBACK][VOD] seek requested position=%lld duration=%lld elapsed=%lld",
+    positionMs,
+    duration,
+    nowMs() - startWallMs
+  );
+
+  return true;
 }
 
 } // namespace nstv

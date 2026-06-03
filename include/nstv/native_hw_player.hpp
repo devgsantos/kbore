@@ -21,6 +21,10 @@ public:
   void close() override;
   bool update() override;
   void togglePause() override;
+  bool canSeek() const override;
+  int64_t durationMs() const override;
+  int64_t positionMs() const override;
+  bool seekToMs(int64_t positionMs) override;
 
   bool isOpen() const override { return open_; }
   bool isPaused() const override { return paused_; }
@@ -37,6 +41,7 @@ public:
     const std::string &status,
     const std::string &controls
   ) override;
+  void setOverlayProgress(int64_t positionMs, int64_t durationMs, bool visible) override;
 
   const std::string &error() const override { return error_; }
   const std::string &url() const override { return url_; }
@@ -80,6 +85,18 @@ private:
   long long lastPresentedVideoWallMs_ = 0;
   long long nextFrameDueMs_ = 0;
 
+  int64_t currentPositionMs_ = 0;
+  int64_t seekBasePositionMs_ = 0;
+  bool seekBaseValid_ = false;
+  int64_t nativeOverlayProgressPositionMs_ = 0;
+  int64_t nativeOverlayProgressDurationMs_ = 0;
+  bool nativeOverlayProgressVisible_ = false;
+
+  bool seeking_ = false;
+  int64_t requestedSeekPositionMs_ = 0;
+  long long seekStartedWallMs_ = 0;
+  int seekDecodeFailures_ = 0;
+
   int fallbackFrameIntervalMs_ = 33;  // ~30 FPS fallback, adjusted for smoother display sync on 60Hz screen
   int currentFrameIntervalMs_ = 40;
   int cpuFrameCostAvgMs_ = 0;
@@ -104,6 +121,8 @@ private:
   void rebalanceAudioQueue(long long now);
   void logStreamQuality(long long now, long long delayMs, int audioQueuedMs);
   bool recoverIfPlaybackPanic(long long now, const char *reason);
+  bool finishSeekAfterFrame(long long now);
+  void cancelSeekRecovery(long long now, const char *reason);
   int streamPanicDelayMs() const;
   int decodeStallBudgetMs() const;
   int dropLoopBudgetMs() const;
