@@ -981,6 +981,44 @@ int NativeDecoder::audioQueuedBytes() const {
 #endif
 }
 
+int NativeDecoder::audioQueuedMs() const {
+#ifdef NSTV_USE_SDL
+  if (!impl_ || impl_->audioDevice == 0) {
+    return 0;
+  }
+
+  const Uint32 queued = SDL_GetQueuedAudioSize(impl_->audioDevice);
+  const Uint32 bytesPerSample = SDL_AUDIO_BITSIZE(impl_->audioSpec.format) / 8u;
+
+  if (impl_->audioSpec.freq <= 0 || impl_->audioSpec.channels <= 0 || bytesPerSample == 0) {
+    return 0;
+  }
+
+  const Uint32 bytesPerSecond =
+    static_cast<Uint32>(impl_->audioSpec.freq) *
+    static_cast<Uint32>(impl_->audioSpec.channels) *
+    bytesPerSample;
+
+  if (bytesPerSecond == 0) {
+    return 0;
+  }
+
+  return static_cast<int>((static_cast<unsigned long long>(queued) * 1000ull) / bytesPerSecond);
+#else
+  return 0;
+#endif
+}
+
+void NativeDecoder::clearAudioQueue() {
+#ifdef NSTV_USE_SDL
+  if (!impl_ || impl_->audioDevice == 0) {
+    return;
+  }
+
+  SDL_ClearQueuedAudio(impl_->audioDevice);
+#endif
+}
+
 #ifdef NSTV_USE_FFMPEG
 bool NativeDecoder::decodeAudioPacketToSdl(AVPacket *packet) {
   if (!impl_ || !impl_->audioCodec || !impl_->audioFrame || !impl_->swr) {
@@ -1053,10 +1091,23 @@ bool NativeDecoder::decodeAudioPacketToSdl(AVPacket *packet) {
         static_cast<Uint32>(impl_->audioSpec.freq) *
         static_cast<Uint32>(impl_->audioSpec.channels) *
         bytesPerSample;
-      const Uint32 targetMaxQueue = bytesPerSecond * 2u; // ~2 segundos de áudio
-      const bool queueIsFull = queued >= targetMaxQueue;
+      /*
+        O limite antigo (~2s) permitia que o áudio ficasse muito
+        atrasado ou continuasse tocando muito à frente quando o vídeo
+        precisava recuperar. Para streaming ao vivo, mantemos uma fila
+        curta e descartamos áudio excedente em vez de acumular latência.
+      */
+      const Uint32 targetMaxQueue = (bytesPerSecond * 550u) / 1000u; // ~550ms
+      const Uint32 emergencyMaxQueue = (bytesPerSecond * 900u) / 1000u; // ~900ms
 
-      if (!queueIsFull) {
+      if (queued > emergencyMaxQueue) {
+        SDL_ClearQueuedAudio(impl_->audioDevice);
+      }
+
+      const Uint32 refreshedQueued = SDL_GetQueuedAudioSize(impl_->audioDevice);
+      const bool queueHasRoom = refreshedQueued < targetMaxQueue;
+
+      if (queueHasRoom) {
         SDL_QueueAudio(
           impl_->audioDevice,
           impl_->audioBuffer.data(),
@@ -1076,7 +1127,8 @@ bool NativeDecoder::decodeAudioPacketToSdl(AVPacket *packet) {
 bool NativeDecoder::decodeNextVideoFrame(
   NativeDemuxer &demuxer,
   bool outputFrame,
-  YuvFrame *outputYuvFrame
+  YuvFrame *outputYuvFrame,
+  int maxPackets
 ) {
 #ifndef NSTV_USE_FFMPEG
   error_ = "NativeDecoder requires NSTV_USE_FFMPEG.";
@@ -1101,7 +1153,9 @@ bool NativeDecoder::decodeNextVideoFrame(
     return false;
   }
 
-  const int maxPackets = 80;
+  if (maxPackets <= 0) {
+    maxPackets = 80;
+  }
 
   for (int i = 0; i < maxPackets; ++i) {
     int ret = av_read_frame(format, impl_->packet);
@@ -1433,7 +1487,8 @@ bool NativeDecoder::decodeNextVideoFrame(
     }
   }
 
-  error_ = "NativeDecoder reached packet limit before next video frame.";
+  error_ = "NativeDecoder reached packet limit before next video frame (maxPackets=" +
+    std::to_string(maxPackets) + ").";
   return false;
 #endif
 }
@@ -1445,15 +1500,18 @@ bool NativeDecoder::decodeFirstVideoFrame(NativeDemuxer &demuxer) {
     return true;
   }
 
-  return decodeNextVideoFrame(demuxer, true);
+  // Streams IPTV/TS muitas vezes iniciam com PAT/PMT, metadata e vários pacotes de
+  // áudio antes do primeiro frame de vídeo. No startup precisamos ser mais
+  // pacientes; os limites curtos continuam valendo no playback normal.
+  return decodeNextVideoFrame(demuxer, true, nullptr, 1200);
 }
 
 bool NativeDecoder::dropNextVideoFrame(NativeDemuxer &demuxer) {
-  return decodeNextVideoFrame(demuxer, false);
+  return decodeNextVideoFrame(demuxer, false, nullptr, 80);
 }
 
 #ifdef NSTV_USE_FFMPEG
-bool NativeDecoder::decodeNextHardwareFrame(NativeDemuxer &demuxer) {
+bool NativeDecoder::decodeNextHardwareFrame(NativeDemuxer &demuxer, int maxPackets) {
   if (!impl_) {
     error_ = "NativeDecoder internal state is unavailable.";
     return false;
@@ -1473,7 +1531,9 @@ bool NativeDecoder::decodeNextHardwareFrame(NativeDemuxer &demuxer) {
     return false;
   }
 
-  const int maxPackets = 80;
+  if (maxPackets <= 0) {
+    maxPackets = 80;
+  }
 
   for (int i = 0; i < maxPackets; ++i) {
     int ret = av_read_frame(format, impl_->packet);
@@ -1583,7 +1643,8 @@ bool NativeDecoder::decodeNextHardwareFrame(NativeDemuxer &demuxer) {
     }
   }
 
-  error_ = "NativeDecoder reached packet limit before next hardware frame.";
+  error_ = "NativeDecoder reached packet limit before next hardware frame (maxPackets=" +
+    std::to_string(maxPackets) + ").";
   return false;
 }
 

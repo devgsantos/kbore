@@ -971,6 +971,7 @@ bool Deko3dVideoRenderer::renderFrame(const AVFrame *frame) {
 
   switchState_->cmdBuf.signalFence(frameSlot.fence);
   switchState_->queue.submitCommands(switchState_->cmdBuf.finishList());
+  // presentImage blocks until vsync on Switch, providing automatic frame pacing
   switchState_->queue.presentImage(switchState_->swapchain, slot);
   frameSlot.submitted = true;
   switchState_->nextFrameSlot = (switchState_->nextFrameSlot + 1) % FrameInFlightCount;

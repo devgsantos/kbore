@@ -132,9 +132,18 @@ bool NativeDemuxer::open(const std::string &url) {
   av_dict_set(&options, "user_agent", "NSTV-NativeDemuxer/0.1", 0);
   av_dict_set(&options, "reconnect", "1", 0);
   av_dict_set(&options, "reconnect_streamed", "1", 0);
-  av_dict_set(&options, "reconnect_delay_max", "5", 0);
-  av_dict_set(&options, "timeout", "8000000", 0);
-  av_dict_set(&options, "rw_timeout", "8000000", 0);
+  av_dict_set(&options, "reconnect_delay_max", "2", 0);
+  /*
+    IPTV ao vivo não pode deixar av_read_frame bloquear por muitos segundos.
+    O log de travadas mostrou o clock acumulando dezenas de segundos enquanto
+    o demuxer esperava dados. Timeouts menores fazem o player congelar menos
+    e permitem o resync de live latency agir.
+  */
+  av_dict_set(&options, "timeout", "3000000", 0);
+  av_dict_set(&options, "rw_timeout", "2000000", 0);
+  av_dict_set(&options, "fflags", "nobuffer", 0);
+  av_dict_set(&options, "flags", "low_delay", 0);
+  av_dict_set(&options, "max_delay", "500000", 0);
   av_dict_set(&options, "analyzeduration", "1000000", 0);
   av_dict_set(&options, "probesize", "65536", 0);
 

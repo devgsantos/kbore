@@ -80,13 +80,14 @@ private:
   long long lastPresentedVideoWallMs_ = 0;
   long long nextFrameDueMs_ = 0;
 
-  int fallbackFrameIntervalMs_ = 40;
+  int fallbackFrameIntervalMs_ = 33;  // ~30 FPS fallback, adjusted for smoother display sync on 60Hz screen
   int currentFrameIntervalMs_ = 40;
   int cpuFrameCostAvgMs_ = 0;
 
   int decodedFrames_ = 0;
   int droppedFrames_ = 0;
   long long lastDropLogWallMs_ = 0;
+  long long lastQualityLogWallMs_ = 0;
 
   void resetClock();
   void syncClockFromLatestFrame();
@@ -97,6 +98,13 @@ private:
   int cpuPresentationIntervalMs() const;
   int maxDropsPerUpdate(long long currentDelayMs) const;
   int dropDelayThresholdMs() const;
+  int targetPlaybackDelayMs() const;
+  void rebalanceAudioQueue(long long now);
+  void logStreamQuality(long long now, long long delayMs, int audioQueuedMs);
+  bool recoverIfPlaybackPanic(long long now, const char *reason);
+  int streamPanicDelayMs() const;
+  int decodeStallBudgetMs() const;
+  int dropLoopBudgetMs() const;
   void updateCpuFrameCost(long long elapsedMs);
 };
 
