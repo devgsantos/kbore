@@ -560,3 +560,6 @@ The NVTEGRA FFmpeg backend requires:
 If Kboré is distributed with binaries linked against that FFmpeg build, treat the
 distribution as GPL-compatible and provide the corresponding source according to
 the applicable FFmpeg license terms.
+
+
+Kboré does not provide IPTV lists, channels, movies, series, servers, or streaming content. The app is only a player. All playlists, sources, and content are provided by the user and are the user’s responsibility. Kboré is not affiliated with, sponsored by, or endorsed by any IPTV provider or streaming server.

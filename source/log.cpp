@@ -44,6 +44,14 @@ void writeLineToFile(const char *line) {
   std::fclose(file);
 }
 
+bool isLogFileEnabled() {
+#ifdef NSTV_PRODUCTION_BUILD
+  return false;
+#else
+  return true;
+#endif
+}
+
 } // namespace
 
 void logLine(const std::string &message) {
@@ -51,7 +59,9 @@ void logLine(const std::string &message) {
 
   std::printf("%s\n", message.c_str());
   std::fflush(stdout);
-  writeLineToFile(message.c_str());
+  if (isLogFileEnabled()) {
+    writeLineToFile(message.c_str());
+  }
 }
 
 void logLinef(const char *format, ...) {

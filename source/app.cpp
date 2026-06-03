@@ -3898,6 +3898,7 @@ void App::renderSettingsGraphic() {
   gfx_.drawText("Thanks to the open-source projects and third-party libraries used by this app,", about.x + 34, about.y + 256, 2, muted, false);
   gfx_.drawText("including devkitPro/libnx, FFmpeg, Deko3D, SDL/cURL and related dependencies.", about.x + 34, about.y + 286, 2, muted, false);
   gfx_.drawText("Thank you for using and supporting Kboré.", about.x + 34, about.y + 326, 2, text, true);
+  gfx_.drawText("Developed by Gilson Santos / https://github.com/devgsantos", about.x + 34, about.y + 356, 2, text, true);
 
   gfx_.drawText("A / B  BACK", 80, 632, 3, muted, true);
 }
