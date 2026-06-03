@@ -170,16 +170,16 @@ void NativeHwPlayerBackend::syncClockFromLatestFrame() {
 
     /*
       Controlador inteligente de clock:
-      - se o vídeo está atrasado, reduzimos agressivamente o intervalo;
-      - se o áudio está com fila alta, aumentamos suavemente o alvo efetivo
-        do vídeo para compensar a latência real de saída do áudio no SDL.
-        Isso corrige o caso de vídeo levemente adiantado sem mexer no
-        resync de emergência que estabilizou transmissões longas.
+      - recuperação usa o alvo base, não o alvo efetivo de A/V.
+        Isso mantém a folga contra o dropThreshold e evita que a
+        compensação visual de áudio vire atraso acumulado.
     */
-    if (delay > effectiveTargetMs) {
+    const int recoveryTargetMs = targetPlaybackDelayMs();
+
+    if (delay > recoveryTargetMs) {
       const int reduction = std::min(
         std::max(1, interval - 8),
-        std::max(2, static_cast<int>((delay - effectiveTargetMs) / 30))
+        std::max(2, static_cast<int>((delay - recoveryTargetMs) / 30))
       );
       interval = std::max(8, interval - reduction);
     } else if (delay < -targetPlaybackDelayMs()) {
@@ -208,27 +208,27 @@ bool NativeHwPlayerBackend::shouldDecodeNow(long long now) const {
   const int effectiveTargetMs = effectiveTargetPlaybackDelayMs(audioQueuedMs);
 
   /*
-    Atraso de vídeo é tratado como emergência progressiva.
-    Usamos o alvo efetivo com compensação de áudio para não acelerar o vídeo
-    quando ele já está visualmente um pouco à frente da saída de áudio.
+    Recuperação de atraso continua usando o alvo base. O alvo efetivo serve
+    apenas para micro-hold visual, não para decidir que o player pode esperar
+    mais antes de decodificar. Isso evita o retorno dos engasgos.
   */
-  if (delay > effectiveTargetMs) {
+  if (delay > targetPlaybackDelayMs()) {
     return true;
   }
 
   /*
-    Ajuste fino A/V: se a fila de áudio está saudável, mas o vídeo está
-    chegando cedo demais em relação ao alvo efetivo, seguramos pouquíssimo
-    o próximo frame. O limite baixo evita perda perceptível de fluidez.
+    Ajuste fino A/V: quando o áudio tem fila suficiente e o vídeo está um
+    pouco cedo em relação ao alvo efetivo, seguramos só alguns milissegundos.
+    O cap baixo mantém a fluidez e evita acumular delay até o frame drop.
   */
   if (
     nativeRendererReady_ &&
     nativeRenderer_ &&
     decodedFrames_ > 12 &&
     audioQueuedMs >= 250 &&
-    delay + 12 < effectiveTargetMs
+    delay + 8 < effectiveTargetMs
   ) {
-    const long long holdMs = std::min(36LL, static_cast<long long>(effectiveTargetMs - delay) / 2);
+    const long long holdMs = std::min(14LL, static_cast<long long>(effectiveTargetMs - delay) / 3);
     return now >= nextFrameDueMs_ + holdMs;
   }
 
@@ -403,9 +403,10 @@ int NativeHwPlayerBackend::dropDelayThresholdMs() const {
 
 int NativeHwPlayerBackend::targetPlaybackDelayMs() const {
   /*
-    Alvo base para IPTV ao vivo no Switch. O ajuste fino de A/V é aplicado
-    separadamente em effectiveTargetPlaybackDelayMs(), porque depende da fila
-    real de áudio no SDL.
+    Alvo base do relógio de live IPTV. Mantemos 90ms no render nativo porque
+    foi o ponto que eliminou engasgos e drift em testes longos. O ajuste fino
+    de A/V não deve aumentar este alvo base, senão o player espera demais,
+    chega perto do threshold de drop e volta a produzir microtravadas.
   */
   return nativeRendererReady_ && nativeRenderer_ ? 90 : 120;
 }
@@ -416,20 +417,20 @@ int NativeHwPlayerBackend::audioLeadCompensationMs(int audioQueuedMs) const {
   }
 
   /*
-    SDL_QueueAudio introduz uma pequena latência de saída. Quando a fila está
-    entre ~350-550ms, o vídeo pode parecer levemente adiantado mesmo com o
-    relógio de vídeo em ~90ms. Compensamos de forma suave, sem forçar drops.
+    Compensação visual pequena para a latência de saída do SDL. Ela é usada
+    apenas como margem de apresentação, não como novo alvo de recuperação.
+    Assim o vídeo pode esperar alguns ms pelo áudio sem reintroduzir drops.
   */
   if (audioQueuedMs >= 450) {
-    return 35;
+    return 24;
   }
 
   if (audioQueuedMs >= 350) {
-    return 25;
+    return 18;
   }
 
   if (audioQueuedMs >= 250) {
-    return 15;
+    return 12;
   }
 
   return 0;
@@ -524,7 +525,7 @@ void NativeHwPlayerBackend::rebalanceAudioQueue(long long now) {
       "[KBORE][PLAYBACK][QUALITY] cleared audio queue audioQ=%dms delay=%lldms target=%d",
       audioQueuedMs,
       delay,
-      targetPlaybackDelayMs()
+      effectiveTargetPlaybackDelayMs(audioQueuedMs)
     );
 
     return;
@@ -550,7 +551,7 @@ void NativeHwPlayerBackend::logStreamQuality(long long now, long long delayMs, i
   logLinef(
     "[KBORE][PLAYBACK][QUALITY] delay=%lldms target=%d dropThreshold=%d audioQ=%dms decoded=%d dropped=%d",
     delayMs,
-    targetPlaybackDelayMs(),
+    effectiveTargetPlaybackDelayMs(audioQueuedMs),
     dropDelayThresholdMs(),
     audioQueuedMs,
     decodedFrames_,
