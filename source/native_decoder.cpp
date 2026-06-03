@@ -1047,11 +1047,22 @@ bool NativeDecoder::decodeAudioPacketToSdl(AVPacket *packet) {
 
 #ifdef NSTV_USE_SDL
     if (impl_->audioDevice != 0 && convertedBytes > 0) {
-      SDL_QueueAudio(
-        impl_->audioDevice,
-        impl_->audioBuffer.data(),
-        static_cast<Uint32>(convertedBytes)
-      );
+      const Uint32 queued = SDL_GetQueuedAudioSize(impl_->audioDevice);
+      const Uint32 bytesPerSample = SDL_AUDIO_BITSIZE(impl_->audioSpec.format) / 8u;
+      const Uint32 bytesPerSecond =
+        static_cast<Uint32>(impl_->audioSpec.freq) *
+        static_cast<Uint32>(impl_->audioSpec.channels) *
+        bytesPerSample;
+      const Uint32 targetMaxQueue = bytesPerSecond * 2u; // ~2 segundos de áudio
+      const bool queueIsFull = queued >= targetMaxQueue;
+
+      if (!queueIsFull) {
+        SDL_QueueAudio(
+          impl_->audioDevice,
+          impl_->audioBuffer.data(),
+          static_cast<Uint32>(convertedBytes)
+        );
+      }
     }
 #endif
 

@@ -99,9 +99,10 @@ void NativeHwPlayerBackend::syncClockFromLatestFrame() {
   }
 
   int interval = fallbackFrameIntervalMs_;
+  int64_t ptsDelta = -1;
 
   if (info.ptsMs >= 0 && lastPtsMs_ >= 0) {
-    const int64_t ptsDelta = info.ptsMs - lastPtsMs_;
+    ptsDelta = info.ptsMs - lastPtsMs_;
 
     /*
       PTS normal:
@@ -138,6 +139,18 @@ void NativeHwPlayerBackend::syncClockFromLatestFrame() {
 
   if (nativeRendererReady_ && nativeRenderer_) {
     const long long delay = playbackDelayMs(now);
+
+    if (delay > 120 || decodedFrames_ <= 3 || decodedFrames_ % 120 == 0) {
+      logLinef(
+        "[KBORE][PLAYBACK] sync decoded=%u interval=%d delay=%lld ptsDelta=%lld firstPtsMs=%lld lastPtsMs=%lld",
+        decodedFrames_,
+        interval,
+        delay,
+        ptsDelta,
+        firstPtsMs_,
+        lastPtsMs_
+      );
+    }
 
     if (delay > 120) {
       const int reduction = std::min(
@@ -242,11 +255,10 @@ int NativeHwPlayerBackend::cpuPresentationIntervalMs() const {
 
 int NativeHwPlayerBackend::maxDropsPerUpdate(long long currentDelayMs) const {
   if (nativeRendererReady_ && nativeRenderer_) {
-    // Para render nativo, usar drops controlados baseados no atraso atual.
-    if (currentDelayMs > 1200) {
-      return 3;
-    }
-    if (currentDelayMs > 800) {
+    // Para render nativo, usar drops o mais leve possível.
+    // Se o atraso não for extremamente grande, preferimos manter o frame
+    // atual para evitar sensação de passo a passo.
+    if (currentDelayMs > 2500) {
       return 2;
     }
     return 1;
@@ -271,30 +283,38 @@ int NativeHwPlayerBackend::maxDropsPerUpdate(long long currentDelayMs) const {
 
 int NativeHwPlayerBackend::dropDelayThresholdMs() const {
   if (nativeRendererReady_ && nativeRenderer_) {
-    // Ajusta o limiar para iniciar drops de forma equilibrada
-    // sem esperar até 1 segundo de atraso.
-    return 700;
+    // Durante os primeiros frames, permitir uma margem maior para o "warmup".
+    if (decodedFrames_ < 12) {
+      return 1800;
+    }
+
+    const int interval = cpuPresentationIntervalMs();
+    if (interval >= 40) {
+      return 1600;
+    }
+
+    return 1400;
   }
 
   const int interval = cpuPresentationIntervalMs();
 
   if (interval >= 100) {
-    return 45;
+    return 60;
   }
 
   if (interval >= 67) {
-    return 55;
+    return 75;
   }
 
   if (interval >= 50) {
-    return 70;
+    return 95;
   }
 
   if (interval >= 40) {
-    return 90;
+    return 115;
   }
 
-  return 120;
+  return 140;
 }
 
 void NativeHwPlayerBackend::updateCpuFrameCost(long long elapsedMs) {
