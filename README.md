@@ -1,3 +1,8 @@
+# What is Kboré?
+A powerfull UX first IPTV player app for Nintendo Switch. Add M3U URL or XTream
+playlists (M3U files support coming soon) and watch content anywhere.
+Just download the lates release and enjoy!
+
 # Kboré - Homebrew Development and Player Build
 
 This repository contains the native Kboré homebrew app, including the app UI,
