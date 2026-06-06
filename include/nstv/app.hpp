@@ -43,10 +43,8 @@ struct AppState {
   std::string loadedCategoryKey;
   bool channelListLoading = false;
   std::string channelListLoadingKey;
-  bool channelGridView = false;
 
   std::map<std::string, EpgPage> epgByChannel;
-  std::map<std::string, long long> epgRefreshAttemptMsByKey;
   std::string currentEpgKey;
   bool currentEpgAvailable = false;
 
