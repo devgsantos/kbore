@@ -26,6 +26,7 @@ Button pollButtonBlocking();
 void clearScreen();
 void presentScreen();
 void sleepMs(int ms);
+void setMediaPlaybackActive(bool active);
 std::string requestTextInput(const std::string &title, const std::string &initialValue = "", int maxLength = 512);
 
 } // namespace nstv

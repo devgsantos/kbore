@@ -888,6 +888,13 @@ App::App() : api_(loadConfig()), player_(createPlayerBackend()) {
 }
 
 App::~App() {
+  setMediaPlaybackActive(false);
+
+  if (player_) {
+    player_->close();
+    player_.reset();
+  }
+
   stopChannelWorker();
   stopEpgWorker();
 }
@@ -952,11 +959,21 @@ int App::run() {
     sleepMs(16);
   }
 
+  setMediaPlaybackActive(false);
   return 0;
 }
 
 void App::handle(Button button) {
   if (button == Button::Quit) {
+    setMediaPlaybackActive(false);
+
+    if (player_) {
+      logLine("[KBORE][PLAYBACK][LIFECYCLE] closing player on Quit");
+      player_->close();
+      player_.reset();
+      gfx_.resumeAfterNativeVideo();
+    }
+
     state_.running = false;
     return;
   }
@@ -975,6 +992,8 @@ void App::handle(Button button) {
         !isOpen;
 
       if (button == Button::Back) {
+        setMediaPlaybackActive(false);
+
         if (player_) {
           logLine("[KBORE][PLAYBACK][LIFECYCLE] closing player on Back");
           player_->close();
@@ -2877,6 +2896,9 @@ void App::openChannel(const Channel &channel) {
   player_->setOverlayVisible(true);
 
   if (player_->open(channel.url)) {
+    setMediaPlaybackActive(true);
+    logLine("[KBORE][PLAYBACK][LIFECYCLE] media playback state enabled");
+
     if (!player_->nativeVideoActive() && gfx_.isSuspendedForNativeVideo()) {
       gfx_.resumeAfterNativeVideo();
     }
@@ -2901,6 +2923,7 @@ void App::openChannel(const Channel &channel) {
     state_.playerLoading = false;
     state_.playerLoadFailed = true;
     state_.playerErrorMessage = openError;
+    setMediaPlaybackActive(false);
     gfx_.resumeAfterNativeVideo();
 
     if (player_) {

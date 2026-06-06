@@ -24,6 +24,7 @@ namespace nstv {
 
 #ifdef __SWITCH__
 static PadState pad;
+static bool mediaPlaybackActive = false;
 #endif
 
 void platformInit() {
@@ -39,6 +40,10 @@ void platformInit() {
 
 void platformExit() {
 #ifdef __SWITCH__
+  if (mediaPlaybackActive) {
+    appletSetMediaPlaybackState(false);
+    mediaPlaybackActive = false;
+  }
   socketExit();
 #endif
   curl_global_cleanup();
@@ -183,6 +188,19 @@ void presentScreen() {
 
 void sleepMs(int ms) {
   std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+}
+
+void setMediaPlaybackActive(bool active) {
+#ifdef __SWITCH__
+  if (mediaPlaybackActive == active) {
+    return;
+  }
+
+  appletSetMediaPlaybackState(active);
+  mediaPlaybackActive = active;
+#else
+  (void)active;
+#endif
 }
 
 
