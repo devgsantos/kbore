@@ -294,48 +294,49 @@ int currentProgramIndex(const EpgPage &page) {
   }
 
   const std::time_t now = std::time(nullptr);
+  int nextIndex = -1;
+  int nearestIndex = -1;
+  long long nearestDistance = std::numeric_limits<long long>::max();
   bool anyTimed = false;
 
   for (std::size_t i = 0; i < page.programs.size(); ++i) {
     std::time_t start{};
     std::time_t stop{};
     const bool hasStart = parseEpgTime(page.programs[i].start, start);
-    bool hasStop = parseEpgTime(page.programs[i].stop, stop);
+    const bool hasStop = parseEpgTime(page.programs[i].stop, stop);
 
     anyTimed = anyTimed || hasStart || hasStop;
 
-    if (!hasStart && !hasStop) {
-      continue;
-    }
-
-    // If the API gives only a start time, infer a safe stop from the next
-    // programme start. This makes "now" detection work for providers that omit
-    // stop on the active item, without ever jumping to a future programme.
-    if (hasStart && !hasStop) {
-      for (std::size_t j = i + 1; j < page.programs.size(); ++j) {
-        std::time_t nextStart{};
-        if (parseEpgTime(page.programs[j].start, nextStart) && nextStart > start) {
-          stop = nextStart;
-          hasStop = true;
-          break;
-        }
-      }
-
-      if (!hasStop) {
-        stop = start + 3 * 60 * 60;
-        hasStop = true;
-      }
-    }
-
-    if (hasStart && hasStop && stop > start && now >= start && now < stop) {
+    if (hasStart && hasStop && now >= start && now < stop) {
       return static_cast<int>(i);
+    }
+
+    if (hasStart && start > now && nextIndex < 0) {
+      nextIndex = static_cast<int>(i);
+    }
+
+    if (hasStart) {
+      const long long distance = std::llabs(static_cast<long long>(start) - static_cast<long long>(now));
+      if (distance < nearestDistance) {
+        nearestDistance = distance;
+        nearestIndex = static_cast<int>(i);
+      }
     }
   }
 
-  // Do not fall forward to nextIndex/nearestIndex. Showing "21:25-22:45" at
-  // 11:05 is worse than showing unavailable because it tells the user the wrong
-  // current programme. A timed EPG page must overlap the current clock.
-  return anyTimed ? -1 : 0;
+  if (nextIndex >= 0) {
+    return nextIndex;
+  }
+
+  // If the parser returned programmes but none overlaps the console clock,
+  // still render the nearest item instead of showing EPG unavailable. This is
+  // important on Switch when the system clock/timezone is off or the provider
+  // returns a shifted XMLTV window.
+  if (nearestIndex >= 0) {
+    return nearestIndex;
+  }
+
+  return anyTimed ? 0 : 0;
 }
 
 std::string formatEpgRange(const EpgProgram &program) {
@@ -527,9 +528,6 @@ bool nodeChildrenAreItems(const MediaNode &node) {
 }
 
 }
-
-static int windowStart(int selected, int size, int maxRows);
-static int gridWindowStart(int selected, int size, int columns, int rows);
 
 App::App() : api_(loadConfig()), player_(createPlayerBackend()) {
   splashStartedAtMs_ = nowMs();
@@ -731,69 +729,6 @@ void App::handleDashboard(Button button) {
   }
 
 
-  if (button == Button::Favorite) {
-    state_.channelGridView = !state_.channelGridView;
-    state_.message = state_.channelGridView
-      ? "Grid view enabled (X)"
-      : "List view enabled (X)";
-    std::printf("[KBORE][INPUT] X toggled dashboard item view: %s\n", state_.channelGridView ? "grid" : "list");
-    normalizeIndexes();
-    loadVisibleEpgForChannelList();
-    loadSelectedEpg(false, false);
-    return;
-  }
-
-  if (button == Button::ShoulderLeft || button == Button::ShoulderRight) {
-    const int delta = button == Button::ShoulderRight ? 10 : -10;
-    int count = 0;
-    int *selected = nullptr;
-
-    if (state_.focus == FocusColumn::Types) {
-      count = static_cast<int>(visibleTypes().size());
-      selected = &state_.selectedType;
-    } else if (state_.focus == FocusColumn::Categories) {
-      count = usingNodeTree()
-        ? static_cast<int>(currentNodeChildren().size())
-        : (selectedTypeGroup() ? static_cast<int>(selectedTypeGroup()->categories.size()) : 0);
-      selected = &state_.selectedCategory;
-    } else if (state_.focus == FocusColumn::Channels) {
-      count = usingNodeTree()
-        ? static_cast<int>(previewNodeChildren().size())
-        : static_cast<int>(state_.loadedChannels.size());
-      selected = &state_.selectedChannel;
-    }
-
-    if (selected && count > 0) {
-      *selected = std::clamp(*selected + delta, 0, count - 1);
-
-      if (state_.focus == FocusColumn::Types) {
-        state_.nodePath.clear();
-        state_.selectedCategory = 0;
-        state_.selectedChannel = 0;
-        if (!usingNodeTree()) resetLoadedChannels();
-      } else if (state_.focus == FocusColumn::Categories) {
-        state_.selectedChannel = 0;
-        if (!usingNodeTree()) resetLoadedChannels();
-      } else if (state_.focus == FocusColumn::Channels && !usingNodeTree()) {
-        maybePreloadNextPage();
-      }
-
-      std::printf(
-        "[KBORE][INPUT] %s skip 10 focus=%d selected=%d count=%d\n",
-        button == Button::ShoulderRight ? "R" : "L",
-        static_cast<int>(state_.focus),
-        *selected,
-        count
-      );
-      state_.message = std::string(button == Button::ShoulderRight ? "Skipped +10" : "Skipped -10");
-    }
-
-    normalizeIndexes();
-    loadVisibleEpgForChannelList();
-    loadSelectedEpg(false, false);
-    return;
-  }
-
   if (usingNodeTree()) {
     if (button == Button::Back) {
       if (state_.focus == FocusColumn::Channels) {
@@ -832,13 +767,7 @@ void App::handleDashboard(Button button) {
       }
 
       if (state_.focus == FocusColumn::Channels) {
-        if (state_.channelGridView && state_.selectedChannel % 2 == 1) {
-          state_.selectedChannel--;
-          loadVisibleEpgForChannelList();
-          loadSelectedEpg(false, false);
-        } else {
-          state_.focus = FocusColumn::Categories;
-        }
+        state_.focus = FocusColumn::Categories;
       } else if (state_.focus == FocusColumn::Categories) {
         state_.focus = FocusColumn::Types;
       }
@@ -868,13 +797,6 @@ void App::handleDashboard(Button button) {
         state_.focus = FocusColumn::Categories;
       } else if (state_.focus == FocusColumn::Categories) {
         state_.focus = FocusColumn::Channels;
-      } else if (state_.focus == FocusColumn::Channels && state_.channelGridView) {
-        const int count = static_cast<int>(previewNodeChildren().size());
-        if (state_.selectedChannel % 2 == 0 && state_.selectedChannel + 1 < count) {
-          state_.selectedChannel++;
-          loadVisibleEpgForChannelList();
-          loadSelectedEpg(false, false);
-        }
       }
       return;
     }
@@ -911,11 +833,10 @@ void App::handleDashboard(Button button) {
       }
 
       if (state_.focus == FocusColumn::Channels) {
-        const int step = state_.channelGridView ? 2 : 1;
         if (state_.selectedChannel <= 0) {
           state_.focus = FocusColumn::Categories;
         } else {
-          state_.selectedChannel = std::max(0, state_.selectedChannel - step);
+          state_.selectedChannel--;
           loadVisibleEpgForChannelList();
           loadSelectedEpg(false, false);
         }
@@ -938,7 +859,7 @@ void App::handleDashboard(Button button) {
         state_.selectedCategory++;
         state_.selectedChannel = 0;
       } else if (state_.focus == FocusColumn::Channels) {
-        state_.selectedChannel += state_.channelGridView ? 2 : 1;
+        state_.selectedChannel++;
       }
 
       normalizeIndexes();
@@ -1090,13 +1011,7 @@ void App::handleDashboard(Button button) {
     }
 
     if (state_.focus == FocusColumn::Channels) {
-      if (state_.channelGridView && state_.selectedChannel % 2 == 1) {
-        state_.selectedChannel--;
-        loadVisibleEpgForChannelList();
-        loadSelectedEpg(false, false);
-      } else {
-        state_.focus = FocusColumn::Categories;
-      }
+      state_.focus = FocusColumn::Categories;
     } else if (state_.focus == FocusColumn::Categories) {
       state_.focus = FocusColumn::Types;
     }
@@ -1126,14 +1041,6 @@ void App::handleDashboard(Button button) {
       state_.focus = FocusColumn::Categories;
     } else if (state_.focus == FocusColumn::Categories) {
       state_.focus = FocusColumn::Channels;
-    } else if (state_.focus == FocusColumn::Channels && state_.channelGridView) {
-      const int count = static_cast<int>(state_.loadedChannels.size());
-      if (state_.selectedChannel % 2 == 0 && state_.selectedChannel + 1 < count) {
-        state_.selectedChannel++;
-        maybePreloadNextPage();
-        loadVisibleEpgForChannelList();
-        loadSelectedEpg(false, false);
-      }
     }
     return;
   }
@@ -1164,11 +1071,10 @@ void App::handleDashboard(Button button) {
     }
 
     if (state_.focus == FocusColumn::Channels) {
-      const int step = state_.channelGridView ? 2 : 1;
       if (state_.selectedChannel <= 0) {
         state_.focus = FocusColumn::Playlist;
       } else {
-        state_.selectedChannel = std::max(0, state_.selectedChannel - step);
+        state_.selectedChannel--;
         loadVisibleEpgForChannelList();
         loadSelectedEpg(false, false);
       }
@@ -1189,7 +1095,7 @@ void App::handleDashboard(Button button) {
       state_.selectedCategory++;
       resetLoadedChannels();
     } else {
-      state_.selectedChannel += state_.channelGridView ? 2 : 1;
+      state_.selectedChannel++;
       normalizeIndexes();
       maybePreloadNextPage();
       loadVisibleEpgForChannelList();
@@ -2191,7 +2097,7 @@ void App::loadSelectedEpg(bool force, bool fetchRemote) {
     for (const std::string &alias : channelEpgKeys(*channel)) {
       state_.epgByChannel[alias] = epg;
     }
-    state_.currentEpgAvailable = currentProgramIndex(epg) >= 0;
+    state_.currentEpgAvailable = !epg.programs.empty();
     saveEpgPage(state_.manifest.id, *channel, epg);
   } catch (const std::exception &ex) {
     std::printf("[KBORE] loadSelectedEpg failed: %s\n", ex.what());
@@ -2291,7 +2197,7 @@ void App::loadEpgForChannels(const std::vector<Channel> &channels) {
 }
 
 void App::loadVisibleEpgForChannelList() {
-  const int channelRows = state_.channelGridView ? 6 : 7;
+  constexpr int channelRows = 7;
 
   if (usingNodeTree()) {
     std::vector<const MediaNode *> nodes = previewNodeChildren();
@@ -2300,9 +2206,10 @@ void App::loadVisibleEpgForChannelList() {
     }
 
     const int size = static_cast<int>(nodes.size());
-    const int start = state_.channelGridView
-      ? gridWindowStart(state_.selectedChannel, size, 2, 3)
-      : windowStart(state_.selectedChannel, size, channelRows);
+    const int half = channelRows / 2;
+    const int start = size <= channelRows
+      ? 0
+      : std::max(0, std::min(state_.selectedChannel - half, size - channelRows));
 
     std::vector<Channel> visible;
     for (int i = 0; i < channelRows; ++i) {
@@ -2331,9 +2238,10 @@ void App::loadVisibleEpgForChannelList() {
   }
 
   const int size = static_cast<int>(state_.loadedChannels.size());
-  const int start = state_.channelGridView
-    ? gridWindowStart(state_.selectedChannel, size, 2, 3)
-    : windowStart(state_.selectedChannel, size, channelRows);
+  const int half = channelRows / 2;
+  const int start = size <= channelRows
+    ? 0
+    : std::max(0, std::min(state_.selectedChannel - half, size - channelRows));
   std::vector<Channel> visible;
 
   for (int i = 0; i < channelRows; ++i) {
@@ -3166,22 +3074,6 @@ static int windowStart(int selected, int size, int maxRows) {
   return std::max(0, std::min(selected - half, size - maxRows));
 }
 
-static int gridWindowStart(int selected, int size, int columns, int rows) {
-  if (size <= 0 || columns <= 0 || rows <= 0) {
-    return 0;
-  }
-
-  const int capacity = columns * rows;
-  if (size <= capacity) {
-    return 0;
-  }
-
-  const int selectedRow = std::max(0, selected) / columns;
-  const int totalRows = (size + columns - 1) / columns;
-  const int firstRow = std::max(0, std::min(selectedRow - rows / 2, totalRows - rows));
-  return firstRow * columns;
-}
-
 void App::render() {
   drainFinishedChannelLoads();
   drainFinishedEpg();
@@ -3286,49 +3178,6 @@ void App::renderDashboardGraphic() {
 
   const Category *selectedCategory = selectedCategoryPtr();
   const std::string provider = providerLabel(state_.hasManifest ? state_.manifest.provider : Provider::Local);
-
-  const int listVisibleRows = 7;
-  const int gridColumns = 2;
-  const int gridRows = 3;
-  const int visibleItemCapacity = state_.channelGridView ? gridColumns * gridRows : listVisibleRows;
-  std::string footerUnit = "CHANNELS";
-  int dashboardItemLoaded = static_cast<int>(state_.loadedChannels.size());
-  int dashboardItemTotal = state_.loadedTotal;
-  int dashboardPage = std::max(1, state_.loadedPage);
-  int dashboardTotalPages = std::max(1, state_.loadedTotalPages);
-
-  if (usingNodeTree()) {
-    dashboardItemLoaded = static_cast<int>(nodePreview.size());
-    dashboardItemTotal = dashboardItemLoaded;
-    footerUnit = "ITEMS";
-
-    if (currentNodeChildrenAreItems()) {
-      const MediaNode *parent = currentNodeParent();
-      if (parent) {
-        dashboardItemTotal = std::max(dashboardItemTotal, nodeCount(*parent));
-      }
-    } else if (const MediaNode *selectedNode = selectedCurrentNode()) {
-      dashboardItemTotal = std::max(dashboardItemTotal, nodeCount(*selectedNode));
-    }
-
-    const int totalForPages = std::max(dashboardItemTotal, dashboardItemLoaded);
-    dashboardTotalPages = std::max(1, (totalForPages + visibleItemCapacity - 1) / visibleItemCapacity);
-    dashboardPage = totalForPages <= 0
-      ? 1
-      : std::clamp((state_.selectedChannel / visibleItemCapacity) + 1, 1, dashboardTotalPages);
-  } else {
-    if (dashboardItemTotal <= 0) {
-      if (selectedCategory) {
-        dashboardItemTotal = selectedCategory->totalChannels;
-      } else if (type) {
-        dashboardItemTotal = type->totalChannels;
-      }
-    }
-
-    if (type && type->id != StreamType::Live) {
-      footerUnit = "ITEMS";
-    }
-  }
 
   const Color text = rgb(248,250,252);
   const Color textSoft = rgb(218,226,244);
@@ -3435,9 +3284,8 @@ void App::renderDashboardGraphic() {
 
   std::string chTitle = usingNodeTree() ? "NEXT / ITEMS" : "CHANNELS";
   if (!usingNodeTree() && type) chTitle += " (" + type->label + ")";
-  chTitle += state_.channelGridView ? " - GRID" : " - LIST";
   drawPanel(channelsPanel, chTitle, "channels", state_.focus == FocusColumn::Channels);
-  gfx_.drawTextRight(std::to_string(dashboardItemTotal) + " " + footerUnit, channelsPanel.x + channelsPanel.w - 28, channelsPanel.y + 25, 2, muted, false);
+  gfx_.drawTextRight(std::to_string(state_.loadedTotal > 0 ? state_.loadedTotal : (type ? type->totalChannels : 0)) + " CHANNELS", channelsPanel.x + channelsPanel.w - 28, channelsPanel.y + 25, 2, muted, false);
   const bool channelPanelLoading =
     state_.channelListLoading &&
     !state_.loadedCategoryKey.empty() &&
@@ -3493,115 +3341,44 @@ void App::renderDashboardGraphic() {
     gfx_.drawBadge(std::to_string(c.totalChannels), categoriesPanel.x + categoriesPanel.w - 72, y + 8, 42, 22, rgba(41,54,82,220), text);
   }
 
-  // Channels/movies/items ----------------------------------------------------
-  const int channelRows = state_.channelGridView ? gridRows : listVisibleRows;
-
-  auto drawItemCard = [&](const Channel &ch, const std::string &subtitle, const std::string &indicator, bool selected, int x, int y, int w, int h) {
-    gfx_.fillRoundRect(x, y, w, h, 14, selected ? rgba(12,23,52,245) : rgba(10,15,29,215));
-    gfx_.strokeRoundRect(x, y, w, h, 14, selected ? brightBlue : rgba(72,92,128,24), selected ? 3 : 1);
-
-    drawLogoOrFallback(ch, x + 12, y + 24, 64, 58);
-
-    const int textX = x + 88;
-    gfx_.drawText(Graphics::fitText(ch.name, 17), textX, y + 16, 2, text, true);
-    drawWrappedText(
-      gfx_,
-      Graphics::fitText(subtitle, 66),
-      textX,
-      y + 42,
-      3,
-      26,
-      1,
-      selected ? textSoft : muted,
-      false
-    );
-
-    gfx_.drawTextRight(indicator, x + w - 14, y + 16, 2, muted, false);
-  };
+  // Channels/movies/items: no numeric prefix, smaller text, wider panel ----
+  int channelRows = 7;
 
   if (usingNodeTree()) {
-    if (state_.channelGridView) {
-      const int cardGap = 12;
-      const int cardW = (channelsPanel.w - 32 - cardGap) / 2;
-      const int cardH = 108;
-      const int startX = channelsPanel.x + 14;
-      const int startY = channelsPanel.y + 66;
-      const int start = gridWindowStart(
-        state_.selectedChannel,
-        static_cast<int>(nodePreview.size()),
-        gridColumns,
-        gridRows
-      );
+    int chanStart = windowStart(state_.selectedChannel, static_cast<int>(nodePreview.size()), channelRows);
 
-      for (int row = 0; row < gridRows; ++row) {
-        for (int col = 0; col < gridColumns; ++col) {
-          const int index = start + row * gridColumns + col;
-          if (index >= static_cast<int>(nodePreview.size())) {
-            break;
-          }
+    for (int i = 0; i < channelRows; ++i) {
+      int index = chanStart + i;
+      int y = channelsPanel.y + 66 + i * 55;
 
-          const MediaNode *node = nodePreview[static_cast<std::size_t>(index)];
-          if (!node) {
-            continue;
-          }
-
-          const bool selected = index == state_.selectedChannel;
-          const bool playable = node->playable || !node->url.empty();
-          const bool folder = nodeCanHaveChildren(*node);
-          Channel ch = channelFromNode(*node);
-          std::string sub = folder
-            ? ("FOLDER • " + std::to_string(nodeCount(*node)) + " ITEMS")
-            : (playable ? epgLineForChannel(ch) : "EMPTY");
-          std::string indicator = state_.favorites.count(node->id) ? "*" : (folder ? ">" : "<3");
-
-          drawItemCard(
-            ch,
-            sub,
-            indicator,
-            selected,
-            startX + col * (cardW + cardGap),
-            startY + row * (cardH + cardGap),
-            cardW,
-            cardH
-          );
-        }
+      if (index >= static_cast<int>(nodePreview.size())) {
+        break;
       }
-    } else {
-      int chanStart = windowStart(state_.selectedChannel, static_cast<int>(nodePreview.size()), channelRows);
 
-      for (int i = 0; i < channelRows; ++i) {
-        int index = chanStart + i;
-        int y = channelsPanel.y + 66 + i * 55;
-
-        if (index >= static_cast<int>(nodePreview.size())) {
-          break;
-        }
-
-        const MediaNode *node = nodePreview[static_cast<std::size_t>(index)];
-        if (!node) {
-          continue;
-        }
-
-        bool selected = index == state_.selectedChannel;
-        const bool playable = node->playable || !node->url.empty();
-        const bool folder = nodeCanHaveChildren(*node);
-
-        gfx_.fillRoundRect(channelsPanel.x + 14, y, channelsPanel.w - 32, 49, 12, selected ? rgba(12,23,52,245) : rgba(10,15,29,215));
-        gfx_.strokeRoundRect(channelsPanel.x + 14, y, channelsPanel.w - 32, 49, 12, selected ? brightBlue : rgba(72,92,128,24), selected ? 2 : 1);
-
-        Channel ch = channelFromNode(*node);
-        drawLogoOrFallback(ch, channelsPanel.x + 30, y + 7, 48, 35);
-
-        const int nameX = channelsPanel.x + 94;
-        gfx_.drawText(Graphics::fitText(ch.name, 35), nameX, y + 9, 3, text, true);
-
-        std::string sub = folder
-          ? ("FOLDER • " + std::to_string(nodeCount(*node)) + " ITEMS")
-          : (playable ? epgLineForChannel(ch) : "EMPTY");
-
-        gfx_.drawText(Graphics::fitText(sub, 42), nameX, y + 32, 2, muted, false);
-        gfx_.drawText(state_.favorites.count(node->id) ? "*" : (folder ? ">" : "<3"), channelsPanel.x + channelsPanel.w - 42, y + 15, 2, muted, false);
+      const MediaNode *node = nodePreview[static_cast<std::size_t>(index)];
+      if (!node) {
+        continue;
       }
+
+      bool selected = index == state_.selectedChannel;
+      const bool playable = node->playable || !node->url.empty();
+      const bool folder = nodeCanHaveChildren(*node);
+
+      gfx_.fillRoundRect(channelsPanel.x + 14, y, channelsPanel.w - 32, 49, 12, selected ? rgba(12,23,52,245) : rgba(10,15,29,215));
+      gfx_.strokeRoundRect(channelsPanel.x + 14, y, channelsPanel.w - 32, 49, 12, selected ? brightBlue : rgba(72,92,128,24), selected ? 2 : 1);
+
+      Channel ch = channelFromNode(*node);
+      drawLogoOrFallback(ch, channelsPanel.x + 30, y + 7, 48, 35);
+
+      const int nameX = channelsPanel.x + 94;
+      gfx_.drawText(Graphics::fitText(ch.name, 35), nameX, y + 9, 3, text, true);
+
+      std::string sub = folder
+        ? ("FOLDER • " + std::to_string(nodeCount(*node)) + " ITEMS")
+        : (playable ? epgLineForChannel(ch) : "EMPTY");
+
+      gfx_.drawText(Graphics::fitText(sub, 42), nameX, y + 32, 2, muted, false);
+      gfx_.drawText(state_.favorites.count(node->id) ? "*" : (folder ? ">" : "<3"), channelsPanel.x + channelsPanel.w - 42, y + 15, 2, muted, false);
     }
 
     if (nodePreview.empty()) {
@@ -3609,61 +3386,24 @@ void App::renderDashboardGraphic() {
       gfx_.drawText("PRESS A TO OPEN", channelsPanel.x + 40, channelsPanel.y + 206, 2, blue, true);
     }
   } else {
-    if (state_.channelGridView) {
-      const int cardGap = 12;
-      const int cardW = (channelsPanel.w - 32 - cardGap) / 2;
-      const int cardH = 108;
-      const int startX = channelsPanel.x + 14;
-      const int startY = channelsPanel.y + 66;
-      const int start = gridWindowStart(
-        state_.selectedChannel,
-        static_cast<int>(state_.loadedChannels.size()),
-        gridColumns,
-        gridRows
-      );
+    int chanStart = windowStart(state_.selectedChannel, (int)state_.loadedChannels.size(), channelRows);
+    for (int i=0; i<channelRows; ++i) {
+      int index = chanStart + i;
+      int y = channelsPanel.y + 66 + i * 55;
+      if (index >= (int)state_.loadedChannels.size()) break;
+      const auto &ch = state_.loadedChannels[index];
+      bool selected = index == state_.selectedChannel;
+      gfx_.fillRoundRect(channelsPanel.x + 14, y, channelsPanel.w - 32, 49, 12, selected ? rgba(12,23,52,245) : rgba(10,15,29,215));
+      gfx_.strokeRoundRect(channelsPanel.x + 14, y, channelsPanel.w - 32, 49, 12, selected ? brightBlue : rgba(72,92,128,24), selected ? 2 : 1);
 
-      for (int row = 0; row < gridRows; ++row) {
-        for (int col = 0; col < gridColumns; ++col) {
-          const int index = start + row * gridColumns + col;
-          if (index >= static_cast<int>(state_.loadedChannels.size())) {
-            break;
-          }
+      // Prefer the real logo from the API. If it is missing or cannot be decoded, use a small acronym fallback.
+      drawLogoOrFallback(ch, channelsPanel.x + 30, y + 7, 48, 35);
 
-          const auto &ch = state_.loadedChannels[static_cast<std::size_t>(index)];
-          const bool selected = index == state_.selectedChannel;
-          drawItemCard(
-            ch,
-            epgLineForChannel(ch),
-            state_.favorites.count(ch.id) ? "*" : "<3",
-            selected,
-            startX + col * (cardW + cardGap),
-            startY + row * (cardH + cardGap),
-            cardW,
-            cardH
-          );
-        }
-      }
-    } else {
-      int chanStart = windowStart(state_.selectedChannel, (int)state_.loadedChannels.size(), channelRows);
-      for (int i=0; i<channelRows; ++i) {
-        int index = chanStart + i;
-        int y = channelsPanel.y + 66 + i * 55;
-        if (index >= (int)state_.loadedChannels.size()) break;
-        const auto &ch = state_.loadedChannels[index];
-        bool selected = index == state_.selectedChannel;
-        gfx_.fillRoundRect(channelsPanel.x + 14, y, channelsPanel.w - 32, 49, 12, selected ? rgba(12,23,52,245) : rgba(10,15,29,215));
-        gfx_.strokeRoundRect(channelsPanel.x + 14, y, channelsPanel.w - 32, 49, 12, selected ? brightBlue : rgba(72,92,128,24), selected ? 2 : 1);
-
-        // Prefer the real logo from the API. If it is missing or cannot be decoded, use a small acronym fallback.
-        drawLogoOrFallback(ch, channelsPanel.x + 30, y + 7, 48, 35);
-
-        const int nameX = channelsPanel.x + 94;
-        gfx_.drawText(Graphics::fitText(ch.name, 35), nameX, y + 9, 3, text, true);
-        gfx_.drawText(Graphics::fitText(epgLineForChannel(ch), 42), nameX, y + 32, 2, muted, false);
-        gfx_.drawText(state_.favorites.count(ch.id) ? "*" : "<3", channelsPanel.x + channelsPanel.w - 42, y + 15, 2, muted, false);
-      }
+      const int nameX = channelsPanel.x + 94;
+      gfx_.drawText(Graphics::fitText(ch.name, 35), nameX, y + 9, 3, text, true);
+      gfx_.drawText(Graphics::fitText(epgLineForChannel(ch), 42), nameX, y + 32, 2, muted, false);
+      gfx_.drawText(state_.favorites.count(ch.id) ? "*" : "<3", channelsPanel.x + channelsPanel.w - 42, y + 15, 2, muted, false);
     }
-
     if (state_.loadedChannels.empty()) {
       gfx_.drawText("SELECT A CATEGORY", channelsPanel.x + 40, channelsPanel.y + 178, 3, muted, false);
       gfx_.drawText("PRESS A TO LOAD", channelsPanel.x + 40, channelsPanel.y + 206, 2, blue, true);
@@ -3698,16 +3438,16 @@ void App::renderDashboardGraphic() {
   } else {
     gfx_.drawText(state_.hasManifest ? Graphics::fitText(state_.manifest.name, 34) : "NSTV", info.x + 40, info.y + 30, 4, text, true);
   }
-  gfx_.drawText("PAGE " + std::to_string(dashboardPage) + " / " + std::to_string(dashboardTotalPages), info.x + 610, info.y + 24, 2, text, true);
-  gfx_.drawText("LOADED: " + std::to_string(dashboardItemLoaded) + " / " + std::to_string(dashboardItemTotal) + " " + footerUnit, info.x + 610, info.y + 50, 1, blue, true);
+  gfx_.drawText("PAGE " + std::to_string(state_.loadedPage) + " / " + std::to_string(state_.loadedTotalPages), info.x + 610, info.y + 24, 2, text, true);
+  gfx_.drawText("LOADED: " + std::to_string(state_.loadedChannels.size()) + " / " + std::to_string(state_.loadedTotal) + " CHANNELS", info.x + 610, info.y + 50, 1, blue, true);
   gfx_.drawText(provider + ": " + Graphics::fitText(state_.hasManifest ? state_.manifest.name : "CONFIGURE", 38), info.x + 940, info.y + 24, 2, text, false);
-  gfx_.drawText(std::string("USABILITY 1.0.1 ") + (state_.channelGridView ? "GRID" : "LIST"), info.x + 978, info.y + 54, 1, green, false);
+  gfx_.drawText("UPDATED", info.x + 978, info.y + 54, 1, green, false);
 
   // Controls footer: smaller text ------------------------------------------
   Rect foot{18, 675, 1245, 36};
   gfx_.fillRoundRect(foot.x, foot.y, foot.w, foot.h, 10, rgba(17,24,39,240));
   gfx_.strokeRoundRect(foot.x, foot.y, foot.w, foot.h, 10, rgba(72,92,128,28), 1);
-  gfx_.drawText("UP - PLAYLISTS   |    LEFT/RIGHT - COLUMNS/CARD   |    L/R - SKIP 10   |    A - SELECT   |    B - BACK   |    X - VIEW   |    + - PLAYLISTS", foot.x + 26, foot.y + 13, 1, text, true);
+  gfx_.drawText("UP - PLAYLISTS   |    LEFT/RIGHT - COLUMNS   |    A  - SELECT   |    B - BACK   |    X - FAVORITES   |    + - PLAYLISTS", foot.x + 26, foot.y + 13, 1, text, true);
 
   if (state_.loading) {
     renderLoadingOverlay(state_.loadingMessage.empty() ? "Loading" : state_.loadingMessage);

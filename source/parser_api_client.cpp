@@ -65,20 +65,14 @@ std::string isoLocalTime(std::time_t value) {
 
 std::string currentEpgWindowJson() {
   const std::time_t now = std::time(nullptr);
+  const std::string from = isoLocalTime(now - 1800);
+  const std::string to = isoLocalTime(now + 24 * 60 * 60);
 
-  // Ask the parser for a window centered around the console clock. Some EPG
-  // sources contain long programmes that started well before the selected
-  // channel became focused; using only now-30m can miss the active programme
-  // and the UI then receives the next future item.
-  const std::string nowIso = isoLocalTime(now);
-  const std::string from = isoLocalTime(now - 8 * 60 * 60);
-  const std::string to = isoLocalTime(now + 16 * 60 * 60);
-
-  if (nowIso.empty() || from.empty() || to.empty()) {
+  if (from.empty() || to.empty()) {
     return "";
   }
 
-  return ",\"now\":\"" + jsonEscape(nowIso) + "\",\"from\":\"" + jsonEscape(from) + "\",\"to\":\"" + jsonEscape(to) + "\"";
+  return ",\"from\":\"" + jsonEscape(from) + "\",\"to\":\"" + jsonEscape(to) + "\"";
 }
 
 bool isAllDigits(const std::string &value) {
