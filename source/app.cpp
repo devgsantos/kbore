@@ -67,6 +67,16 @@ bool isVodType(StreamType type) {
   return type == StreamType::Movies || type == StreamType::Series;
 }
 
+bool startsWith(const std::string &value, const std::string &prefix) {
+  return value.size() >= prefix.size() &&
+    value.compare(0, prefix.size(), prefix) == 0;
+}
+
+bool endsWith(const std::string &value, const std::string &suffix) {
+  return value.size() >= suffix.size() &&
+    value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
 std::string formatSystemClockTime() {
   std::time_t rawTime = std::time(nullptr);
 
@@ -868,6 +878,7 @@ App::App() : api_(loadConfig()), player_(createPlayerBackend()) {
 
   state_.config = loadConfig();
   api_ = ParserApiClient(state_.config);
+  loadFavoritesForActivePlaylist();
 
   const PlaylistConfig *playlist = activePlaylist();
 
@@ -1297,22 +1308,20 @@ void App::handleDashboard(Button button) {
       return;
     }
 
-    if (button == Button::Favorite) {
+    if (button == Button::FavoriteToggle) {
       const MediaNode *node = state_.focus == FocusColumn::Channels
         ? selectedPreviewNode()
         : selectedCurrentNode();
 
       if (!node || node->url.empty()) {
+        state_.message = "Only playable items can be favorited";
         return;
       }
 
-      if (state_.favorites.count(node->id)) {
-        state_.favorites.erase(node->id);
-        state_.message = "Removed favorite: " + (node->title.empty() ? node->name : node->title);
-      } else {
-        state_.favorites.insert(node->id);
-        state_.message = "Favorite: " + (node->title.empty() ? node->name : node->title);
-      }
+      toggleFavorite(channelFromNode(*node));
+      normalizeIndexes();
+      loadVisibleEpgForChannelList();
+      loadSelectedEpg(false, false);
       return;
     }
 
@@ -1548,16 +1557,16 @@ void App::handleDashboard(Button button) {
     return;
   }
 
-  if (button == Button::Favorite) {
+  if (button == Button::FavoriteToggle) {
     const Channel *channel = selectedChannelPtr();
-    if (!channel) return;
-    if (state_.favorites.count(channel->id)) {
-      state_.favorites.erase(channel->id);
-      state_.message = "Removed favorite: " + channel->name;
-    } else {
-      state_.favorites.insert(channel->id);
-      state_.message = "Favorite: " + channel->name;
+    if (!channel) {
+      state_.message = "Only playable items can be favorited";
+      return;
     }
+    toggleFavorite(*channel);
+    normalizeIndexes();
+    loadVisibleEpgForChannelList();
+    loadSelectedEpg(false, false);
     return;
   }
 
@@ -1692,6 +1701,11 @@ bool App::loadCachedPlaylist(const PlaylistConfig &playlist) {
   state_.selectedType = 0;
   state_.selectedCategory = 0;
   state_.selectedChannel = 0;
+  state_.nodePath.clear();
+  loadFavoritesForActivePlaylist();
+  if (!state_.manifest.nodes.empty() || !state_.manifest.types.empty()) {
+    state_.selectedType = 1;
+  }
   resetLoadedChannels();
   normalizeIndexes();
 
@@ -1926,6 +1940,10 @@ void App::updatePlaylistLoad() {
   state_.selectedChannel = 0;
   state_.nodePath.clear();
 
+  loadFavoritesForActivePlaylist();
+  if (!state_.manifest.nodes.empty() || !state_.manifest.types.empty()) {
+    state_.selectedType = 1;
+  }
   resetLoadedChannels();
   normalizeIndexes();
 
@@ -2159,6 +2177,23 @@ void App::loadCategory(bool append) {
 
     if (!state_.hasManifest) {
       state_.message = "No playlist loaded";
+      return;
+    }
+
+    if (selectedTypeIsFavorites()) {
+      state_.loadedChannels = state_.favoriteChannels;
+      state_.loadedPage = 1;
+      state_.loadedTotal = static_cast<int>(state_.loadedChannels.size());
+      state_.loadedTotalPages = 1;
+      state_.loadedCategoryKey = "favorites:" + state_.manifest.id;
+      state_.channelListLoading = false;
+      state_.channelListLoadingKey.clear();
+      state_.selectedChannel = std::clamp(state_.selectedChannel, 0, std::max(0, static_cast<int>(state_.loadedChannels.size()) - 1));
+      state_.message = state_.loadedChannels.empty()
+        ? "No favorites yet. Select an item and press Y."
+        : "Loaded favorites";
+      loadVisibleEpgForChannelList();
+      loadSelectedEpg(false, false);
       return;
     }
 
@@ -2949,6 +2984,7 @@ void App::resetLoadedChannels() {
 std::vector<TypeGroup> App::visibleTypes() const {
   if (usingNodeTree()) {
     std::vector<TypeGroup> groups;
+    groups.push_back(state_.favoritesTypeGroup);
 
     for (const auto &node : state_.manifest.nodes) {
       TypeGroup group;
@@ -2961,7 +2997,13 @@ std::vector<TypeGroup> App::visibleTypes() const {
     return groups;
   }
 
-  if (state_.hasManifest) return state_.manifest.types;
+  if (state_.hasManifest) {
+    std::vector<TypeGroup> groups;
+    groups.push_back(state_.favoritesTypeGroup);
+    groups.insert(groups.end(), state_.manifest.types.begin(), state_.manifest.types.end());
+    return groups;
+  }
+
   return {
     {StreamType::Live, "Live TV", 0, {}},
     {StreamType::Movies, "Movies", 0, {}},
@@ -2971,12 +3013,17 @@ std::vector<TypeGroup> App::visibleTypes() const {
 }
 
 const TypeGroup *App::selectedTypeGroup() const {
-  auto types = visibleTypes();
-  if (types.empty()) return nullptr;
-  int index = std::clamp(state_.selectedType, 0, static_cast<int>(types.size()) - 1);
-  // Safe because render/use is immediate; avoid returning pointer to temp? Use manifest direct below.
   if (!state_.hasManifest) return nullptr;
-  if (index >= 0 && index < static_cast<int>(state_.manifest.types.size())) return &state_.manifest.types[index];
+
+  if (selectedTypeIsFavorites()) {
+    return &state_.favoritesTypeGroup;
+  }
+
+  int index = state_.selectedType - 1;
+  if (index >= 0 && index < static_cast<int>(state_.manifest.types.size())) {
+    return &state_.manifest.types[static_cast<std::size_t>(index)];
+  }
+
   return nullptr;
 }
 
@@ -3007,12 +3054,14 @@ const MediaNode *App::selectedRootNode() const {
     return nullptr;
   }
 
-  int index = std::clamp(
-    state_.selectedType,
-    0,
-    std::max(0, static_cast<int>(state_.manifest.nodes.size()) - 1)
-  );
+  const int totalRoots = static_cast<int>(state_.manifest.nodes.size()) + 1;
+  int index = std::clamp(state_.selectedType, 0, std::max(0, totalRoots - 1));
 
+  if (index == 0) {
+    return &state_.favoritesRootNode;
+  }
+
+  index -= 1;
   if (index < 0 || index >= static_cast<int>(state_.manifest.nodes.size())) {
     return nullptr;
   }
@@ -3025,12 +3074,14 @@ MediaNode *App::selectedRootNode() {
     return nullptr;
   }
 
-  int index = std::clamp(
-    state_.selectedType,
-    0,
-    std::max(0, static_cast<int>(state_.manifest.nodes.size()) - 1)
-  );
+  const int totalRoots = static_cast<int>(state_.manifest.nodes.size()) + 1;
+  int index = std::clamp(state_.selectedType, 0, std::max(0, totalRoots - 1));
 
+  if (index == 0) {
+    return &state_.favoritesRootNode;
+  }
+
+  index -= 1;
   if (index < 0 || index >= static_cast<int>(state_.manifest.nodes.size())) {
     return nullptr;
   }
@@ -3413,6 +3464,204 @@ void App::playNode(const MediaNode &node) {
   // browser the selected item lives in nodePreview, and replacing the channel
   // list would make the cursor return to the top after playback.
   openChannel(channelFromNode(node));
+}
+
+
+void App::loadFavoritesForActivePlaylist() {
+  state_.favoriteChannels.clear();
+  state_.favoriteIds.clear();
+
+  const PlaylistConfig *playlist = activePlaylist();
+  if (!playlist) {
+    rebuildFavoritesNode();
+    return;
+  }
+
+  std::vector<Channel> loaded;
+  loadFavoritesForPlaylist(playlist->id, loaded);
+
+  for (Channel channel : loaded) {
+    if (channel.url.empty()) {
+      continue;
+    }
+
+    channel.id = favoriteIdForChannel(channel);
+    if (channel.id.empty() || state_.favoriteIds.count(channel.id)) {
+      continue;
+    }
+
+    state_.favoriteIds.insert(channel.id);
+    state_.favoriteChannels.push_back(std::move(channel));
+  }
+
+  rebuildFavoritesNode();
+}
+
+void App::rebuildFavoritesNode() {
+  const int total = static_cast<int>(state_.favoriteChannels.size());
+
+  state_.favoritesTypeGroup = TypeGroup{};
+  state_.favoritesTypeGroup.id = StreamType::Favorites;
+  state_.favoritesTypeGroup.label = "Favorites";
+  state_.favoritesTypeGroup.totalChannels = total;
+
+  Category all;
+  all.id = "__favorites_all__";
+  all.name = total > 0 ? "All Favorites" : "No favorites yet";
+  all.totalChannels = total;
+  all.type = StreamType::Favorites;
+  state_.favoritesTypeGroup.categories.push_back(all);
+
+  MediaNode folder;
+  folder.id = "__favorites_all__";
+  folder.title = total > 0 ? "All Favorites" : "No favorites yet";
+  folder.name = folder.title;
+  folder.type = "favorites";
+  folder.kind = "folder";
+  folder.group = "Favorites";
+  folder.totalItems = total;
+  folder.totalChannels = total;
+  folder.childCount = total;
+  folder.hasChildren = total > 0;
+  folder.playable = false;
+
+  for (const Channel &channel : state_.favoriteChannels) {
+    MediaNode item;
+    item.id = channel.id;
+    item.title = channel.name;
+    item.name = channel.name;
+    item.type = toString(channel.type);
+    item.kind = "item";
+    item.url = channel.url;
+    item.logo = channel.logo;
+    item.group = channel.group.empty() ? "Favorites" : channel.group;
+    item.groupId = channel.groupId;
+    item.tvgId = channel.tvgId;
+    item.tvgName = channel.tvgName;
+    item.streamId = channel.streamId;
+    item.totalItems = 0;
+    item.totalChannels = 0;
+    item.childCount = 0;
+    item.hasChildren = false;
+    item.playable = true;
+    folder.children.push_back(std::move(item));
+  }
+
+  state_.favoritesRootNode = MediaNode{};
+  state_.favoritesRootNode.id = "__favorites_root__";
+  state_.favoritesRootNode.title = "Favorites";
+  state_.favoritesRootNode.name = "Favorites";
+  state_.favoritesRootNode.type = "favorites";
+  state_.favoritesRootNode.kind = "folder";
+  state_.favoritesRootNode.totalItems = total;
+  state_.favoritesRootNode.totalChannels = total;
+  state_.favoritesRootNode.childCount = 1;
+  state_.favoritesRootNode.hasChildren = true;
+  state_.favoritesRootNode.playable = false;
+  state_.favoritesRootNode.children.push_back(std::move(folder));
+}
+
+std::string App::favoriteIdForChannel(const Channel &channel) const {
+  if (channel.url.empty()) {
+    return "";
+  }
+
+  const std::string typePrefix = toString(channel.type) + "|";
+  const std::string urlSuffix = "|" + channel.url;
+
+  // Favorites are rebuilt as virtual nodes and their node id is already the
+  // canonical favorite id. When pressing Y inside the Favorites list, avoid
+  // wrapping that id again as: type|type|...|url|url. That was creating a
+  // second favorite instead of removing the existing one.
+  if (!channel.id.empty() && startsWith(channel.id, typePrefix) && endsWith(channel.id, urlSuffix)) {
+    return channel.id;
+  }
+
+  std::string identity;
+  if (!channel.tvgId.empty()) {
+    identity = channel.tvgId;
+  } else if (!channel.streamId.empty()) {
+    identity = channel.streamId;
+  } else if (!channel.id.empty()) {
+    identity = channel.id;
+  } else if (!channel.name.empty()) {
+    identity = channel.name;
+  } else {
+    identity = channel.url;
+  }
+
+  return typePrefix + identity + urlSuffix;
+}
+
+bool App::isFavorite(const Channel &channel) const {
+  const std::string id = favoriteIdForChannel(channel);
+  return !id.empty() && state_.favoriteIds.count(id) > 0;
+}
+
+bool App::toggleFavorite(const Channel &input) {
+  if (input.url.empty()) {
+    state_.message = "Only playable items can be favorited";
+    return false;
+  }
+
+  const PlaylistConfig *playlist = activePlaylist();
+  if (!playlist) {
+    state_.message = "No playlist loaded";
+    return false;
+  }
+
+  Channel channel = input;
+  channel.id = favoriteIdForChannel(channel);
+
+  if (channel.id.empty()) {
+    state_.message = "Could not identify this item";
+    return false;
+  }
+
+  const auto existing = std::find_if(
+    state_.favoriteChannels.begin(),
+    state_.favoriteChannels.end(),
+    [&](const Channel &favorite) { return favorite.id == channel.id; }
+  );
+
+  if (existing != state_.favoriteChannels.end()) {
+    const std::string name = existing->name.empty() ? input.name : existing->name;
+    state_.favoriteChannels.erase(existing);
+    state_.favoriteIds.erase(channel.id);
+    rebuildFavoritesNode();
+    if (selectedTypeIsFavorites()) {
+      state_.loadedChannels = state_.favoriteChannels;
+      state_.loadedTotal = static_cast<int>(state_.loadedChannels.size());
+      state_.loadedTotalPages = 1;
+      if (state_.selectedChannel >= static_cast<int>(state_.loadedChannels.size())) {
+        state_.selectedChannel = std::max(0, static_cast<int>(state_.loadedChannels.size()) - 1);
+      }
+    }
+    saveFavoritesForPlaylist(playlist->id, state_.favoriteChannels);
+    state_.message = "Removed favorite: " + name;
+    std::printf("[KBORE][FAVORITES] removed playlist=%s item=%s\n", playlist->id.c_str(), name.c_str());
+    return true;
+  }
+
+  if (channel.name.empty()) {
+    channel.name = "Untitled";
+  }
+
+  state_.favoriteChannels.push_back(channel);
+  state_.favoriteIds.insert(channel.id);
+  rebuildFavoritesNode();
+  saveFavoritesForPlaylist(playlist->id, state_.favoriteChannels);
+  state_.message = "Added favorite: " + channel.name;
+  std::printf("[KBORE][FAVORITES] added playlist=%s item=%s\n", playlist->id.c_str(), channel.name.c_str());
+  return true;
+}
+
+bool App::selectedTypeIsFavorites() const {
+  return state_.hasManifest && state_.selectedType == 0;
+}
+
+bool App::favoritesRootSelected() const {
+  return usingNodeTree() && selectedTypeIsFavorites();
 }
 
 std::string App::breadcrumbText() const {
@@ -3850,6 +4099,23 @@ void App::renderDashboardGraphic() {
   // Channels/movies/items ----------------------------------------------------
   const int channelRows = state_.channelGridView ? gridRows : listVisibleRows;
 
+  auto drawFavoriteMarker = [&](const std::string &indicator, int x, int y, int size) {
+    if (indicator == ">") {
+      gfx_.drawTextRight(">", x + size, y + std::max(0, size / 5), 2, muted, false);
+      return;
+    }
+
+    const bool filled = indicator == "*";
+    gfx_.drawImageFile(
+      filled ? "romfs:/images/favorite-on.png" : "romfs:/images/favorite-off.png",
+      x,
+      y,
+      size,
+      size,
+      false
+    );
+  };
+
   auto drawItemCard = [&](const Channel &ch, const std::string &subtitle, const std::string &indicator, bool selected, int x, int y, int w, int h) {
     gfx_.fillRoundRect(x, y, w, h, 14, selected ? rgba(12,23,52,245) : rgba(10,15,29,215));
     gfx_.strokeRoundRect(x, y, w, h, 14, selected ? brightBlue : rgba(72,92,128,24), selected ? 3 : 1);
@@ -3870,7 +4136,7 @@ void App::renderDashboardGraphic() {
       false
     );
 
-    gfx_.drawTextRight(indicator, x + w - 14, y + 16, 2, muted, false);
+    drawFavoriteMarker(indicator, x + w - 42, y + 14, 24);
   };
 
   if (usingNodeTree()) {
@@ -3906,7 +4172,7 @@ void App::renderDashboardGraphic() {
           std::string sub = folder
             ? ("FOLDER • " + std::to_string(nodeCount(*node)) + " ITEMS")
             : (playable ? epgLineForChannel(ch) : "EMPTY");
-          std::string indicator = state_.favorites.count(node->id) ? "*" : (folder ? ">" : "<3");
+          std::string indicator = isFavorite(ch) ? "*" : (folder ? ">" : "<3");
 
           drawItemCard(
             ch,
@@ -3954,7 +4220,7 @@ void App::renderDashboardGraphic() {
           : (playable ? epgLineForChannel(ch) : "EMPTY");
 
         gfx_.drawText(Graphics::fitText(sub, 42), nameX, y + 32, 2, muted, false);
-        gfx_.drawText(state_.favorites.count(node->id) ? "*" : (folder ? ">" : "<3"), channelsPanel.x + channelsPanel.w - 42, y + 15, 2, muted, false);
+        drawFavoriteMarker(isFavorite(ch) ? "*" : (folder ? ">" : "<3"), channelsPanel.x + channelsPanel.w - 52, y + 13, 24);
       }
     }
 
@@ -3988,7 +4254,7 @@ void App::renderDashboardGraphic() {
           drawItemCard(
             ch,
             epgLineForChannel(ch),
-            state_.favorites.count(ch.id) ? "*" : "<3",
+            isFavorite(ch) ? "*" : "<3",
             selected,
             startX + col * (cardW + cardGap),
             startY + row * (cardH + cardGap),
@@ -4014,7 +4280,7 @@ void App::renderDashboardGraphic() {
         const int nameX = channelsPanel.x + 94;
         gfx_.drawText(Graphics::fitText(ch.name, 35), nameX, y + 9, 3, text, true);
         gfx_.drawText(Graphics::fitText(epgLineForChannel(ch), 42), nameX, y + 32, 2, muted, false);
-        gfx_.drawText(state_.favorites.count(ch.id) ? "*" : "<3", channelsPanel.x + channelsPanel.w - 42, y + 15, 2, muted, false);
+        drawFavoriteMarker(isFavorite(ch) ? "*" : "<3", channelsPanel.x + channelsPanel.w - 52, y + 13, 24);
       }
     }
 
@@ -4061,7 +4327,7 @@ void App::renderDashboardGraphic() {
   Rect foot{18, 675, 1245, 36};
   gfx_.fillRoundRect(foot.x, foot.y, foot.w, foot.h, 10, rgba(17,24,39,240));
   gfx_.strokeRoundRect(foot.x, foot.y, foot.w, foot.h, 10, rgba(72,92,128,28), 1);
-  gfx_.drawText("UP - PLAYLISTS   |    LEFT/RIGHT - COLUMNS/CARD   |    L/R - SKIP 10   |    A - SELECT   |    B - BACK   |    X - VIEW   |    + - PLAYLISTS", foot.x + 26, foot.y + 13, 1, text, true);
+  gfx_.drawText("UP - PLAYLISTS   | LEFT/RIGHT - COLUMNS/CARD | L/R - SKIP 10 | A - SELECT | B - BACK | X - VIEW | Y - FAVORITE | + - PLAYLISTS", foot.x + 26, foot.y + 13, 1, text, true);
 
   if (state_.loading) {
     renderLoadingOverlay(state_.loadingMessage.empty() ? "Loading" : state_.loadingMessage);
