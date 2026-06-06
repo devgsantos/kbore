@@ -147,6 +147,7 @@ Color typeColor(const std::string &type) {
   if (type == "movies") return rgb(126, 34, 206);
   if (type == "series") return rgb(13, 148, 136);
   if (type == "radio") return rgb(194, 65, 12);
+  if (type == "favorites") return rgb(20, 132, 255);
   return rgb(37, 99, 235);
 }
 
@@ -356,6 +357,16 @@ void Graphics::drawIconBox(const std::string &kind, int x, int y, int size, Colo
     strokeRect(x+16,y+20,size-32,size-24,fg,3); drawLine(x+20,y+16,x+30,y+8,fg,3); drawLine(x+42,y+16,x+53,y+8,fg,3); fillRect(x+20,y+28,size-40,5,fg);
   } else if (kind == "radio") {
     strokeRoundRect(x+14,y+25,size-28,size-20,5,fg,3); drawLine(x+20,y+25,x+50,y+12,fg,3); fillCircle(x+25,y+42,5,fg); fillCircle(x+43,y+42,5,fg);
+  } else if (kind == "favorites") {
+    int t = std::max(3, size / 9);
+    int cx = x + size / 2;
+    int cy = y + size / 2;
+    fillCircle(x + size * 38 / 100, y + size * 38 / 100, std::max(4, size / 7), fg);
+    fillCircle(x + size * 62 / 100, y + size * 38 / 100, std::max(4, size / 7), fg);
+    drawLine(x + size * 28 / 100, y + size * 42 / 100, cx, y + size * 73 / 100, fg, t);
+    drawLine(x + size * 72 / 100, y + size * 42 / 100, cx, y + size * 73 / 100, fg, t);
+    drawLine(x + size * 35 / 100, y + size * 34 / 100, cx, cy, fg, t);
+    drawLine(x + size * 65 / 100, y + size * 34 / 100, cx, cy, fg, t);
   } else {
     drawText(kind.substr(0,3), x+9, y+size/2-7, 2, fg, true);
   }
@@ -470,6 +481,19 @@ void Graphics::drawHeaderIcon(const std::string &name, int x, int y, int size, C
       drawLine(x + size / 2, yy + size / 4, x + size / 6, yy + size / 8, color, t);
       drawLine(x + size / 6, yy + size / 8, x + size / 2, yy, color, t);
     }
+    return;
+  }
+
+  if (name == "favorites") {
+    int t = std::max(3, size / 9);
+    int cx = x + size / 2;
+    int cy = y + size / 2;
+    fillCircle(x + size * 38 / 100, y + size * 38 / 100, std::max(4, size / 7), color);
+    fillCircle(x + size * 62 / 100, y + size * 38 / 100, std::max(4, size / 7), color);
+    drawLine(x + size * 28 / 100, y + size * 42 / 100, cx, y + size * 73 / 100, color, t);
+    drawLine(x + size * 72 / 100, y + size * 42 / 100, cx, y + size * 73 / 100, color, t);
+    drawLine(x + size * 35 / 100, y + size * 34 / 100, cx, cy, color, t);
+    drawLine(x + size * 65 / 100, y + size * 34 / 100, cx, cy, color, t);
     return;
   }
 
