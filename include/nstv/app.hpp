@@ -91,7 +91,7 @@ private:
     std::string source;
     Provider provider = Provider::M3u;
     std::string manualEpgUrl;
-    int pageSize = 4;
+    int pageSize = 48;
   };
 
   struct EpgResult {

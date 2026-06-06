@@ -155,48 +155,196 @@ bool parseZoneOffsetSeconds(const std::string &zone, int &offsetSeconds) {
   return true;
 }
 
+std::string trimEpgValue(const std::string &value) {
+  std::size_t first = 0;
+  while (first < value.size() && std::isspace(static_cast<unsigned char>(value[first]))) {
+    ++first;
+  }
+
+  std::size_t last = value.size();
+  while (last > first && std::isspace(static_cast<unsigned char>(value[last - 1]))) {
+    --last;
+  }
+
+  return value.substr(first, last - first);
+}
+
+enum class EpgMeridiem {
+  None,
+  AM,
+  PM
+};
+
+EpgMeridiem detectMeridiemInRange(const std::string &text, std::size_t start, std::size_t end) {
+  if (start >= text.size()) {
+    return EpgMeridiem::None;
+  }
+
+  end = std::min(end, text.size());
+
+  for (std::size_t i = start; i < end; ++i) {
+    const char first = static_cast<char>(std::tolower(static_cast<unsigned char>(text[i])));
+    if (first != 'a' && first != 'p') {
+      continue;
+    }
+
+    std::size_t j = i + 1;
+    while (j < end && (std::isspace(static_cast<unsigned char>(text[j])) || text[j] == '.')) {
+      ++j;
+    }
+
+    if (j >= end || static_cast<char>(std::tolower(static_cast<unsigned char>(text[j]))) != 'm') {
+      continue;
+    }
+
+    std::size_t k = j + 1;
+    while (k < end && text[k] == '.') {
+      ++k;
+    }
+
+    // Reject words such as "America" while still accepting compact values like
+    // "10:25PM". EPG time values must use 24h internally; AM/PM is only parsed
+    // so PM programmes are not accidentally matched as morning programmes.
+    if (k < end && std::isalpha(static_cast<unsigned char>(text[k]))) {
+      continue;
+    }
+
+    return first == 'p' ? EpgMeridiem::PM : EpgMeridiem::AM;
+  }
+
+  return EpgMeridiem::None;
+}
+
+bool normalizeHourWithMeridiem(int &hour, EpgMeridiem meridiem) {
+  if (meridiem == EpgMeridiem::None) {
+    return hour >= 0 && hour <= 23;
+  }
+
+  // Some providers incorrectly append AM/PM to an already-24h value. Keep the
+  // 24h value instead of rejecting the programme completely.
+  if (hour == 0 || hour > 12) {
+    return hour >= 0 && hour <= 23;
+  }
+
+  if (meridiem == EpgMeridiem::AM) {
+    if (hour == 12) {
+      hour = 0;
+    }
+  } else if (hour != 12) {
+    hour += 12;
+  }
+
+  return hour >= 0 && hour <= 23;
+}
+
+struct ParsedClockEpgTime {
+  int minutesOfDay = -1;
+  int seconds = 0;
+  int rawHour = -1;
+  int rawMinute = -1;
+  bool hasMeridiem = false;
+  bool isPm = false;
+};
+
+int normalize12HourCandidateMinutes(int rawHour, int rawMinute, bool pm) {
+  int hour = rawHour;
+  if (hour == 12) {
+    hour = pm ? 12 : 0;
+  } else if (pm) {
+    hour += 12;
+  }
+  return hour * 60 + rawMinute;
+}
+
+int positiveClockDurationMinutes(int startMinutes, int stopMinutes) {
+  int duration = stopMinutes - startMinutes;
+  if (duration <= 0) {
+    duration += 24 * 60;
+  }
+  return duration;
+}
+
+bool canInferMissingMeridiem(const ParsedClockEpgTime &clock) {
+  return !clock.hasMeridiem && clock.rawHour >= 1 && clock.rawHour <= 12;
+}
+
+void inferMissingMeridiemForClockRange(ParsedClockEpgTime &start, bool hasStart, ParsedClockEpgTime &stop, bool hasStop) {
+  if (!hasStart || !hasStop) {
+    return;
+  }
+
+  if (canInferMissingMeridiem(start) && stop.hasMeridiem) {
+    const int amStart = normalize12HourCandidateMinutes(start.rawHour, start.rawMinute, false);
+    const int pmStart = normalize12HourCandidateMinutes(start.rawHour, start.rawMinute, true);
+    const int amDuration = positiveClockDurationMinutes(amStart, stop.minutesOfDay);
+    const int pmDuration = positiveClockDurationMinutes(pmStart, stop.minutesOfDay);
+    start.minutesOfDay = pmDuration < amDuration ? pmStart : amStart;
+    start.hasMeridiem = true;
+    start.isPm = pmDuration < amDuration;
+  }
+
+  if (canInferMissingMeridiem(stop) && start.hasMeridiem) {
+    const int amStop = normalize12HourCandidateMinutes(stop.rawHour, stop.rawMinute, false);
+    const int pmStop = normalize12HourCandidateMinutes(stop.rawHour, stop.rawMinute, true);
+    const int amDuration = positiveClockDurationMinutes(start.minutesOfDay, amStop);
+    const int pmDuration = positiveClockDurationMinutes(start.minutesOfDay, pmStop);
+    stop.minutesOfDay = pmDuration < amDuration ? pmStop : amStop;
+    stop.hasMeridiem = true;
+    stop.isPm = pmDuration < amDuration;
+  }
+}
+
 bool parseEpgTime(const std::string &value, std::time_t &timestamp) {
-  if (value.empty()) {
+  const std::string text = trimEpgValue(value);
+  if (text.empty()) {
     return false;
   }
 
-  const bool allDigits = std::all_of(value.begin(), value.end(), [](char ch) {
+  const bool allDigits = std::all_of(text.begin(), text.end(), [](char ch) {
     return std::isdigit(static_cast<unsigned char>(ch));
   });
 
-  if (allDigits && value.size() >= 10 && value.size() <= 13) {
+  if (allDigits && text.size() >= 10 && text.size() <= 13) {
     long long raw = 0;
 
     try {
-      raw = std::stoll(value);
+      raw = std::stoll(text);
     } catch (...) {
       return false;
     }
 
-    if (value.size() == 13) raw /= 1000;
+    if (text.size() == 13) raw /= 1000;
     if (raw <= 0) return false;
 
     timestamp = static_cast<std::time_t>(raw);
     return true;
   }
 
-  const std::size_t tPos = value.find('T');
-  if (tPos != std::string::npos && value.size() >= tPos + 6) {
-    const int year = parseFixedInt(value, 0, 4, -1);
-    const int month = parseFixedInt(value, 5, 2, -1);
-    const int day = parseFixedInt(value, 8, 2, -1);
-    const int hour = parseFixedInt(value, tPos + 1, 2, -1);
-    const int minute = parseFixedInt(value, tPos + 4, 2, -1);
-    const int second = value.size() >= tPos + 9 ? parseFixedInt(value, tPos + 7, 2, 0) : 0;
+  std::size_t dateTimePos = text.find('T');
+  if (dateTimePos == std::string::npos && text.size() >= 16 && text[4] == '-' && text[7] == '-' && text[10] == ' ') {
+    dateTimePos = 10;
+  }
 
-    if (year < 0 || month < 1 || day < 1 || hour < 0 || minute < 0 || second < 0) {
+  if (dateTimePos != std::string::npos && text.size() >= dateTimePos + 6) {
+    const int year = parseFixedInt(text, 0, 4, -1);
+    const int month = parseFixedInt(text, 5, 2, -1);
+    const int day = parseFixedInt(text, 8, 2, -1);
+    int hour = parseFixedInt(text, dateTimePos + 1, 2, -1);
+    const int minute = parseFixedInt(text, dateTimePos + 4, 2, -1);
+    const int second = text.size() >= dateTimePos + 9 ? parseFixedInt(text, dateTimePos + 7, 2, 0) : 0;
+
+    std::size_t zonePos = text.find_first_of("Zz+-", dateTimePos + 6);
+    const std::size_t meridiemEnd = zonePos == std::string::npos ? text.size() : zonePos;
+    const EpgMeridiem meridiem = detectMeridiemInRange(text, dateTimePos + 6, meridiemEnd);
+
+    if (year < 0 || month < 1 || day < 1 || hour < 0 || minute < 0 || minute > 59 || second < 0 || second > 59 ||
+        !normalizeHourWithMeridiem(hour, meridiem)) {
       return false;
     }
 
-    std::size_t zonePos = value.find_first_of("Zz+-", tPos + 6);
     if (zonePos != std::string::npos) {
       int offsetSeconds = 0;
-      if (parseZoneOffsetSeconds(value.substr(zonePos), offsetSeconds)) {
+      if (parseZoneOffsetSeconds(text.substr(zonePos), offsetSeconds)) {
         timestamp = static_cast<std::time_t>(
           epochFromUtcParts(year, month, day, hour, minute, second) - offsetSeconds
         );
@@ -217,24 +365,24 @@ bool parseEpgTime(const std::string &value, std::time_t &timestamp) {
   }
 
   // XMLTV common format: YYYYMMDDHHMMSS +/-ZZZZ
-  if (value.size() >= 14 && std::all_of(value.begin(), value.begin() + 14, [](char ch) {
+  if (text.size() >= 14 && std::all_of(text.begin(), text.begin() + 14, [](char ch) {
         return std::isdigit(static_cast<unsigned char>(ch));
       })) {
-    const int year = parseFixedInt(value, 0, 4, -1);
-    const int month = parseFixedInt(value, 4, 2, -1);
-    const int day = parseFixedInt(value, 6, 2, -1);
-    const int hour = parseFixedInt(value, 8, 2, -1);
-    const int minute = parseFixedInt(value, 10, 2, -1);
-    const int second = parseFixedInt(value, 12, 2, 0);
+    const int year = parseFixedInt(text, 0, 4, -1);
+    const int month = parseFixedInt(text, 4, 2, -1);
+    const int day = parseFixedInt(text, 6, 2, -1);
+    const int hour = parseFixedInt(text, 8, 2, -1);
+    const int minute = parseFixedInt(text, 10, 2, -1);
+    const int second = parseFixedInt(text, 12, 2, 0);
 
-    if (year < 0 || month < 1 || day < 1 || hour < 0 || minute < 0 || second < 0) {
+    if (year < 0 || month < 1 || day < 1 || hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59) {
       return false;
     }
 
-    std::size_t zonePos = value.find_first_of("+-", 14);
+    std::size_t zonePos = text.find_first_of("+-", 14);
     if (zonePos != std::string::npos) {
       int offsetSeconds = 0;
-      if (parseZoneOffsetSeconds(value.substr(zonePos), offsetSeconds)) {
+      if (parseZoneOffsetSeconds(text.substr(zonePos), offsetSeconds)) {
         timestamp = static_cast<std::time_t>(
           epochFromUtcParts(year, month, day, hour, minute, second) - offsetSeconds
         );
@@ -252,6 +400,209 @@ bool parseEpgTime(const std::string &value, std::time_t &timestamp) {
     localTime.tm_isdst = -1;
     timestamp = std::mktime(&localTime);
     return timestamp != static_cast<std::time_t>(-1);
+  }
+
+  return false;
+}
+
+bool parseClockOnlyEpgTimeDetailed(const std::string &value, ParsedClockEpgTime &clock) {
+  const std::string text = trimEpgValue(value);
+  if (text.size() < 4) {
+    return false;
+  }
+
+  std::size_t colon = text.find(':');
+  if (colon == std::string::npos || colon == 0 || colon > 2 || colon + 2 >= text.size()) {
+    return false;
+  }
+
+  int hour = 0;
+  for (std::size_t i = 0; i < colon; ++i) {
+    if (!std::isdigit(static_cast<unsigned char>(text[i]))) {
+      return false;
+    }
+    hour = hour * 10 + (text[i] - '0');
+  }
+
+  if (!std::isdigit(static_cast<unsigned char>(text[colon + 1])) ||
+      !std::isdigit(static_cast<unsigned char>(text[colon + 2]))) {
+    return false;
+  }
+
+  const int minute = (text[colon + 1] - '0') * 10 + (text[colon + 2] - '0');
+  int parsedSeconds = 0;
+  std::size_t timeEnd = colon + 3;
+
+  if (text.size() >= colon + 6 && text[colon + 3] == ':' &&
+      std::isdigit(static_cast<unsigned char>(text[colon + 4])) &&
+      std::isdigit(static_cast<unsigned char>(text[colon + 5]))) {
+    parsedSeconds = (text[colon + 4] - '0') * 10 + (text[colon + 5] - '0');
+    timeEnd = colon + 6;
+  }
+
+  const EpgMeridiem meridiem = detectMeridiemInRange(text, timeEnd, text.size());
+  const int rawHour = hour;
+
+  if (minute < 0 || minute > 59 || parsedSeconds < 0 || parsedSeconds > 59 ||
+      !normalizeHourWithMeridiem(hour, meridiem)) {
+    return false;
+  }
+
+  clock.minutesOfDay = hour * 60 + minute;
+  clock.seconds = parsedSeconds;
+  clock.rawHour = rawHour;
+  clock.rawMinute = minute;
+  clock.hasMeridiem = meridiem != EpgMeridiem::None;
+  clock.isPm = meridiem == EpgMeridiem::PM;
+  return true;
+}
+
+bool parseClockOnlyEpgTime(const std::string &value, int &minutesOfDay, int &seconds) {
+  ParsedClockEpgTime clock;
+  if (!parseClockOnlyEpgTimeDetailed(value, clock)) {
+    return false;
+  }
+
+  minutesOfDay = clock.minutesOfDay;
+  seconds = clock.seconds;
+  return true;
+}
+
+std::time_t localDateWithClock(std::time_t anchor, int minutesOfDay, int seconds, int dayOffset = 0) {
+  std::tm localDate{};
+
+#if defined(_WIN32)
+  localtime_s(&localDate, &anchor);
+#else
+  std::tm *result = std::localtime(&anchor);
+  if (!result) {
+    return static_cast<std::time_t>(-1);
+  }
+  localDate = *result;
+#endif
+
+  localDate.tm_mday += dayOffset;
+  localDate.tm_hour = minutesOfDay / 60;
+  localDate.tm_min = minutesOfDay % 60;
+  localDate.tm_sec = seconds;
+  localDate.tm_isdst = -1;
+  return std::mktime(&localDate);
+}
+
+struct ResolvedEpgRange {
+  bool hasAnyTime = false;
+  bool hasStartTime = false;
+  bool hasDatedTime = false;
+  bool validRange = false;
+  std::time_t start = 0;
+  std::time_t stop = 0;
+};
+
+ResolvedEpgRange resolveEpgRangeForNow(const EpgProgram &program, std::time_t now, const EpgPage *page = nullptr, std::size_t index = 0) {
+  ResolvedEpgRange range;
+
+  std::time_t start{};
+  std::time_t stop{};
+  const bool hasDatedStart = parseEpgTime(program.start, start);
+  bool hasDatedStop = parseEpgTime(program.stop, stop);
+
+  ParsedClockEpgTime startClockParsed;
+  ParsedClockEpgTime stopClockParsed;
+  const bool hasClockStart = !hasDatedStart && parseClockOnlyEpgTimeDetailed(program.start, startClockParsed);
+  const bool hasClockStop = !hasDatedStop && parseClockOnlyEpgTimeDetailed(program.stop, stopClockParsed);
+
+  inferMissingMeridiemForClockRange(startClockParsed, hasClockStart, stopClockParsed, hasClockStop);
+
+  int startClock = startClockParsed.minutesOfDay;
+  int stopClock = stopClockParsed.minutesOfDay;
+  int startSecond = startClockParsed.seconds;
+  int stopSecond = stopClockParsed.seconds;
+
+  range.hasAnyTime = hasDatedStart || hasDatedStop || hasClockStart || hasClockStop;
+  range.hasStartTime = hasDatedStart || hasClockStart;
+  range.hasDatedTime = hasDatedStart || hasDatedStop;
+
+  if (hasDatedStart) {
+    range.start = start;
+  } else if (hasClockStart) {
+    int dayOffset = 0;
+    if (hasClockStop && stopClock <= startClock) {
+      std::tm nowLocal{};
+#if defined(_WIN32)
+      localtime_s(&nowLocal, &now);
+#else
+      std::tm *nowResult = std::localtime(&now);
+      if (nowResult) {
+        nowLocal = *nowResult;
+      }
+#endif
+      const int nowClock = nowLocal.tm_hour * 60 + nowLocal.tm_min;
+      if (nowClock < stopClock) {
+        dayOffset = -1;
+      }
+    }
+
+    range.start = localDateWithClock(now, startClock, startSecond, dayOffset);
+  }
+
+  if (hasDatedStop) {
+    range.stop = stop;
+  } else if (hasClockStop) {
+    int dayOffset = 0;
+    if (hasClockStart && stopClock <= startClock) {
+      std::tm nowLocal{};
+#if defined(_WIN32)
+      localtime_s(&nowLocal, &now);
+#else
+      std::tm *nowResult = std::localtime(&now);
+      if (nowResult) {
+        nowLocal = *nowResult;
+      }
+#endif
+      const int nowClock = nowLocal.tm_hour * 60 + nowLocal.tm_min;
+      dayOffset = nowClock < stopClock ? 0 : 1;
+    }
+
+    const std::time_t anchor = hasDatedStart ? range.start : now;
+    range.stop = localDateWithClock(anchor, stopClock, stopSecond, dayOffset);
+  }
+
+  const bool hasStart = hasDatedStart || hasClockStart;
+  bool hasStop = hasDatedStop || hasClockStop;
+
+  if (hasStart && !hasStop && page) {
+    for (std::size_t j = index + 1; j < page->programs.size(); ++j) {
+      ResolvedEpgRange next = resolveEpgRangeForNow(page->programs[j], now, nullptr, 0);
+      if (next.hasStartTime && next.start > range.start) {
+        range.stop = next.start;
+        hasStop = true;
+        break;
+      }
+    }
+
+    if (!hasStop) {
+      range.stop = range.start + 3 * 60 * 60;
+      hasStop = true;
+    }
+  }
+
+  if (hasStart && hasStop && range.start != static_cast<std::time_t>(-1) && range.stop != static_cast<std::time_t>(-1)) {
+    if (range.stop <= range.start && (hasClockStart || hasClockStop)) {
+      range.stop += 24 * 60 * 60;
+    }
+
+    range.validRange = range.stop > range.start;
+  }
+
+  return range;
+}
+
+bool epgPageHasDatedTimes(const EpgPage &page) {
+  for (const EpgProgram &program : page.programs) {
+    std::time_t ignored{};
+    if (parseEpgTime(program.start, ignored) || parseEpgTime(program.stop, ignored)) {
+      return true;
+    }
   }
 
   return false;
@@ -281,8 +632,11 @@ std::string formatEpgClock(const std::string &value) {
     return formatLocalClock(timestamp);
   }
 
-  if (value.size() >= 5 && value[2] == ':') {
-    return value.substr(0, 5);
+  ParsedClockEpgTime clock;
+  if (parseClockOnlyEpgTimeDetailed(value, clock)) {
+    char buffer[8] = {};
+    std::snprintf(buffer, sizeof(buffer), "%02d:%02d", clock.minutesOfDay / 60, clock.minutesOfDay % 60);
+    return buffer;
   }
 
   return value.size() > 5 ? value.substr(0, 5) : value;
@@ -297,44 +651,21 @@ int currentProgramIndex(const EpgPage &page) {
   bool anyTimed = false;
 
   for (std::size_t i = 0; i < page.programs.size(); ++i) {
-    std::time_t start{};
-    std::time_t stop{};
-    const bool hasStart = parseEpgTime(page.programs[i].start, start);
-    bool hasStop = parseEpgTime(page.programs[i].stop, stop);
+    const ResolvedEpgRange range = resolveEpgRangeForNow(page.programs[i], now, &page, i);
+    anyTimed = anyTimed || range.hasAnyTime;
 
-    anyTimed = anyTimed || hasStart || hasStop;
-
-    if (!hasStart && !hasStop) {
-      continue;
-    }
-
-    // If the API gives only a start time, infer a safe stop from the next
-    // programme start. This makes "now" detection work for providers that omit
-    // stop on the active item, without ever jumping to a future programme.
-    if (hasStart && !hasStop) {
-      for (std::size_t j = i + 1; j < page.programs.size(); ++j) {
-        std::time_t nextStart{};
-        if (parseEpgTime(page.programs[j].start, nextStart) && nextStart > start) {
-          stop = nextStart;
-          hasStop = true;
-          break;
-        }
-      }
-
-      if (!hasStop) {
-        stop = start + 3 * 60 * 60;
-        hasStop = true;
-      }
-    }
-
-    if (hasStart && hasStop && stop > start && now >= start && now < stop) {
+    // Match against the resolved full timestamp, not just HH:mm. Full dated EPG
+    // values must overlap the current date/time. Clock-only ranges are anchored
+    // to the current local service date, with midnight-crossing handled.
+    if (range.validRange && now >= range.start && now < range.stop) {
       return static_cast<int>(i);
     }
   }
 
-  // Do not fall forward to nextIndex/nearestIndex. Showing "21:25-22:45" at
-  // 11:05 is worse than showing unavailable because it tells the user the wrong
-  // current programme. A timed EPG page must overlap the current clock.
+  // Do not fall back to the first/nearest programme when the EPG page has times.
+  // Example: at 10:46, a clock-only 03:00-05:00 programme is a valid timed range
+  // from today, but it is not current, so the UI must show unavailable instead
+  // of presenting it as NOW.
   return anyTimed ? -1 : 0;
 }
 
@@ -2162,7 +2493,7 @@ void App::loadSelectedEpg(bool force, bool fetchRemote) {
   const EpgPage *memoryPage = cachedEpgForChannel(*channel);
   if (!force && memoryPage) {
     state_.currentEpgAvailable = currentProgramIndex(*memoryPage) >= 0;
-    if (state_.currentEpgAvailable || !fetchRemote) {
+    if ((state_.currentEpgAvailable && epgPageHasDatedTimes(*memoryPage)) || !fetchRemote) {
       return;
     }
   }
@@ -2173,7 +2504,7 @@ void App::loadSelectedEpg(bool force, bool fetchRemote) {
       state_.epgByChannel[alias] = cached;
     }
     state_.currentEpgAvailable = currentProgramIndex(cached) >= 0;
-    if (state_.currentEpgAvailable || !fetchRemote) {
+    if ((state_.currentEpgAvailable && epgPageHasDatedTimes(cached)) || !fetchRemote) {
       return;
     }
   }
@@ -2187,7 +2518,7 @@ void App::loadSelectedEpg(bool force, bool fetchRemote) {
     const PlaylistConfig *playlist = activePlaylist();
     const std::string manualEpgUrl = playlist && playlist->provider == Provider::M3u ? playlist->epgUrl : "";
     std::printf("[KBORE] loading selected EPG channel='%s' provider='%s' key='%s' remote=%s\n", channel->name.c_str(), toString(state_.manifest.provider).c_str(), key.c_str(), fetchRemote ? "yes" : "no");
-    EpgPage epg = api_.loadEpgPrograms(state_.manifest.source, state_.manifest.provider, *channel, 1, 12, manualEpgUrl);
+    EpgPage epg = api_.loadEpgPrograms(state_.manifest.source, state_.manifest.provider, *channel, 1, 48, manualEpgUrl);
     for (const std::string &alias : channelEpgKeys(*channel)) {
       state_.epgByChannel[alias] = epg;
     }
@@ -2216,7 +2547,7 @@ void App::loadEpgForChannels(const std::vector<Channel> &channels) {
 
     const std::string key = channelEpgKey(channel);
     const EpgPage *memoryPage = cachedEpgForChannel(channel);
-    if (memoryPage && currentProgramIndex(*memoryPage) >= 0) {
+    if (memoryPage && currentProgramIndex(*memoryPage) >= 0 && epgPageHasDatedTimes(*memoryPage)) {
       continue;
     }
 
@@ -2225,7 +2556,7 @@ void App::loadEpgForChannels(const std::vector<Channel> &channels) {
       for (const std::string &alias : channelEpgKeys(channel)) {
         state_.epgByChannel[alias] = cached;
       }
-      if (currentProgramIndex(cached) >= 0) {
+      if (currentProgramIndex(cached) >= 0 && epgPageHasDatedTimes(cached)) {
         continue;
       }
     }
@@ -2265,7 +2596,7 @@ void App::loadEpgForChannels(const std::vector<Channel> &channels) {
       state_.manifest.source,
       state_.manifest.provider,
       manualEpgUrl,
-      4
+      48
     });
   }
 
