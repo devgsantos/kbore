@@ -2835,7 +2835,7 @@ std::string App::epgNowNextLine(const Channel &channel) const {
   const std::size_t nextIndex = static_cast<std::size_t>(nowIndex + 1);
   if (nextIndex < page.programs.size()) {
     const EpgProgram &next = page.programs[nextIndex];
-    line += "  |  NEXT ";
+    line += "\nNEXT ";
     const std::string nextRange = formatEpgRange(next);
     if (!nextRange.empty()) {
       line += nextRange + " ";
@@ -4048,7 +4048,7 @@ void App::renderDashboardGraphic() {
   if (selectedChannel) {
     drawLogoOrFallback(*selectedChannel, info.x + 34, info.y + 13, 154, 62);
     gfx_.drawText(Graphics::fitText(selectedChannel->name, 42), info.x + 210, info.y + 18, 2, text, true);
-    gfx_.drawText(Graphics::fitText(epgNowNextLine(*selectedChannel), 86), info.x + 210, info.y + 46, 1, muted, false);
+    drawWrappedText(gfx_, epgNowNextLine(*selectedChannel), info.x + 210, info.y + 46, 2, 86, 1, muted);
   } else {
     gfx_.drawText(state_.hasManifest ? Graphics::fitText(state_.manifest.name, 34) : "NSTV", info.x + 40, info.y + 30, 4, text, true);
   }
@@ -4449,10 +4449,13 @@ void App::renderPlayerGraphic() {
       );
 
       if (channel->type == StreamType::Live) {
-        gfx_.drawText(
-          Graphics::fitText(epgNowNextLine(*channel), 98),
+        drawWrappedText(
+          gfx_,
+          epgNowNextLine(*channel),
           122,
           Graphics::Height - 58,
+          2,
+          98,
           1,
           rgb(150, 163, 190),
           false

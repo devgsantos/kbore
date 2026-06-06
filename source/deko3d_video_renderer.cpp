@@ -274,7 +274,11 @@ void buildOverlayBitmap(
 
   drawText(rgba, initials, 42, 37, 3, 165, 190, 230, 255, true);
   drawText(rgba, fitText(title, 58), 122, 18, 2, 248, 250, 252, 255, true);
-  drawText(rgba, fitText(subtitle, 98), 122, 46, 1, 150, 163, 190, 255, false);
+  const std::size_t subtitleBreak = subtitle.find('\n');
+  drawText(rgba, fitText(subtitle.substr(0, subtitleBreak), 98), 122, 46, 1, 150, 163, 190, 255, false);
+  if (subtitleBreak != std::string::npos) {
+    drawText(rgba, fitText(subtitle.substr(subtitleBreak + 1), 98), 122, 60, 1, 150, 163, 190, 255, false);
+  }
   drawText(rgba, fitText(status, 32), 122, 72, 1, 57, 220, 35, 255, true);
 
   const std::string fittedControls = fitText(controls, 76);
