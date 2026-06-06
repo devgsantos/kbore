@@ -89,6 +89,7 @@ public:
   bool dropNextVideoFrame(NativeDemuxer &demuxer);
 
 #ifdef NSTV_USE_FFMPEG
+  bool decodeAudioOnly(NativeDemuxer &demuxer, int maxPackets = 96);
   bool decodeNextHardwareFrame(NativeDemuxer &demuxer, int maxPackets = 80);
   const AVFrame *latestHardwareFrame() const;
   void releaseLatestHardwareFrame();

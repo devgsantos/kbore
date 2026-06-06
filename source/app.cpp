@@ -2860,7 +2860,7 @@ void App::openChannel(const Channel &channel) {
   loadEpgForChannels(std::vector<Channel>{channel});
 
   state_.screen = ScreenId::Player;
-  state_.message = "Loading video";
+  state_.message = "Loading stream";
   state_.playerStarted = false;
   state_.playerFrameSeen = false;
   state_.playerLoading = true;
@@ -2896,7 +2896,7 @@ void App::openChannel(const Channel &channel) {
       openError.c_str(),
       channel.url.c_str()
     );
-    state_.message = "Failed to load video";
+    state_.message = "Failed to load stream";
     state_.playerStarted = false;
     state_.playerLoading = false;
     state_.playerLoadFailed = true;
@@ -4175,6 +4175,7 @@ void App::renderPlayerGraphic() {
   bool hasFrame = false;
   const bool isOpen = player_ && player_->isOpen();
   const bool isPaused = player_ && player_->isPaused();
+  const bool isAudioOnly = isOpen && player_ && player_->isAudioOnly();
   const bool overlayRequested =
     !state_.playerFrameSeen ||
     nowMs() < state_.playerOverlayUntilMs ||
@@ -4186,6 +4187,8 @@ void App::renderPlayerGraphic() {
 
     if (isPaused) {
       status = "PAUSED";
+    } else if (isAudioOnly) {
+      status = "PLAYING AUDIO";
     } else if (player_ && player_->hasFrame()) {
       status = "PLAYING";
     } else {
@@ -4210,7 +4213,14 @@ void App::renderPlayerGraphic() {
     );
     player_->setOverlayProgress(vodPositionMs, vodDurationMs, vodPlayback && vodDurationMs > 0);
 
-    if (player_->nativeVideoActive() || gfx_.isSuspendedForNativeVideo()) {
+    if (isAudioOnly) {
+      if (gfx_.isSuspendedForNativeVideo()) {
+        gfx_.resumeAfterNativeVideo();
+      }
+
+      player_->setNativeVideoAllowed(false);
+      player_->setOverlayVisible(false);
+    } else if (player_->nativeVideoActive() || gfx_.isSuspendedForNativeVideo()) {
       player_->setOverlayVisible(overlayRequested);
       player_->setNativeVideoAllowed(true);
     } else {
@@ -4221,7 +4231,7 @@ void App::renderPlayerGraphic() {
 
     player_->update();
 
-    if (player_->nativeVideoActive()) {
+    if (!isAudioOnly && player_->nativeVideoActive()) {
       hasFrame = true;
 
       if (!state_.playerFrameSeen) {
@@ -4231,7 +4241,7 @@ void App::renderPlayerGraphic() {
       return;
     }
 
-    if (gfx_.isSuspendedForNativeVideo()) {
+    if (!isAudioOnly && gfx_.isSuspendedForNativeVideo()) {
       gfx_.resumeAfterNativeVideo();
     }
   }
@@ -4239,7 +4249,24 @@ void App::renderPlayerGraphic() {
   gfx_.fillRect(0, 0, Graphics::Width, Graphics::Height, rgb(0, 0, 0));
 
   if (isOpen) {
-    if (player_->yuvFrame().valid()) {
+    if (isAudioOnly) {
+      hasFrame = true;
+
+      gfx_.fillVerticalGradient(
+        0,
+        0,
+        Graphics::Width,
+        Graphics::Height,
+        rgb(6, 12, 28),
+        rgb(1, 5, 12)
+      );
+      gfx_.drawImageFile("romfs:/images/radio-bg.png", 0, 0, Graphics::Width, Graphics::Height, true);
+
+      if (!state_.playerFrameSeen) {
+        state_.playerFrameSeen = true;
+        state_.playerOverlayUntilMs = nowMs() + 5000;
+      }
+    } else if (player_->yuvFrame().valid()) {
       hasFrame = true;
 
       gfx_.drawYuvFrame(
@@ -4308,7 +4335,7 @@ void App::renderPlayerGraphic() {
 
     if (state_.playerLoadFailed) {
       gfx_.drawText(
-        "Failed to load video",
+        "Failed to load stream",
         boxX + 82,
         boxY + 58,
         3,
@@ -4339,7 +4366,7 @@ void App::renderPlayerGraphic() {
       );
 
       gfx_.drawText(
-        "Loading video",
+        "Loading stream",
         boxX + 138,
         boxY + 106,
         3,
@@ -4413,6 +4440,8 @@ void App::renderPlayerGraphic() {
 
       if (isPaused) {
         status = "PAUSED";
+      } else if (isAudioOnly) {
+        status = "PLAYING AUDIO";
       } else if (isOpen && hasFrame) {
         status = "PLAYING";
       } else if (isOpen) {

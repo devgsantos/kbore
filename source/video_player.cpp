@@ -208,6 +208,7 @@ bool VideoPlayer::open(const std::string &url) {
   url_ = url;
   error_.clear();
   paused_ = false;
+  audioOnlyMode_ = false;
 
 #ifndef NSTV_USE_FFMPEG
   error_ = "Video player not enabled: build with NSTV_USE_FFMPEG and FFmpeg/libav libraries.";
@@ -489,6 +490,7 @@ void VideoPlayer::close() {
   durationMs_ = 0;
   startTimeMs_ = 0;
   currentPositionMs_ = 0;
+  audioOnlyMode_ = false;
 }
 
 bool VideoPlayer::update() {

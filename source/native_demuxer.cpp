@@ -3,8 +3,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #ifdef NSTV_USE_FFMPEG
 extern "C" {
@@ -82,12 +84,172 @@ std::string httpFallbackUrl(const std::string &url) {
   return url;
 }
 
+std::string httpFallbackUrlWithoutExplicitPort(const std::string &url) {
+  if (!startsWithHttps(url)) {
+    return url;
+  }
+
+  const std::string rest = url.substr(8);
+  const std::size_t slash = rest.find('/');
+  const std::string authority = slash == std::string::npos ? rest : rest.substr(0, slash);
+  const std::string path = slash == std::string::npos ? std::string() : rest.substr(slash);
+
+  std::string host = authority;
+
+  if (!host.empty() && host.front() == '[') {
+    const std::size_t close = host.find(']');
+    if (close != std::string::npos && close + 1 < host.size() && host[close + 1] == ':') {
+      host = host.substr(0, close + 1);
+    }
+  } else {
+    const std::size_t colon = host.find(':');
+    if (colon != std::string::npos) {
+      host = host.substr(0, colon);
+    }
+  }
+
+  if (host.empty()) {
+    return httpFallbackUrl(url);
+  }
+
+  return "http://" + host + path;
+}
+
+
+char lowerAscii(char value) {
+  return static_cast<char>(std::tolower(static_cast<unsigned char>(value)));
+}
+
+std::string toLowerAscii(std::string value) {
+  std::transform(value.begin(), value.end(), value.begin(), lowerAscii);
+  return value;
+}
+
+void replaceCaseInsensitiveFrom(
+  std::string &value,
+  std::size_t start,
+  const std::string &needle,
+  const std::string &replacement
+) {
+  if (needle.empty() || start >= value.size()) {
+    return;
+  }
+
+  std::string lowerValue = toLowerAscii(value);
+  const std::string lowerNeedle = toLowerAscii(needle);
+
+  std::size_t pos = lowerValue.find(lowerNeedle, start);
+  while (pos != std::string::npos) {
+    value.replace(pos, needle.size(), replacement);
+    lowerValue.replace(pos, needle.size(), toLowerAscii(replacement));
+    pos = lowerValue.find(lowerNeedle, pos + replacement.size());
+  }
+}
+
+std::string rewriteNestedHttpsToHttp(const std::string &url) {
+  std::string rewritten = url;
+  const std::size_t query = rewritten.find('?');
+
+  if (query == std::string::npos || query + 1 >= rewritten.size()) {
+    return rewritten;
+  }
+
+  // Some HLS provider URLs are HTTP-compatible after the main scheme fallback,
+  // but still carry nested HTTPS upstreams inside query parameters, e.g.
+  //   ...m3u8?yo.up=https://cdn.example/...
+  // FFmpeg without TLS can still fail when the provider follows that nested URL.
+  // Rewriting only the query keeps the real URL scheme untouched.
+  replaceCaseInsensitiveFrom(rewritten, query + 1, "https://", "http://");
+  replaceCaseInsensitiveFrom(rewritten, query + 1, "https%3A%2F%2F", "http%3A%2F%2F");
+  return rewritten;
+}
+
+void addUniqueFallback(std::vector<std::string> &fallbacks, const std::string &url) {
+  if (url.empty()) {
+    return;
+  }
+
+  if (std::find(fallbacks.begin(), fallbacks.end(), url) == fallbacks.end()) {
+    fallbacks.push_back(url);
+  }
+}
+
+std::string urlOrigin(const std::string &url) {
+  const std::size_t scheme = url.find("://");
+  if (scheme == std::string::npos) {
+    return std::string();
+  }
+
+  const std::size_t authorityStart = scheme + 3;
+  const std::size_t slash = url.find('/', authorityStart);
+  if (slash == std::string::npos) {
+    return url + "/";
+  }
+
+  return url.substr(0, slash + 1);
+}
+
+std::string urlScheme(const std::string &url) {
+  const std::size_t colon = url.find(':');
+  if (colon == std::string::npos || colon == 0) {
+    return std::string();
+  }
+
+  for (std::size_t i = 0; i < colon; ++i) {
+    const unsigned char c = static_cast<unsigned char>(url[i]);
+    if (!std::isalpha(c) && !std::isdigit(c) && url[i] != '+' && url[i] != '-' && url[i] != '.') {
+      return std::string();
+    }
+  }
+
+  return toLowerAscii(url.substr(0, colon));
+}
+
 bool isProtocolNotFound(int code) {
   return ffmpegError(code).find("Protocol not found") != std::string::npos;
 }
 
-void setLiveInputOptions(AVDictionary **options, const char *userAgent) {
+bool isHttp4xxError(int code) {
+  const std::string error = ffmpegError(code);
+  return error.find("Server returned 4") != std::string::npos ||
+    error.find("4XX Client Error") != std::string::npos;
+}
+
+bool isNetworkIoError(int code) {
+  return ffmpegError(code).find("I/O error") != std::string::npos;
+}
+
+bool shouldRetryWithBrowserHeaders(int code) {
+  return isHttp4xxError(code) || isNetworkIoError(code);
+}
+
+std::string unsupportedProtocolMessage(const std::string &url) {
+  const std::string scheme = urlScheme(url);
+
+  if (scheme.empty() || scheme == "http" || scheme == "https") {
+    return std::string();
+  }
+
+  return " | Unsupported stream protocol '" + scheme +
+    "' in this FFmpeg build. Kboré currently treats HTTP/HLS directly and HTTPS only through HTTP-compatible fallback.";
+}
+
+void setLiveInputOptions(
+  AVDictionary **options,
+  const std::string &url,
+  const char *userAgent,
+  bool browserHeaders
+) {
   av_dict_set(options, "user_agent", userAgent, 0);
+
+  if (browserHeaders) {
+    const std::string origin = urlOrigin(url);
+    av_dict_set(options, "headers", "Accept: */*\r\nConnection: keep-alive\r\n", 0);
+    if (!origin.empty()) {
+      av_dict_set(options, "referer", origin.c_str(), 0);
+    }
+  }
+
   av_dict_set(options, "reconnect", "1", 0);
   av_dict_set(options, "reconnect_streamed", "1", 0);
   av_dict_set(options, "reconnect_delay_max", "2", 0);
@@ -106,9 +268,14 @@ void setLiveInputOptions(AVDictionary **options, const char *userAgent) {
   av_dict_set(options, "probesize", "65536", 0);
 }
 
-int openLiveInput(AVFormatContext **format, const std::string &url, const char *userAgent) {
+int openLiveInput(
+  AVFormatContext **format,
+  const std::string &url,
+  const char *userAgent,
+  bool browserHeaders = false
+) {
   AVDictionary *options = nullptr;
-  setLiveInputOptions(&options, userAgent);
+  setLiveInputOptions(&options, url, userAgent, browserHeaders);
 
   int ret = avformat_open_input(
     format,
@@ -118,6 +285,42 @@ int openLiveInput(AVFormatContext **format, const std::string &url, const char *
   );
 
   av_dict_free(&options);
+  return ret;
+}
+
+int openLiveInputWithHttpCompatibilityRetries(
+  NativeDemuxer::Impl *impl,
+  const std::string &url,
+  const char *normalUserAgent,
+  const char *browserUserAgent
+) {
+  int ret = openLiveInput(&impl->format, url, normalUserAgent, false);
+
+  if (ret < 0 && shouldRetryWithBrowserHeaders(ret)) {
+    logLinef(
+      "[KBORE][NETWORK][HTTP] retrying stream with browser-compatible headers url=%s reason=%s",
+      url.c_str(),
+      ffmpegError(ret).c_str()
+    );
+
+    if (impl->format) {
+      avformat_close_input(&impl->format);
+      impl->format = nullptr;
+    }
+
+    const int browserRet = openLiveInput(&impl->format, url, browserUserAgent, true);
+    if (browserRet >= 0) {
+      logLine("[KBORE][NETWORK][HTTP] browser-compatible headers opened stream successfully");
+      return browserRet;
+    }
+
+    logLinef(
+      "[KBORE][NETWORK][HTTP] browser-compatible headers failed error=%s",
+      ffmpegError(browserRet).c_str()
+    );
+    ret = browserRet;
+  }
+
   return ret;
 }
 
@@ -297,35 +500,74 @@ bool NativeDemuxer::open(const std::string &url) {
     return false;
   }
 
-  int ret = openLiveInput(&impl_->format, url, "NSTV-NativeDemuxer/0.1");
+  int ret = openLiveInputWithHttpCompatibilityRetries(
+    impl_,
+    url,
+    "NSTV-NativeDemuxer/0.1",
+    "Mozilla/5.0 (Nintendo Switch; Kbore/1.0) AppleWebKit/605.1.15"
+  );
 
   const bool httpsProtocolMissing = ret < 0 && startsWithHttps(url) && isProtocolNotFound(ret);
 
   if (httpsProtocolMissing) {
-    const std::string fallback = httpFallbackUrl(url);
+    std::vector<std::string> fallbacks;
+    const std::string withPort = httpFallbackUrl(url);
+    const std::string withoutPort = httpFallbackUrlWithoutExplicitPort(url);
+    addUniqueFallback(fallbacks, withPort);
+    addUniqueFallback(fallbacks, rewriteNestedHttpsToHttp(withPort));
+    addUniqueFallback(fallbacks, withoutPort);
+    addUniqueFallback(fallbacks, rewriteNestedHttpsToHttp(withoutPort));
 
-    logLinef(
-      "[KBORE][NETWORK][HTTPS] FFmpeg HTTPS protocol unavailable; retrying HTTP fallback url=%s",
-      fallback.c_str()
-    );
+    int lastFallbackRet = ret;
+    std::string lastTriedFallback;
 
-    if (impl_->format) {
-      avformat_close_input(&impl_->format);
-      impl_->format = nullptr;
-    }
+    for (const std::string &fallback : fallbacks) {
+      if (fallback.empty() || fallback == url || fallback == lastTriedFallback) {
+        continue;
+      }
 
-    const int fallbackRet = openLiveInput(&impl_->format, fallback, "NSTV-NativeDemuxer/0.1");
+      lastTriedFallback = fallback;
 
-    if (fallbackRet >= 0) {
-      url_ = fallback;
-      ret = fallbackRet;
-      logLine("[KBORE][NETWORK][HTTPS] HTTP fallback opened stream successfully");
-    } else {
-      ret = fallbackRet;
+      if (fallback != fallbacks.front()) {
+        logLinef(
+          "[KBORE][NETWORK][HTTPS] retrying HTTP fallback without explicit HTTPS port url=%s",
+          fallback.c_str()
+        );
+      } else {
+        logLinef(
+          "[KBORE][NETWORK][HTTPS] FFmpeg HTTPS protocol unavailable; retrying HTTP fallback url=%s",
+          fallback.c_str()
+        );
+      }
+
+      if (impl_->format) {
+        avformat_close_input(&impl_->format);
+        impl_->format = nullptr;
+      }
+
+      const int fallbackRet = openLiveInputWithHttpCompatibilityRetries(
+        impl_,
+        fallback,
+        "NSTV-NativeDemuxer/0.1",
+        "Mozilla/5.0 (Nintendo Switch; Kbore/1.0) AppleWebKit/605.1.15"
+      );
+      lastFallbackRet = fallbackRet;
+
+      if (fallbackRet >= 0) {
+        url_ = fallback;
+        ret = fallbackRet;
+        logLine("[KBORE][NETWORK][HTTPS] HTTP fallback opened stream successfully");
+        break;
+      }
+
       logLinef(
-        "[KBORE][NETWORK][HTTPS] HTTP fallback also failed error=%s",
+        "[KBORE][NETWORK][HTTPS] HTTP fallback failed error=%s",
         ffmpegError(fallbackRet).c_str()
       );
+    }
+
+    if (ret < 0) {
+      ret = lastFallbackRet;
     }
   }
 
@@ -336,6 +578,10 @@ bool NativeDemuxer::open(const std::string &url) {
       error_ +=
         " | The stream URL uses HTTPS, but this FFmpeg build does not expose the https/tls protocol. "
         "Rebuild FFmpeg for Switch with TLS/HTTPS support or use an HTTP-compatible playlist/URL.";
+    }
+
+    if (isProtocolNotFound(ret)) {
+      error_ += unsupportedProtocolMessage(url);
     }
 
     close();
@@ -378,23 +624,36 @@ bool NativeDemuxer::open(const std::string &url) {
     }
   }
 
-  if (!video_.exists) {
-    error_ = "NativeDemuxer did not find a video stream.";
+  if (!video_.exists && !audio_.exists) {
+    error_ = "NativeDemuxer did not find video or audio streams.";
     close();
     return false;
   }
 
+  if (!video_.exists && audio_.exists) {
+    logLinef(
+      "[KBORE][PLAYBACK][AUDIO_ONLY] demuxer opened audio-only stream codec=%s stream=%d url=%s",
+      audio_.codecName.c_str(),
+      audio_.index,
+      url_.c_str()
+    );
+  }
+
   std::ostringstream out;
 
-  out
-    << "video="
-    << video_.codecName
-    << " "
-    << video_.width
-    << "x"
-    << video_.height
-    << " stream="
-    << video_.index;
+  if (video_.exists) {
+    out
+      << "video="
+      << video_.codecName
+      << " "
+      << video_.width
+      << "x"
+      << video_.height
+      << " stream="
+      << video_.index;
+  } else {
+    out << "video=none";
+  }
 
   if (audio_.exists) {
     out
