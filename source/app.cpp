@@ -63,6 +63,44 @@ std::string formatPlaybackTime(int64_t ms) {
   return buffer;
 }
 
+static int gEpgOffsetMinutes = 0;
+
+void setRuntimeEpgOffsetMinutes(int minutes) {
+  gEpgOffsetMinutes = minutes;
+  std::printf("[KBORE][EPG][OFFSET] active playlist EPG offset=%d minute(s)\n", gEpgOffsetMinutes);
+}
+
+int runtimeEpgOffsetMinutes() {
+  return gEpgOffsetMinutes;
+}
+
+int runtimeEpgOffsetSeconds() {
+  return runtimeEpgOffsetMinutes() * 60;
+}
+
+std::time_t applyRuntimeEpgOffset(std::time_t timestamp) {
+  return static_cast<std::time_t>(static_cast<long long>(timestamp) + runtimeEpgOffsetSeconds());
+}
+
+std::string formatEpgOffsetMinutes(int minutes) {
+  if (minutes == 0) {
+    return "0h";
+  }
+
+  const char sign = minutes < 0 ? '-' : '+';
+  int absolute = minutes < 0 ? -minutes : minutes;
+  const int hours = absolute / 60;
+  const int mins = absolute % 60;
+
+  char buffer[32] = {};
+  if (mins == 0) {
+    std::snprintf(buffer, sizeof(buffer), "%c%dh", sign, hours);
+  } else {
+    std::snprintf(buffer, sizeof(buffer), "%c%dh%02d", sign, hours, mins);
+  }
+  return buffer;
+}
+
 bool isVodType(StreamType type) {
   return type == StreamType::Movies || type == StreamType::Series;
 }
@@ -78,37 +116,22 @@ bool endsWith(const std::string &value, const std::string &suffix) {
 }
 
 std::string formatSystemClockTime() {
-  std::time_t rawTime = std::time(nullptr);
+  const std::time_t rawTime = currentUnixTime();
 
   if (rawTime <= 0) {
     return "--:--";
   }
 
-  std::tm localTime{};
-
-#if defined(_WIN32)
-  localtime_s(&localTime, &rawTime);
-#else
-  std::tm *result = std::localtime(&rawTime);
-
-  if (!result) {
+  PlatformLocalTime localTime;
+  if (!localTimeFromUnix(rawTime, localTime)) {
     return "--:--";
   }
 
-  localTime = *result;
-#endif
-
   char buffer[8] = {};
-  std::snprintf(
-    buffer,
-    sizeof(buffer),
-    "%02d:%02d",
-    localTime.tm_hour,
-    localTime.tm_min
-  );
-
+  std::snprintf(buffer, sizeof(buffer), "%02d:%02d", localTime.hour, localTime.minute);
   return buffer;
 }
+
 
 int parseFixedInt(const std::string &value, std::size_t pos, std::size_t len, int fallback = 0) {
   if (pos + len > value.size()) {
@@ -179,10 +202,194 @@ std::string trimEpgValue(const std::string &value) {
   return value.substr(first, last - first);
 }
 
+std::string normalizeEpgIdentityToken(const std::string &value) {
+  const std::string trimmed = trimEpgValue(value);
+  std::string normalized;
+  normalized.reserve(trimmed.size());
+
+  bool previousSpace = false;
+  for (char ch : trimmed) {
+    const unsigned char uch = static_cast<unsigned char>(ch);
+    if (std::isspace(uch)) {
+      if (!previousSpace && !normalized.empty()) {
+        normalized.push_back(' ');
+        previousSpace = true;
+      }
+      continue;
+    }
+
+    normalized.push_back(static_cast<char>(std::tolower(uch)));
+    previousSpace = false;
+  }
+
+  while (!normalized.empty() && normalized.back() == ' ') {
+    normalized.pop_back();
+  }
+
+  return normalized;
+}
+
+void addUniqueEpgIdentityToken(std::vector<std::string> &tokens, const std::string &value) {
+  const std::string normalized = normalizeEpgIdentityToken(value);
+  if (normalized.empty()) {
+    return;
+  }
+
+  if (std::find(tokens.begin(), tokens.end(), normalized) == tokens.end()) {
+    tokens.push_back(normalized);
+  }
+}
+
+void addEpgIdentityTokenWithVariants(std::vector<std::string> &tokens, const std::string &value) {
+  addUniqueEpgIdentityToken(tokens, value);
+
+  const std::string trimmed = trimEpgValue(value);
+  const std::size_t colon = trimmed.find_last_of(':');
+  if (colon != std::string::npos && colon + 1 < trimmed.size()) {
+    addUniqueEpgIdentityToken(tokens, trimmed.substr(colon + 1));
+  }
+
+  const std::size_t slash = trimmed.find_last_of('/');
+  if (slash != std::string::npos && slash + 1 < trimmed.size()) {
+    addUniqueEpgIdentityToken(tokens, trimmed.substr(slash + 1));
+  }
+}
+
+std::vector<std::string> strongEpgIdentityTokensForChannel(const Channel &channel) {
+  std::vector<std::string> tokens;
+  addEpgIdentityTokenWithVariants(tokens, channel.tvgId);
+  addEpgIdentityTokenWithVariants(tokens, channel.streamId);
+  addEpgIdentityTokenWithVariants(tokens, channel.id);
+  return tokens;
+}
+
+std::vector<std::string> weakEpgIdentityTokensForChannel(const Channel &channel) {
+  std::vector<std::string> tokens;
+  addUniqueEpgIdentityToken(tokens, channel.tvgName);
+  addUniqueEpgIdentityToken(tokens, channel.name);
+  return tokens;
+}
+
+bool tokenListContains(const std::vector<std::string> &tokens, const std::string &token) {
+  return !token.empty() && std::find(tokens.begin(), tokens.end(), token) != tokens.end();
+}
+
+bool epgProgramHasChannelIdentity(const EpgProgram &program) {
+  return !trimEpgValue(program.channelId).empty() || !trimEpgValue(program.channelName).empty();
+}
+
+bool epgProgramMatchesChannelIdentity(const EpgProgram &program, const Channel &channel) {
+  const std::vector<std::string> strongTokens = strongEpgIdentityTokensForChannel(channel);
+  const std::vector<std::string> weakTokens = weakEpgIdentityTokensForChannel(channel);
+
+  const std::string programChannelId = normalizeEpgIdentityToken(program.channelId);
+  if (!programChannelId.empty()) {
+    if (tokenListContains(strongTokens, programChannelId)) {
+      return true;
+    }
+
+    // Some parser responses expose the XMLTV channel name in a field named
+    // channelId. Only allow this loose comparison when the focused item has no
+    // stronger identifiers, otherwise IDs such as 426095/426147 must remain
+    // strict and must not be matched by title/time alone.
+    if (strongTokens.empty() && tokenListContains(weakTokens, programChannelId)) {
+      return true;
+    }
+
+    return false;
+  }
+
+  const std::string programChannelName = normalizeEpgIdentityToken(program.channelName);
+  if (!programChannelName.empty()) {
+    return tokenListContains(weakTokens, programChannelName) || tokenListContains(strongTokens, programChannelName);
+  }
+
+  return false;
+}
+
+std::vector<std::size_t> epgCandidateIndicesForChannel(const EpgPage &page, const Channel *channel) {
+  std::vector<std::size_t> all;
+  all.reserve(page.programs.size());
+  for (std::size_t i = 0; i < page.programs.size(); ++i) {
+    all.push_back(i);
+  }
+
+  if (!channel) {
+    return all;
+  }
+
+  std::vector<std::size_t> identifiedMatches;
+  bool pageHasIdentifiedPrograms = false;
+  std::vector<std::string> distinctPageIds;
+
+  auto addDistinctPageId = [&distinctPageIds](const std::string &value) {
+    const std::string token = normalizeEpgIdentityToken(value);
+    if (token.empty()) {
+      return;
+    }
+    if (std::find(distinctPageIds.begin(), distinctPageIds.end(), token) == distinctPageIds.end()) {
+      distinctPageIds.push_back(token);
+    }
+  };
+
+  for (std::size_t i = 0; i < page.programs.size(); ++i) {
+    const EpgProgram &program = page.programs[i];
+    if (!epgProgramHasChannelIdentity(program)) {
+      continue;
+    }
+
+    pageHasIdentifiedPrograms = true;
+    addDistinctPageId(program.channelId);
+    if (program.channelId.empty()) {
+      addDistinctPageId(program.channelName);
+    }
+
+    if (epgProgramMatchesChannelIdentity(program, *channel)) {
+      identifiedMatches.push_back(i);
+    }
+  }
+
+  if (!identifiedMatches.empty()) {
+    return identifiedMatches;
+  }
+
+  // Some parser responses are already scoped to the requested focused channel,
+  // but the programme.channel value is the raw XMLTV id, while the app item only
+  // has streamId/name/url metadata. In that situation a strict ID comparison
+  // would hide a valid page as "EPG unavailable". If the page itself contains a
+  // single EPG channel id, trust the parser-scoped page and match by time inside
+  // that page. If multiple programme channel ids are present, keep protection
+  // against borrowing another channel's current programme.
+  if (pageHasIdentifiedPrograms) {
+    if (distinctPageIds.size() <= 1) {
+      std::printf(
+        "[KBORE][EPG][MATCH] no direct channel id match for '%s', but EPG page is single-channel id='%s'; trusting parser-scoped page\n",
+        channel->name.c_str(),
+        distinctPageIds.empty() ? "" : distinctPageIds.front().c_str()
+      );
+      return all;
+    }
+
+    std::printf(
+      "[KBORE][EPG][MATCH] no direct channel id match for '%s' and EPG page has %zu channel ids; refusing mixed-page fallback\n",
+      channel->name.c_str(),
+      distinctPageIds.size()
+    );
+    return {};
+  }
+
+  return all;
+}
+
 enum class EpgMeridiem {
   None,
   AM,
   PM
+};
+
+enum class EpgTimeInterpretation {
+  Exact,
+  LocalWallClock
 };
 
 EpgMeridiem detectMeridiemInRange(const std::string &text, std::size_t start, std::size_t end) {
@@ -304,7 +511,7 @@ void inferMissingMeridiemForClockRange(ParsedClockEpgTime &start, bool hasStart,
   }
 }
 
-bool parseEpgTime(const std::string &value, std::time_t &timestamp) {
+bool parseEpgTimeInternal(const std::string &value, std::time_t &timestamp, EpgTimeInterpretation interpretation) {
   const std::string text = trimEpgValue(value);
   if (text.empty()) {
     return false;
@@ -326,9 +533,15 @@ bool parseEpgTime(const std::string &value, std::time_t &timestamp) {
     if (text.size() == 13) raw /= 1000;
     if (raw <= 0) return false;
 
+    // Numeric timestamps are already absolute Unix time. Do not reinterpret
+    // them as local wall-clock values.
     timestamp = static_cast<std::time_t>(raw);
     return true;
   }
+
+  auto localWallClockTimestamp = [](int year, int month, int day, int hour, int minute, int second, std::time_t &out) {
+    return unixTimeFromLocal(year, month, day, hour, minute, second, out);
+  };
 
   std::size_t dateTimePos = text.find('T');
   if (dateTimePos == std::string::npos && text.size() >= 16 && text[4] == '-' && text[7] == '-' && text[10] == ' ') {
@@ -355,6 +568,17 @@ bool parseEpgTime(const std::string &value, std::time_t &timestamp) {
     if (zonePos != std::string::npos) {
       int offsetSeconds = 0;
       if (parseZoneOffsetSeconds(text.substr(zonePos), offsetSeconds)) {
+        if (interpretation == EpgTimeInterpretation::LocalWallClock) {
+          // Some parser/provider combinations return XMLTV/ISO values whose
+          // date+hour already represent the intended playlist schedule, while
+          // the trailing timezone belongs to the EPG source. Applying that
+          // offset can move the programme by several hours (for example +0400
+          // on a UTC-3 console shows a programme 7h early). In this guarded
+          // interpretation we keep the full date+time, but ignore the explicit
+          // offset and anchor it to the console local timezone.
+          return localWallClockTimestamp(year, month, day, hour, minute, second, timestamp);
+        }
+
         timestamp = static_cast<std::time_t>(
           epochFromUtcParts(year, month, day, hour, minute, second) - offsetSeconds
         );
@@ -362,16 +586,7 @@ bool parseEpgTime(const std::string &value, std::time_t &timestamp) {
       }
     }
 
-    std::tm localTime{};
-    localTime.tm_year = year - 1900;
-    localTime.tm_mon = month - 1;
-    localTime.tm_mday = day;
-    localTime.tm_hour = hour;
-    localTime.tm_min = minute;
-    localTime.tm_sec = second;
-    localTime.tm_isdst = -1;
-    timestamp = std::mktime(&localTime);
-    return timestamp != static_cast<std::time_t>(-1);
+    return localWallClockTimestamp(year, month, day, hour, minute, second, timestamp);
   }
 
   // XMLTV common format: YYYYMMDDHHMMSS +/-ZZZZ
@@ -393,6 +608,10 @@ bool parseEpgTime(const std::string &value, std::time_t &timestamp) {
     if (zonePos != std::string::npos) {
       int offsetSeconds = 0;
       if (parseZoneOffsetSeconds(text.substr(zonePos), offsetSeconds)) {
+        if (interpretation == EpgTimeInterpretation::LocalWallClock) {
+          return localWallClockTimestamp(year, month, day, hour, minute, second, timestamp);
+        }
+
         timestamp = static_cast<std::time_t>(
           epochFromUtcParts(year, month, day, hour, minute, second) - offsetSeconds
         );
@@ -400,19 +619,80 @@ bool parseEpgTime(const std::string &value, std::time_t &timestamp) {
       }
     }
 
-    std::tm localTime{};
-    localTime.tm_year = year - 1900;
-    localTime.tm_mon = month - 1;
-    localTime.tm_mday = day;
-    localTime.tm_hour = hour;
-    localTime.tm_min = minute;
-    localTime.tm_sec = second;
-    localTime.tm_isdst = -1;
-    timestamp = std::mktime(&localTime);
-    return timestamp != static_cast<std::time_t>(-1);
+    return localWallClockTimestamp(year, month, day, hour, minute, second, timestamp);
   }
 
   return false;
+}
+
+bool parseEpgTime(const std::string &value, std::time_t &timestamp) {
+  return parseEpgTimeInternal(value, timestamp, EpgTimeInterpretation::Exact);
+}
+
+bool parseEpgTimeLocalWallClock(const std::string &value, std::time_t &timestamp) {
+  return parseEpgTimeInternal(value, timestamp, EpgTimeInterpretation::LocalWallClock);
+}
+
+bool epgValueHasExplicitTimezone(const std::string &value) {
+  const std::string text = trimEpgValue(value);
+  if (text.empty()) {
+    return false;
+  }
+
+  std::size_t dateTimePos = text.find('T');
+  if (dateTimePos == std::string::npos && text.size() >= 16 && text[4] == '-' && text[7] == '-' && text[10] == ' ') {
+    dateTimePos = 10;
+  }
+
+  if (dateTimePos != std::string::npos && text.size() >= dateTimePos + 6) {
+    return text.find_first_of("Zz+-", dateTimePos + 6) != std::string::npos;
+  }
+
+  if (text.size() >= 14 && std::all_of(text.begin(), text.begin() + 14, [](char ch) {
+        return std::isdigit(static_cast<unsigned char>(ch));
+      })) {
+    return text.find_first_of("+-", 14) != std::string::npos;
+  }
+
+  return false;
+}
+
+bool parseExplicitEpgTimezoneOffsetSeconds(const std::string &value, int &offsetSeconds) {
+  const std::string text = trimEpgValue(value);
+  if (text.empty()) {
+    return false;
+  }
+
+  std::size_t dateTimePos = text.find('T');
+  if (dateTimePos == std::string::npos && text.size() >= 16 && text[4] == '-' && text[7] == '-' && text[10] == ' ') {
+    dateTimePos = 10;
+  }
+
+  if (dateTimePos != std::string::npos && text.size() >= dateTimePos + 6) {
+    const std::size_t zonePos = text.find_first_of("Zz+-", dateTimePos + 6);
+    if (zonePos != std::string::npos) {
+      return parseZoneOffsetSeconds(text.substr(zonePos), offsetSeconds);
+    }
+  }
+
+  if (text.size() >= 14 && std::all_of(text.begin(), text.begin() + 14, [](char ch) {
+        return std::isdigit(static_cast<unsigned char>(ch));
+      })) {
+    const std::size_t zonePos = text.find_first_of("+-", 14);
+    if (zonePos != std::string::npos) {
+      return parseZoneOffsetSeconds(text.substr(zonePos), offsetSeconds);
+    }
+  }
+
+  return false;
+}
+
+int localUtcOffsetSeconds(std::time_t value) {
+  PlatformLocalTime localTime;
+  if (!localTimeFromUnix(value, localTime)) {
+    return 0;
+  }
+  return localTime.utcOffsetSeconds;
 }
 
 bool parseClockOnlyEpgTimeDetailed(const std::string &value, ParsedClockEpgTime &clock) {
@@ -479,24 +759,23 @@ bool parseClockOnlyEpgTime(const std::string &value, int &minutesOfDay, int &sec
 }
 
 std::time_t localDateWithClock(std::time_t anchor, int minutesOfDay, int seconds, int dayOffset = 0) {
-  std::tm localDate{};
-
-#if defined(_WIN32)
-  localtime_s(&localDate, &anchor);
-#else
-  std::tm *result = std::localtime(&anchor);
-  if (!result) {
+  PlatformLocalTime localDate;
+  if (!localTimeFromUnix(anchor, localDate)) {
     return static_cast<std::time_t>(-1);
   }
-  localDate = *result;
-#endif
 
-  localDate.tm_mday += dayOffset;
-  localDate.tm_hour = minutesOfDay / 60;
-  localDate.tm_min = minutesOfDay % 60;
-  localDate.tm_sec = seconds;
-  localDate.tm_isdst = -1;
-  return std::mktime(&localDate);
+  std::time_t out{};
+  if (!unixTimeFromLocal(
+        localDate.year,
+        localDate.month,
+        localDate.day + dayOffset,
+        minutesOfDay / 60,
+        minutesOfDay % 60,
+        seconds,
+        out)) {
+    return static_cast<std::time_t>(-1);
+  }
+  return out;
 }
 
 struct ResolvedEpgRange {
@@ -508,13 +787,23 @@ struct ResolvedEpgRange {
   std::time_t stop = 0;
 };
 
-ResolvedEpgRange resolveEpgRangeForNow(const EpgProgram &program, std::time_t now, const EpgPage *page = nullptr, std::size_t index = 0) {
+ResolvedEpgRange resolveEpgRangeForNow(
+  const EpgProgram &program,
+  std::time_t now,
+  const EpgPage *page = nullptr,
+  std::size_t index = 0,
+  EpgTimeInterpretation interpretation = EpgTimeInterpretation::Exact
+) {
   ResolvedEpgRange range;
 
   std::time_t start{};
   std::time_t stop{};
-  const bool hasDatedStart = parseEpgTime(program.start, start);
-  bool hasDatedStop = parseEpgTime(program.stop, stop);
+  const bool hasDatedStart = interpretation == EpgTimeInterpretation::LocalWallClock
+    ? parseEpgTimeLocalWallClock(program.start, start)
+    : parseEpgTime(program.start, start);
+  bool hasDatedStop = interpretation == EpgTimeInterpretation::LocalWallClock
+    ? parseEpgTimeLocalWallClock(program.stop, stop)
+    : parseEpgTime(program.stop, stop);
 
   ParsedClockEpgTime startClockParsed;
   ParsedClockEpgTime stopClockParsed;
@@ -533,48 +822,38 @@ ResolvedEpgRange resolveEpgRangeForNow(const EpgProgram &program, std::time_t no
   range.hasDatedTime = hasDatedStart || hasDatedStop;
 
   if (hasDatedStart) {
-    range.start = start;
+    range.start = applyRuntimeEpgOffset(start);
   } else if (hasClockStart) {
     int dayOffset = 0;
     if (hasClockStop && stopClock <= startClock) {
-      std::tm nowLocal{};
-#if defined(_WIN32)
-      localtime_s(&nowLocal, &now);
-#else
-      std::tm *nowResult = std::localtime(&now);
-      if (nowResult) {
-        nowLocal = *nowResult;
+      PlatformLocalTime nowLocal;
+      if (!localTimeFromUnix(now, nowLocal)) {
+        return range;
       }
-#endif
-      const int nowClock = nowLocal.tm_hour * 60 + nowLocal.tm_min;
+      const int nowClock = nowLocal.hour * 60 + nowLocal.minute;
       if (nowClock < stopClock) {
         dayOffset = -1;
       }
     }
 
-    range.start = localDateWithClock(now, startClock, startSecond, dayOffset);
+    range.start = applyRuntimeEpgOffset(localDateWithClock(now, startClock, startSecond, dayOffset));
   }
 
   if (hasDatedStop) {
-    range.stop = stop;
+    range.stop = applyRuntimeEpgOffset(stop);
   } else if (hasClockStop) {
     int dayOffset = 0;
     if (hasClockStart && stopClock <= startClock) {
-      std::tm nowLocal{};
-#if defined(_WIN32)
-      localtime_s(&nowLocal, &now);
-#else
-      std::tm *nowResult = std::localtime(&now);
-      if (nowResult) {
-        nowLocal = *nowResult;
+      PlatformLocalTime nowLocal;
+      if (!localTimeFromUnix(now, nowLocal)) {
+        return range;
       }
-#endif
-      const int nowClock = nowLocal.tm_hour * 60 + nowLocal.tm_min;
+      const int nowClock = nowLocal.hour * 60 + nowLocal.minute;
       dayOffset = nowClock < stopClock ? 0 : 1;
     }
 
     const std::time_t anchor = hasDatedStart ? range.start : now;
-    range.stop = localDateWithClock(anchor, stopClock, stopSecond, dayOffset);
+    range.stop = applyRuntimeEpgOffset(localDateWithClock(anchor, stopClock, stopSecond, dayOffset));
   }
 
   const bool hasStart = hasDatedStart || hasClockStart;
@@ -582,7 +861,7 @@ ResolvedEpgRange resolveEpgRangeForNow(const EpgProgram &program, std::time_t no
 
   if (hasStart && !hasStop && page) {
     for (std::size_t j = index + 1; j < page->programs.size(); ++j) {
-      ResolvedEpgRange next = resolveEpgRangeForNow(page->programs[j], now, nullptr, 0);
+      ResolvedEpgRange next = resolveEpgRangeForNow(page->programs[j], now, nullptr, 0, interpretation);
       if (next.hasStartTime && next.start > range.start) {
         range.stop = next.start;
         hasStop = true;
@@ -618,55 +897,101 @@ bool epgPageHasDatedTimes(const EpgPage &page) {
   return false;
 }
 
-std::string formatLocalClock(std::time_t timestamp) {
-  std::tm localTime{};
+bool epgPageHasExplicitTimezone(const EpgPage &page) {
+  for (const EpgProgram &program : page.programs) {
+    if (epgValueHasExplicitTimezone(program.start) || epgValueHasExplicitTimezone(program.stop)) {
+      return true;
+    }
+  }
 
-#if defined(_WIN32)
-  localtime_s(&localTime, &timestamp);
-#else
-  std::tm *result = std::localtime(&timestamp);
-  if (!result) {
+  return false;
+}
+
+bool epgPageHasLargeTimezoneDelta(const EpgPage &page, std::time_t now) {
+  int sourceOffsetSeconds = 0;
+  bool foundOffset = false;
+
+  for (const EpgProgram &program : page.programs) {
+    if (parseExplicitEpgTimezoneOffsetSeconds(program.start, sourceOffsetSeconds) ||
+        parseExplicitEpgTimezoneOffsetSeconds(program.stop, sourceOffsetSeconds)) {
+      foundOffset = true;
+      break;
+    }
+  }
+
+  if (!foundOffset) {
+    return false;
+  }
+
+  const int localOffset = localUtcOffsetSeconds(now);
+  const int delta = std::abs(sourceOffsetSeconds - localOffset);
+
+  // Do not reinterpret normal UTC/local differences of 1-4 hours. The reported
+  // bug is a large source-offset drift (for example +0400 EPG on a UTC-3 console
+  // = 7h), which should use the EPG date+clock as the playlist local schedule.
+  return delta >= 5 * 60 * 60;
+}
+
+std::string formatLocalClock(std::time_t timestamp) {
+  PlatformLocalTime localTime;
+  if (!localTimeFromUnix(timestamp, localTime)) {
     return "--:--";
   }
-  localTime = *result;
-#endif
 
   char buffer[8] = {};
-  std::snprintf(buffer, sizeof(buffer), "%02d:%02d", localTime.tm_hour, localTime.tm_min);
+  std::snprintf(buffer, sizeof(buffer), "%02d:%02d", localTime.hour, localTime.minute);
   return buffer;
 }
 
-std::string formatEpgClock(const std::string &value) {
+std::string formatEpgClock(const std::string &value, EpgTimeInterpretation interpretation = EpgTimeInterpretation::Exact) {
   std::time_t timestamp{};
-  if (parseEpgTime(value, timestamp)) {
-    return formatLocalClock(timestamp);
+  const bool parsedTimestamp = interpretation == EpgTimeInterpretation::LocalWallClock
+    ? parseEpgTimeLocalWallClock(value, timestamp)
+    : parseEpgTime(value, timestamp);
+  if (parsedTimestamp) {
+    return formatLocalClock(applyRuntimeEpgOffset(timestamp));
   }
 
   ParsedClockEpgTime clock;
   if (parseClockOnlyEpgTimeDetailed(value, clock)) {
+    int minutes = clock.minutesOfDay + runtimeEpgOffsetMinutes();
+    minutes %= 24 * 60;
+    if (minutes < 0) {
+      minutes += 24 * 60;
+    }
     char buffer[8] = {};
-    std::snprintf(buffer, sizeof(buffer), "%02d:%02d", clock.minutesOfDay / 60, clock.minutesOfDay % 60);
+    std::snprintf(buffer, sizeof(buffer), "%02d:%02d", minutes / 60, minutes % 60);
     return buffer;
   }
 
   return value.size() > 5 ? value.substr(0, 5) : value;
 }
 
-int currentProgramIndex(const EpgPage &page) {
+struct EpgProgramMatch {
+  int index = -1;
+  EpgTimeInterpretation interpretation = EpgTimeInterpretation::Exact;
+};
+
+int currentProgramIndexForInterpretation(const EpgPage &page, EpgTimeInterpretation interpretation, const Channel *channel = nullptr) {
   if (page.programs.empty()) {
     return -1;
   }
 
-  const std::time_t now = std::time(nullptr);
+  const std::vector<std::size_t> candidates = epgCandidateIndicesForChannel(page, channel);
+  if (candidates.empty()) {
+    return -1;
+  }
+
+  const std::time_t now = currentUnixTime();
   bool anyTimed = false;
 
-  for (std::size_t i = 0; i < page.programs.size(); ++i) {
-    const ResolvedEpgRange range = resolveEpgRangeForNow(page.programs[i], now, &page, i);
+  for (std::size_t i : candidates) {
+    const ResolvedEpgRange range = resolveEpgRangeForNow(page.programs[i], now, &page, i, interpretation);
     anyTimed = anyTimed || range.hasAnyTime;
 
     // Match against the resolved full timestamp, not just HH:mm. Full dated EPG
-    // values must overlap the current date/time. Clock-only ranges are anchored
-    // to the current local service date, with midnight-crossing handled.
+    // values must overlap the current date/time, and the programme must belong
+    // to the focused channel when the EPG response carries channel IDs/names.
     if (range.validRange && now >= range.start && now < range.stop) {
       return static_cast<int>(i);
     }
@@ -676,12 +1001,43 @@ int currentProgramIndex(const EpgPage &page) {
   // Example: at 10:46, a clock-only 03:00-05:00 programme is a valid timed range
   // from today, but it is not current, so the UI must show unavailable instead
   // of presenting it as NOW.
-  return anyTimed ? -1 : 0;
+  return anyTimed ? -1 : static_cast<int>(candidates.front());
 }
 
-std::string formatEpgRange(const EpgProgram &program) {
-  const std::string start = formatEpgClock(program.start);
-  const std::string stop = formatEpgClock(program.stop);
+EpgProgramMatch currentProgramMatch(const EpgPage &page, const Channel *channel = nullptr) {
+  EpgProgramMatch match;
+  match.index = currentProgramIndexForInterpretation(page, EpgTimeInterpretation::Exact, channel);
+
+  // Keep one canonical timeline. XMLTV timestamps such as
+  // 20260608211500 -0300 already describe an absolute instant. Reinterpreting
+  // the same date+clock as local wall-clock can pair the display range from one
+  // interpretation with a title from another slot/channel.
+  match.interpretation = EpgTimeInterpretation::Exact;
+  return match;
+}
+
+int currentProgramIndex(const EpgPage &page, const Channel *channel = nullptr) {
+  return currentProgramMatch(page, channel).index;
+}
+
+int nextProgramIndexAfter(const EpgPage &page, int currentIndex, const Channel *channel = nullptr) {
+  if (currentIndex < 0) {
+    return -1;
+  }
+
+  const std::vector<std::size_t> candidates = epgCandidateIndicesForChannel(page, channel);
+  for (std::size_t i : candidates) {
+    if (static_cast<int>(i) > currentIndex) {
+      return static_cast<int>(i);
+    }
+  }
+
+  return -1;
+}
+
+std::string formatEpgRange(const EpgProgram &program, EpgTimeInterpretation interpretation = EpgTimeInterpretation::Exact) {
+  const std::string start = formatEpgClock(program.start, interpretation);
+  const std::string stop = formatEpgClock(program.stop, interpretation);
 
   if (start == "--:--" && stop == "--:--") {
     return "";
@@ -881,6 +1237,7 @@ App::App() : api_(loadConfig()), player_(createPlayerBackend()) {
   loadFavoritesForActivePlaylist();
 
   const PlaylistConfig *playlist = activePlaylist();
+  setRuntimeEpgOffsetMinutes(playlist ? playlist->epgOffsetMinutes : 0);
 
   if (playlist) {
     startPlaylistLoad(*playlist);
@@ -1065,7 +1422,59 @@ void App::handle(Button button) {
       break;
     }
     case ScreenId::Settings:
-      if (button == Button::Back || button == Button::Select) state_.screen = ScreenId::Dashboard;
+      if (button == Button::Back || button == Button::Select) {
+        state_.screen = ScreenId::Dashboard;
+        break;
+      }
+
+      {
+        const int settingsViewportHeight = 412;
+        const int settingsContentHeight = 558;
+        const int settingsScrollStep = 38;
+        const int maxSettingsScroll = std::max(0, settingsContentHeight - settingsViewportHeight);
+
+        if (button == Button::Up) {
+          state_.settingsScroll = std::max(0, state_.settingsScroll - settingsScrollStep);
+          break;
+        }
+        if (button == Button::Down) {
+          state_.settingsScroll = std::min(maxSettingsScroll, state_.settingsScroll + settingsScrollStep);
+          break;
+        }
+      }
+
+      if (button == Button::Left || button == Button::Right ||
+          button == Button::ShoulderLeft || button == Button::ShoulderRight ||
+          button == Button::FavoriteToggle) {
+        const PlaylistConfig *active = activePlaylist();
+        if (!active) {
+          state_.message = "No active playlist";
+          break;
+        }
+
+        for (PlaylistConfig &playlist : state_.config.playlists) {
+          if (playlist.id != active->id) {
+            continue;
+          }
+
+          if (button == Button::FavoriteToggle) {
+            playlist.epgOffsetMinutes = 0;
+          } else {
+            const int step = (button == Button::ShoulderLeft || button == Button::ShoulderRight) ? 60 : 30;
+            playlist.epgOffsetMinutes += (button == Button::Left || button == Button::ShoulderLeft) ? -step : step;
+            playlist.epgOffsetMinutes = std::max(-12 * 60, std::min(12 * 60, playlist.epgOffsetMinutes));
+          }
+
+          saveConfig(state_.config);
+          setRuntimeEpgOffsetMinutes(playlist.epgOffsetMinutes);
+          state_.epgByChannel.clear();
+          state_.currentEpgAvailable = false;
+          state_.message = "EPG offset: " + formatEpgOffsetMinutes(playlist.epgOffsetMinutes);
+          loadVisibleEpgForChannelList();
+          loadSelectedEpg(false, false);
+          break;
+        }
+      }
       break;
     case ScreenId::Playlists:
       state_.screen = ScreenId::AddPlaylist;
@@ -1651,6 +2060,7 @@ void App::handleAddPlaylist(Button button) {
 
     if (state_.selectedAddOption == settingsIndex) {
       state_.screen = ScreenId::Settings;
+      state_.settingsScroll = 0;
       return;
     }
 
@@ -1724,6 +2134,8 @@ void App::activatePlaylist(int index) {
 
   PlaylistConfig playlist = state_.config.playlists[static_cast<std::size_t>(index)];
   state_.config.activePlaylistId = playlist.id;
+  setRuntimeEpgOffsetMinutes(playlist.epgOffsetMinutes);
+  state_.epgByChannel.clear();
   saveConfig(state_.config);
 
   /*
@@ -1745,6 +2157,7 @@ bool App::playlistLoadActive() const {
 
 void App::startPlaylistLoad(const PlaylistConfig &playlist, bool forceRefresh) {
   updatePlaylistLoad();
+  setRuntimeEpgOffsetMinutes(playlist.epgOffsetMinutes);
 
   {
     std::lock_guard<std::mutex> lock(playlistLoadMutex_);
@@ -2152,6 +2565,7 @@ void App::deletePlaylist(int index) {
   state_.message = "Playlist deleted: " + removed.name;
 
   const PlaylistConfig *playlist = activePlaylist();
+  setRuntimeEpgOffsetMinutes(playlist ? playlist->epgOffsetMinutes : 0);
 
   if (playlist) {
     startPlaylistLoad(*playlist);
@@ -2546,7 +2960,7 @@ void App::loadSelectedEpg(bool force, bool fetchRemote) {
 
   const EpgPage *memoryPage = cachedEpgForChannel(*channel);
   if (!force && memoryPage) {
-    state_.currentEpgAvailable = currentProgramIndex(*memoryPage) >= 0;
+    state_.currentEpgAvailable = currentProgramIndex(*memoryPage, channel) >= 0;
     if ((state_.currentEpgAvailable && epgPageHasDatedTimes(*memoryPage)) || !fetchRemote) {
       return;
     }
@@ -2557,7 +2971,7 @@ void App::loadSelectedEpg(bool force, bool fetchRemote) {
     for (const std::string &alias : channelEpgKeys(*channel)) {
       state_.epgByChannel[alias] = cached;
     }
-    state_.currentEpgAvailable = currentProgramIndex(cached) >= 0;
+    state_.currentEpgAvailable = currentProgramIndex(cached, channel) >= 0;
     if ((state_.currentEpgAvailable && epgPageHasDatedTimes(cached)) || !fetchRemote) {
       return;
     }
@@ -2572,11 +2986,12 @@ void App::loadSelectedEpg(bool force, bool fetchRemote) {
     const PlaylistConfig *playlist = activePlaylist();
     const std::string manualEpgUrl = playlist && playlist->provider == Provider::M3u ? playlist->epgUrl : "";
     std::printf("[KBORE] loading selected EPG channel='%s' provider='%s' key='%s' remote=%s\n", channel->name.c_str(), toString(state_.manifest.provider).c_str(), key.c_str(), fetchRemote ? "yes" : "no");
-    EpgPage epg = api_.loadEpgPrograms(state_.manifest.source, state_.manifest.provider, *channel, 1, 48, manualEpgUrl);
+    const int epgOffsetMinutes = playlist ? playlist->epgOffsetMinutes : 0;
+    EpgPage epg = api_.loadEpgPrograms(state_.manifest.source, state_.manifest.provider, *channel, 1, 48, manualEpgUrl, epgOffsetMinutes);
     for (const std::string &alias : channelEpgKeys(*channel)) {
       state_.epgByChannel[alias] = epg;
     }
-    state_.currentEpgAvailable = currentProgramIndex(epg) >= 0;
+    state_.currentEpgAvailable = currentProgramIndex(epg, channel) >= 0;
     saveEpgPage(state_.manifest.id, *channel, epg);
   } catch (const std::exception &ex) {
     std::printf("[KBORE] loadSelectedEpg failed: %s\n", ex.what());
@@ -2601,7 +3016,7 @@ void App::loadEpgForChannels(const std::vector<Channel> &channels) {
 
     const std::string key = channelEpgKey(channel);
     const EpgPage *memoryPage = cachedEpgForChannel(channel);
-    if (memoryPage && currentProgramIndex(*memoryPage) >= 0 && epgPageHasDatedTimes(*memoryPage)) {
+    if (memoryPage && currentProgramIndex(*memoryPage, &channel) >= 0 && epgPageHasDatedTimes(*memoryPage)) {
       continue;
     }
 
@@ -2610,7 +3025,7 @@ void App::loadEpgForChannels(const std::vector<Channel> &channels) {
       for (const std::string &alias : channelEpgKeys(channel)) {
         state_.epgByChannel[alias] = cached;
       }
-      if (currentProgramIndex(cached) >= 0 && epgPageHasDatedTimes(cached)) {
+      if (currentProgramIndex(cached, &channel) >= 0 && epgPageHasDatedTimes(cached)) {
         continue;
       }
     }
@@ -2624,6 +3039,7 @@ void App::loadEpgForChannels(const std::vector<Channel> &channels) {
 
   const PlaylistConfig *playlist = activePlaylist();
   const std::string manualEpgUrl = playlist && playlist->provider == Provider::M3u ? playlist->epgUrl : "";
+  const int epgOffsetMinutes = playlist ? playlist->epgOffsetMinutes : 0;
   std::vector<EpgJob> jobs;
 
   for (const Channel &channel : missing) {
@@ -2650,7 +3066,8 @@ void App::loadEpgForChannels(const std::vector<Channel> &channels) {
       state_.manifest.source,
       state_.manifest.provider,
       manualEpgUrl,
-      48
+      48,
+      epgOffsetMinutes
     });
   }
 
@@ -2775,7 +3192,8 @@ void App::epgWorkerLoop() {
         job.channel,
         1,
         job.pageSize,
-        job.manualEpgUrl
+        job.manualEpgUrl,
+        job.epgOffsetMinutes
       );
       saveEpgPage(job.manifestId, job.channel, epg);
       std::printf("[KBORE] EPG loaded for channel='%s': %zu program(s)\n", job.channel.name.c_str(), epg.programs.size());
@@ -2809,7 +3227,7 @@ void App::drainFinishedEpg() {
     }
 
     if (result.key == state_.currentEpgKey) {
-      state_.currentEpgAvailable = currentProgramIndex(result.page) >= 0;
+      state_.currentEpgAvailable = currentProgramIndex(result.page, &result.channel) >= 0;
     }
   }
 }
@@ -2826,13 +3244,13 @@ std::string App::epgLineForChannel(const Channel &channel) const {
     return key == state_.currentEpgKey ? "EPG unavailable" : "EPG not loaded";
   }
 
-  const int index = currentProgramIndex(*page);
-  if (index < 0) {
+  const EpgProgramMatch match = currentProgramMatch(*page, &channel);
+  if (match.index < 0) {
     return "EPG unavailable";
   }
 
-  const EpgProgram &program = page->programs[static_cast<std::size_t>(index)];
-  const std::string timeRange = formatEpgRange(program);
+  const EpgProgram &program = page->programs[static_cast<std::size_t>(match.index)];
+  const std::string timeRange = formatEpgRange(program, match.interpretation);
 
   if (!timeRange.empty()) {
     return timeRange + "  " + program.title;
@@ -2853,25 +3271,26 @@ std::string App::epgNowNextLine(const Channel &channel) const {
   }
 
   const EpgPage &page = *cachedPage;
-  const int nowIndex = currentProgramIndex(page);
-  if (nowIndex < 0) {
+  const EpgProgramMatch nowMatch = currentProgramMatch(page, &channel);
+  if (nowMatch.index < 0) {
     return "EPG unavailable for this channel";
   }
 
+  const int nowIndex = nowMatch.index;
   const EpgProgram &now = page.programs[static_cast<std::size_t>(nowIndex)];
 
   std::string line = "NOW ";
-  const std::string nowRange = formatEpgRange(now);
+  const std::string nowRange = formatEpgRange(now, nowMatch.interpretation);
   if (!nowRange.empty()) {
     line += nowRange + " ";
   }
   line += now.title;
 
-  const std::size_t nextIndex = static_cast<std::size_t>(nowIndex + 1);
-  if (nextIndex < page.programs.size()) {
-    const EpgProgram &next = page.programs[nextIndex];
+  const int nextIndex = nextProgramIndexAfter(page, nowIndex, &channel);
+  if (nextIndex >= 0) {
+    const EpgProgram &next = page.programs[static_cast<std::size_t>(nextIndex)];
     line += "\nNEXT ";
-    const std::string nextRange = formatEpgRange(next);
+    const std::string nextRange = formatEpgRange(next, nowMatch.interpretation);
     if (!nextRange.empty()) {
       line += nextRange + " ";
     }
@@ -4814,27 +5233,62 @@ void App::renderSettingsGraphic() {
   const Color panelBottom = rgb(7, 11, 22);
 
   gfx_.fillVerticalGradient(0, 0, Graphics::Width, Graphics::Height, rgb(7, 11, 22), rgb(2, 5, 11));
-  gfx_.drawImageFileCentered("romfs:/logo/logo-horizontal.png", 34, 34, 300, 72);
-  gfx_.drawText("SETTINGS / ABOUT", 80, 120, 5, text, true);
-  gfx_.drawText("CONFIG: " + Graphics::fitText(configPath(), 72), 80, 158, 2, muted, false);
+  gfx_.drawImageFileCentered("romfs:/logo/logo-horizontal.png", 34, 28, 300, 72);
+  gfx_.drawText("SETTINGS / ABOUT", 80, 104, 5, text, true);
+  gfx_.drawText("CONFIG: " + Graphics::fitText(configPath(), 80), 80, 142, 2, muted, false);
 
-  Rect about{80, 205, 1120, 365};
-  gfx_.fillVerticalGradient(about.x, about.y, about.w, about.h, panelTop, panelBottom);
-  gfx_.strokeRoundRect(about.x, about.y, about.w, about.h, 18, rgba(72, 92, 128, 55), 1);
+  Rect panel{64, 180, 1152, 452};
+  gfx_.fillVerticalGradient(panel.x, panel.y, panel.w, panel.h, panelTop, panelBottom);
+  gfx_.strokeRoundRect(panel.x, panel.y, panel.w, panel.h, 18, rgba(72, 92, 128, 55), 1);
 
-  gfx_.drawText("ABOUT KBORE", about.x + 34, about.y + 28, 4, text, true);
-  gfx_.drawText("Kboré is an IPTV/VOD player for user-provided playlists.", about.x + 34, about.y + 76, 2, muted, false);
-  gfx_.drawText("The app does not provide playlists, channels, movies, series or IPTV servers.", about.x + 34, about.y + 106, 2, muted, false);
-  gfx_.drawText("Kboré does not endorse, host, sponsor or verify any IPTV provider/server.", about.x + 34, about.y + 136, 2, muted, false);
-  gfx_.drawText("All content, playlist URLs, credentials and playback sources are the user's responsibility.", about.x + 34, about.y + 166, 2, muted, false);
+  const int viewportTop = panel.y + 18;
+  const int viewportBottom = panel.y + panel.h - 22;
+  const int contentX = panel.x + 34;
+  const int scroll = std::max(0, state_.settingsScroll);
 
-  gfx_.drawText("THIRD-PARTY LIBRARIES", about.x + 34, about.y + 220, 3, blue, true);
-  gfx_.drawText("Thanks to the open-source projects and third-party libraries used by this app,", about.x + 34, about.y + 256, 2, muted, false);
-  gfx_.drawText("including devkitPro/libnx, FFmpeg, Deko3D, SDL/cURL and related dependencies.", about.x + 34, about.y + 286, 2, muted, false);
-  gfx_.drawText("Thank you for using and supporting Kboré.", about.x + 34, about.y + 326, 2, text, true);
-  gfx_.drawText("Developed by Gilson Santos / https://github.com/devgsantos", about.x + 34, about.y + 356, 2, text, true);
+  auto drawLine = [&](const std::string &line, int baseY, int scale, Color color, bool bold) {
+    const int y = baseY - scroll;
+    const int height = (scale == 4 ? 30 : (scale == 3 ? 24 : 18));
+    if (y + height < viewportTop || y > viewportBottom) {
+      return;
+    }
+    gfx_.drawText(line, contentX, y, scale, color, bold);
+  };
 
-  gfx_.drawText("A / B  BACK", 80, 632, 3, muted, true);
+  const PlaylistConfig *playlist = activePlaylist();
+  const int epgOffset = playlist ? playlist->epgOffsetMinutes : 0;
+
+  int y = panel.y + 26;
+  drawLine("EPG TIME OFFSET", y, 4, blue, true); y += 42;
+  drawLine("Active playlist: " + Graphics::fitText(activePlaylistName(), 48), y, 2, muted, false); y += 28;
+  drawLine("Current offset: " + formatEpgOffsetMinutes(epgOffset), y, 3, text, true); y += 30;
+  drawLine("Applied before EPG matching and on-screen display.", y, 2, muted, false); y += 28;
+  drawLine("LEFT/RIGHT = 30 min", y, 2, muted, false); y += 26;
+  drawLine("L/R = 1 hour    Y = reset", y, 2, muted, false); y += 42;
+
+  drawLine("ABOUT KBORE", y, 4, text, true); y += 42;
+  drawLine("Kboré is an IPTV/VOD player for user-provided playlists.", y, 2, muted, false); y += 28;
+  drawLine("The app does not provide playlists, channels, movies, series or servers.", y, 2, muted, false); y += 28;
+  drawLine("Kboré does not endorse, host, sponsor or verify IPTV providers.", y, 2, muted, false); y += 28;
+  drawLine("All playlist URLs, credentials and playback sources are the user's responsibility.", y, 2, muted, false); y += 42;
+
+  drawLine("THIRD-PARTY LIBRARIES", y, 4, text, true); y += 42;
+  drawLine("Built with devkitPro/libnx, FFmpeg, Deko3D, SDL, cURL and related libraries.", y, 2, muted, false); y += 28;
+  drawLine("Thank you for using and supporting Kboré.", y, 2, text, true); y += 28;
+  drawLine("Developed by Gilson Santos", y, 2, text, true); y += 28;
+  drawLine("github.com/devgsantos", y, 2, blue, true); y += 20;
+
+  const int settingsViewportHeight = 412;
+  const int settingsContentHeight = 558;
+  const int maxSettingsScroll = std::max(0, settingsContentHeight - settingsViewportHeight);
+  if (state_.settingsScroll > 0) {
+    gfx_.drawText("^ MORE", panel.x + panel.w - 120, panel.y + 18, 2, blue, true);
+  }
+  if (state_.settingsScroll < maxSettingsScroll) {
+    gfx_.drawText("v MORE", panel.x + panel.w - 120, panel.y + panel.h - 32, 2, blue, true);
+  }
+
+  gfx_.drawText("UP/DOWN SCROLL    A / B BACK    LEFT/RIGHT/L/R ADJUST OFFSET    Y RESET", 64, 660, 2, muted, true);
 }
 
 

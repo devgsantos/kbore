@@ -126,6 +126,7 @@ static PlaylistConfig playlistFromJson(const Json &json, int index) {
   playlist.serverUrl = trimTrailingSlash(json["server_url"].asString(json["serverUrl"].asString("")));
   playlist.username = json["username"].asString("");
   playlist.password = json["password"].asString("");
+  playlist.epgOffsetMinutes = json["epg_offset_minutes"].asInt(json["epgOffsetMinutes"].asInt(0));
 
   // Compatibility: old xtream source stored as source/url.
   if (playlist.provider == Provider::Xtream && playlist.serverUrl.empty()) {
@@ -148,10 +149,16 @@ static Json playlistToJson(const PlaylistConfig &playlist, const std::string &ac
     if (!playlist.epgUrl.empty()) {
       json["epg_url"] = playlist.epgUrl;
     }
+    if (playlist.epgOffsetMinutes != 0) {
+      json["epg_offset_minutes"] = playlist.epgOffsetMinutes;
+    }
   } else if (playlist.provider == Provider::Xtream) {
     json["server_url"] = playlist.serverUrl;
     json["username"] = playlist.username;
     json["password"] = playlist.password;
+    if (playlist.epgOffsetMinutes != 0) {
+      json["epg_offset_minutes"] = playlist.epgOffsetMinutes;
+    }
   }
 
   return json;
