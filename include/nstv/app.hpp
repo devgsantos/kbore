@@ -59,6 +59,7 @@ struct AppState {
   int selectedCategory = 0;
   int selectedChannel = 0;
   int selectedAddOption = 0;
+  int settingsScroll = 0;
 
   std::set<std::string> favoriteIds;
   std::vector<Channel> favoriteChannels;
@@ -95,6 +96,7 @@ private:
     Provider provider = Provider::M3u;
     std::string manualEpgUrl;
     int pageSize = 48;
+    int epgOffsetMinutes = 0;
   };
 
   struct EpgResult {
