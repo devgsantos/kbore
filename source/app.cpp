@@ -4046,22 +4046,44 @@ void App::renderDashboardGraphic() {
     !state_.loadedCategoryKey.empty() &&
     state_.channelListLoadingKey == state_.loadedCategoryKey;
 
-  // Stream type cards -------------------------------------------------------
-  int typeY = typesPanel.y + 70;
-  for (int i=0; i<std::min(4, (int)types.size()); ++i) {
-    const auto &t = types[i];
-    const bool selected = i == state_.selectedType;
+  // Stream type/root cards --------------------------------------------------
+  // The left root/type panel has room for four cards plus the connection
+  // footer. Since Favorites adds a fifth root, render a sliding window around
+  // selectedType instead of hard-limiting the panel to the first four entries.
+  const int typeRows = 4;
+  const int typeStart = windowStart(
+    state_.selectedType,
+    static_cast<int>(types.size()),
+    typeRows
+  );
+  const int typeY = typesPanel.y + 70;
+
+  for (int row = 0; row < typeRows; ++row) {
+    const int index = typeStart + row;
+    if (index >= static_cast<int>(types.size())) {
+      break;
+    }
+
+    const auto &t = types[static_cast<std::size_t>(index)];
+    const bool selected = index == state_.selectedType;
     Color base = typeColor(toString(t.id));
-    int y = typeY + i * 74;
+    int y = typeY + row * 74;
     gfx_.fillHorizontalGradient(typesPanel.x + 14, y, typesPanel.w - 28, 64, rgba(base.r,base.g,base.b, selected?110:55), rgba(12,18,34, selected?245:210));
     gfx_.fillRoundRect(typesPanel.x + 14, y, typesPanel.w - 28, 64, 13, rgba(0,0,0,0));
     gfx_.strokeRoundRect(typesPanel.x + 14, y, typesPanel.w - 28, 64, 13, selected ? brightBlue : rgba(72,92,128,24), selected ? 3 : 1);
     gfx_.drawIconBox(toString(t.id), typesPanel.x + 26, y + 10, 44, lighten(base,25), darken(base,30), text);
     gfx_.drawText(Graphics::fitText(t.label, 12), typesPanel.x + 82, y + 15, 3, text, true);
-    // Stream types sub label
-    // std::string sub = t.id == StreamType::Live ? "LIVE CHANNELS" : (t.id == StreamType::Movies ? "MOVIES" : (t.id == StreamType::Series ? "SERIES" : "RADIOS"));
-    // gfx_.drawText(sub, typesPanel.x + 82, y + 42, 2, muted, false);
     if (t.totalChannels > 0) gfx_.drawBadge(std::to_string(t.totalChannels), typesPanel.x + typesPanel.w - 68, y + 21, 42, 24, rgba(30,41,59,210), text);
+  }
+
+  if (static_cast<int>(types.size()) > typeRows) {
+    if (typeStart > 0) {
+      gfx_.drawTextRight("^", typesPanel.x + typesPanel.w - 24, typesPanel.y + 50, 2, muted, true);
+    }
+
+    if (typeStart + typeRows < static_cast<int>(types.size())) {
+      gfx_.drawTextRight("v", typesPanel.x + typesPanel.w - 24, typesPanel.y + typesPanel.h - 88, 2, muted, true);
+    }
   }
 
   int cy = typesPanel.y + typesPanel.h - 74;
