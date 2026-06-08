@@ -6,6 +6,7 @@
 #include <fstream>
 #include <functional>
 #include <sstream>
+#include <set>
 #include <thread>
 #include <chrono>
 #include <vector>
@@ -54,10 +55,12 @@ static void ensureDataDir() {
   mkdir("sdmc:/switch/kbore", 0777);
   mkdir("sdmc:/switch/kbore/cache", 0777);
   mkdir("sdmc:/switch/kbore/manifests", 0777);
+  mkdir("sdmc:/switch/kbore/favorites", 0777);
 #else
   mkdir(".", 0777);
   mkdir("./cache", 0777);
   mkdir("./manifests", 0777);
+  mkdir("./favorites", 0777);
 #endif
 }
 
@@ -924,6 +927,120 @@ bool loadNodeChildrenPage(
     page = nodeChildrenPageFromJson(Json::parse(ss.str()));
     return true;
   } catch (...) {
+    return false;
+  }
+}
+
+std::string favoritesDir() {
+  return dataDir() + "/favorites";
+}
+
+std::string favoritesPathForPlaylist(const std::string &playlistId) {
+  return favoritesDir() + "/" + safeFilePart(playlistId.empty() ? "active" : playlistId) + ".json";
+}
+
+static Json favoriteChannelToJson(const Channel &channel) {
+  Json json(Json::object_t{});
+  json["favorite_id"] = channel.id;
+  json["id"] = channel.id;
+  json["name"] = channel.name;
+  json["url"] = channel.url;
+  json["logo"] = channel.logo;
+  json["group"] = channel.group;
+  json["groupId"] = channel.groupId;
+  json["tvgId"] = channel.tvgId;
+  json["tvgName"] = channel.tvgName;
+  json["streamId"] = channel.streamId;
+  json["type"] = toString(channel.type);
+  return json;
+}
+
+static Channel favoriteChannelFromJson(const Json &json) {
+  Channel channel;
+  channel.id = json["favorite_id"].asString(json["id"].asString(""));
+  channel.name = json["name"].asString(json["title"].asString("Untitled"));
+  channel.url = json["url"].asString(json["playbackUrl"].asString(""));
+  channel.logo = json["logo"].asString(json["stream_icon"].asString(json["cover"].asString("")));
+  channel.group = json["group"].asString(json["category"].asString(""));
+  channel.groupId = json["groupId"].asString(json["categoryId"].asString(json["category_id"].asString("")));
+  channel.tvgId = json["tvgId"].asString(json["tvg-id"].asString(json["epgChannelId"].asString("")));
+  channel.tvgName = json["tvgName"].asString(json["tvg-name"].asString(channel.name));
+  if (json["streamId"].isString()) {
+    channel.streamId = json["streamId"].asString("");
+  } else {
+    int parsedStreamId = json["streamId"].asInt(json["stream_id"].asInt(0));
+    channel.streamId = parsedStreamId > 0 ? std::to_string(parsedStreamId) : "";
+  }
+  channel.type = streamTypeFromString(json["type"].asString(json["streamType"].asString("live")));
+  return channel;
+}
+
+bool saveFavoritesForPlaylist(const std::string &playlistId, const std::vector<Channel> &favorites) {
+  ensureDataDir();
+
+  Json::array_t items;
+  for (const Channel &channel : favorites) {
+    if (channel.url.empty()) {
+      continue;
+    }
+    items.push_back(favoriteChannelToJson(channel));
+  }
+
+  Json root(Json::object_t{});
+  root["version"] = 1;
+  root["playlist_id"] = playlistId;
+  root["items"] = Json(items);
+
+  std::ofstream file(favoritesPathForPlaylist(playlistId), std::ios::binary);
+  if (!file) return false;
+
+  file << root.stringify();
+  return true;
+}
+
+bool loadFavoritesForPlaylist(const std::string &playlistId, std::vector<Channel> &favorites) {
+  favorites.clear();
+
+  std::ifstream file(favoritesPathForPlaylist(playlistId), std::ios::binary);
+  if (!file) return false;
+
+  std::ostringstream ss;
+  ss << file.rdbuf();
+
+  try {
+    Json parsed = Json::parse(ss.str());
+    const Json *itemsJson = &parsed;
+
+    if (parsed.isObject() && parsed["items"].isArray()) {
+      itemsJson = &parsed["items"];
+    }
+
+    if (!itemsJson->isArray()) {
+      return false;
+    }
+
+    std::set<std::string> seen;
+    for (const Json &item : itemsJson->asArray()) {
+      Channel channel = favoriteChannelFromJson(item);
+      if (channel.url.empty()) {
+        continue;
+      }
+      if (channel.id.empty()) {
+        channel.id = channel.type == StreamType::Live
+          ? (channel.tvgId.empty() ? channel.streamId : channel.tvgId)
+          : channel.name;
+      }
+      const std::string key = channel.id.empty() ? channel.url : channel.id;
+      if (seen.count(key)) {
+        continue;
+      }
+      seen.insert(key);
+      favorites.push_back(channel);
+    }
+
+    return true;
+  } catch (...) {
+    favorites.clear();
     return false;
   }
 }

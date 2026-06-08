@@ -45,7 +45,8 @@ public:
     const Channel &channel,
     int page = 1,
     int pageSize = 12,
-    const std::string &manualEpgUrl = ""
+    const std::string &manualEpgUrl = "",
+    int epgOffsetMinutes = 0
   ) const;
 
 private:

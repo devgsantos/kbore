@@ -90,4 +90,9 @@ bool loadNodeChildrenPage(
   NodeChildrenPage &page
 );
 
+std::string favoritesDir();
+std::string favoritesPathForPlaylist(const std::string &playlistId);
+bool saveFavoritesForPlaylist(const std::string &playlistId, const std::vector<Channel> &favorites);
+bool loadFavoritesForPlaylist(const std::string &playlistId, std::vector<Channel> &favorites);
+
 } // namespace nstv

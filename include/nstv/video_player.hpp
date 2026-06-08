@@ -29,6 +29,8 @@ public:
     return yuvFrame_.valid() || frame_.valid();
   }
 
+  bool isAudioOnly() const override { return audioOnlyMode_; }
+
   const Bitmap &frame() const override { return frame_; }
   const YuvFrame &yuvFrame() const override { return yuvFrame_; }
 
@@ -47,6 +49,7 @@ private:
   int64_t durationMs_ = 0;
   int64_t startTimeMs_ = 0;
   int64_t currentPositionMs_ = 0;
+  bool audioOnlyMode_ = false;
 
 #ifdef NSTV_USE_FFMPEG
   struct Impl;

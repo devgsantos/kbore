@@ -661,6 +661,7 @@ bool NativeHwPlayerBackend::open(const std::string &url) {
   nativeRendererFailed_ = false;
   nativeFramePresented_ = false;
   nativeRendererStatus_.clear();
+  audioOnlyMode_ = false;
   resetClock();
 
   auto failOpen = [this](const std::string &message) -> bool {
@@ -679,6 +680,26 @@ bool NativeHwPlayerBackend::open(const std::string &url) {
 #else
   if (!demuxer_.open(url)) {
     return failOpen(demuxer_.error());
+  }
+
+  if (!demuxer_.video().exists && demuxer_.audio().exists) {
+    audioOnlyMode_ = true;
+
+    if (!decoder_.openAudio(demuxer_)) {
+      return failOpen(decoder_.error());
+    }
+
+    decoder_.startAudio();
+    error_.clear();
+    open_ = true;
+
+    logLinef(
+      "[KBORE][PLAYBACK][AUDIO_ONLY] playing audio with static radio background url=%s decoder=%s",
+      url.c_str(),
+      decoder_.summary().c_str()
+    );
+
+    return true;
   }
 
   if (!hwProbe_.probeVideo(demuxer_)) {
@@ -847,6 +868,7 @@ void NativeHwPlayerBackend::close() {
   nativeRendererReady_ = false;
   nativeRendererFailed_ = false;
   nativeFramePresented_ = false;
+  audioOnlyMode_ = false;
   nativeRendererStatus_.clear();
   resetClock();
 }
@@ -949,6 +971,21 @@ bool NativeHwPlayerBackend::update() {
 #else
   if (!open_ || paused_) {
     return hasFrame();
+  }
+
+  if (audioOnlyMode_) {
+    // Keep audio-only streams fed without touching video timing or frame pacing.
+    if (decoder_.audioQueuedMs() < 420) {
+#ifdef NSTV_USE_FFMPEG
+      if (!decoder_.decodeAudioOnly(demuxer_, 128)) {
+        error_ = decoder_.error();
+        return false;
+      }
+#endif
+    }
+
+    error_.clear();
+    return true;
   }
 
   const long long now = nowMs();
@@ -1196,7 +1233,7 @@ void NativeHwPlayerBackend::togglePause() {
 }
 
 bool NativeHwPlayerBackend::canSeek() const {
-  return open_ && demuxer_.canSeek() && durationMs() > 0;
+  return open_ && !audioOnlyMode_ && demuxer_.canSeek() && durationMs() > 0;
 }
 
 int64_t NativeHwPlayerBackend::durationMs() const {

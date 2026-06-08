@@ -59,8 +59,12 @@ struct AppState {
   int selectedCategory = 0;
   int selectedChannel = 0;
   int selectedAddOption = 0;
+  int settingsScroll = 0;
 
-  std::set<std::string> favorites;
+  std::set<std::string> favoriteIds;
+  std::vector<Channel> favoriteChannels;
+  MediaNode favoritesRootNode;
+  TypeGroup favoritesTypeGroup;
   std::string message;
   bool loading = false;
   std::string loadingMessage;
@@ -91,7 +95,8 @@ private:
     std::string source;
     Provider provider = Provider::M3u;
     std::string manualEpgUrl;
-    int pageSize = 4;
+    int pageSize = 48;
+    int epgOffsetMinutes = 0;
   };
 
   struct EpgResult {
@@ -204,6 +209,13 @@ private:
   Channel channelFromNode(const MediaNode &node) const;
   void enterNode(const MediaNode &node, int childIndex);
   void playNode(const MediaNode &node);
+  void loadFavoritesForActivePlaylist();
+  void rebuildFavoritesNode();
+  std::string favoriteIdForChannel(const Channel &channel) const;
+  bool isFavorite(const Channel &channel) const;
+  bool toggleFavorite(const Channel &channel);
+  bool selectedTypeIsFavorites() const;
+  bool favoritesRootSelected() const;
   std::string breadcrumbText() const;
 
   template <typename T, typename LabelFn>

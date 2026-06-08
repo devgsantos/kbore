@@ -21,6 +21,11 @@ struct PlaylistConfig {
   std::string username;
   std::string password;
 
+  // Manual EPG time correction for providers whose EPG data is shifted.
+  // Applied in minutes to programme start/stop timestamps before matching/display.
+  // Example: if programmes appear 7 hours late, use -420.
+  int epgOffsetMinutes = 0;
+
   std::string sourceUrl() const;
 };
 

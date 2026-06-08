@@ -410,6 +410,7 @@ Color typeColor(const std::string &type) {
   if (type == "movies") return rgb(126, 34, 206);
   if (type == "series") return rgb(13, 148, 136);
   if (type == "radio") return rgb(194, 65, 12);
+  if (type == "favorites") return rgb(20, 132, 255);
   return rgb(37, 99, 235);
 }
 
@@ -731,6 +732,18 @@ void Graphics::drawHeaderIcon(const std::string &name, int x, int y, int size, C
   if (name == "movies") { fillCircle(x+size/2,y+size/2,size/3,color); fillCircle(x+size/2,y+size/2,size/10,rgb(30,20,60)); return; }
   if (name == "series") { strokeRoundRect(x+size/5,y+size/4,size*3/5,size/2,size/14,color,std::max(2,size/18)); fillRect(x+size/4,y+size/2,size/2,std::max(2,size/12),color); return; }
   if (name == "radio") { strokeRoundRect(x+size/5,y+size/3,size*3/5,size/3,size/12,color,std::max(2,size/18)); drawLine(x+size/4,y+size/3,x+size*3/4,y+size/8,color,std::max(2,size/18)); return; }
+  if (name == "favorites") {
+    int t = std::max(3, size / 9);
+    int cx = x + size / 2;
+    int cy = y + size / 2;
+    fillCircle(x + size * 38 / 100, y + size * 38 / 100, std::max(4, size / 7), color);
+    fillCircle(x + size * 62 / 100, y + size * 38 / 100, std::max(4, size / 7), color);
+    drawLine(x + size * 28 / 100, y + size * 42 / 100, cx, y + size * 73 / 100, color, t);
+    drawLine(x + size * 72 / 100, y + size * 42 / 100, cx, y + size * 73 / 100, color, t);
+    drawLine(x + size * 35 / 100, y + size * 34 / 100, cx, cy, color, t);
+    drawLine(x + size * 65 / 100, y + size * 34 / 100, cx, cy, color, t);
+    return;
+  }
 }
 
 void Graphics::drawLogoPlaceholder(const std::string &name, const std::string &logoUrl, int x, int y, int w, int h) {

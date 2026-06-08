@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <iostream>
 #include <thread>
 #include <chrono>
@@ -24,6 +25,7 @@ namespace nstv {
 
 #ifdef __SWITCH__
 static PadState pad;
+static bool mediaPlaybackActive = false;
 #endif
 
 void platformInit() {
@@ -39,9 +41,125 @@ void platformInit() {
 
 void platformExit() {
 #ifdef __SWITCH__
+  if (mediaPlaybackActive) {
+    appletSetMediaPlaybackState(false);
+    mediaPlaybackActive = false;
+  }
   socketExit();
 #endif
   curl_global_cleanup();
+}
+
+std::time_t currentUnixTime() {
+#ifdef __SWITCH__
+  u64 timestamp = 0;
+  Result rc = timeGetCurrentTime(TimeType_UserSystemClock, &timestamp);
+  if (R_SUCCEEDED(rc)) {
+    return static_cast<std::time_t>(timestamp);
+  }
+  std::printf("[KBORE][TIME] timeGetCurrentTime failed rc=0x%x; falling back to std::time\n", static_cast<unsigned int>(rc));
+#endif
+  return std::time(nullptr);
+}
+
+namespace {
+#ifndef __SWITCH__
+int portableLocalUtcOffsetSeconds(std::time_t value) {
+  std::tm localTime{};
+  std::tm utcTime{};
+
+#if defined(_WIN32)
+  localtime_s(&localTime, &value);
+  gmtime_s(&utcTime, &value);
+#else
+  std::tm *result = std::localtime(&value);
+  if (result) {
+    localTime = *result;
+  }
+
+  result = std::gmtime(&value);
+  if (result) {
+    utcTime = *result;
+  }
+#endif
+
+  return static_cast<int>(std::difftime(std::mktime(&localTime), std::mktime(&utcTime)));
+}
+#endif
+} // namespace
+
+bool localTimeFromUnix(std::time_t timestamp, PlatformLocalTime &out) {
+#ifdef __SWITCH__
+  TimeCalendarTime cal{};
+  TimeCalendarAdditionalInfo info{};
+  Result rc = timeToCalendarTimeWithMyRule(static_cast<u64>(timestamp), &cal, &info);
+  if (R_SUCCEEDED(rc)) {
+    out.year = cal.year;
+    out.month = cal.month;
+    out.day = cal.day;
+    out.hour = cal.hour;
+    out.minute = cal.minute;
+    out.second = cal.second;
+    out.utcOffsetSeconds = info.offset;
+    out.timezoneName = info.timezoneName;
+    return true;
+  }
+  std::printf("[KBORE][TIME] timeToCalendarTimeWithMyRule failed rc=0x%x; falling back to std::localtime\n", static_cast<unsigned int>(rc));
+#endif
+
+  std::tm localTime{};
+#if defined(_WIN32)
+  localtime_s(&localTime, &timestamp);
+#else
+  std::tm *result = std::localtime(&timestamp);
+  if (!result) {
+    return false;
+  }
+  localTime = *result;
+#endif
+
+  out.year = localTime.tm_year + 1900;
+  out.month = localTime.tm_mon + 1;
+  out.day = localTime.tm_mday;
+  out.hour = localTime.tm_hour;
+  out.minute = localTime.tm_min;
+  out.second = localTime.tm_sec;
+#ifndef __SWITCH__
+  out.utcOffsetSeconds = portableLocalUtcOffsetSeconds(timestamp);
+#endif
+  return true;
+}
+
+bool unixTimeFromLocal(int year, int month, int day, int hour, int minute, int second, std::time_t &out) {
+#ifdef __SWITCH__
+  TimeCalendarTime cal{};
+  cal.year = static_cast<u16>(year);
+  cal.month = static_cast<u8>(month);
+  cal.day = static_cast<u8>(day);
+  cal.hour = static_cast<u8>(hour);
+  cal.minute = static_cast<u8>(minute);
+  cal.second = static_cast<u8>(second);
+
+  u64 timestamps[2] = {};
+  s32 timestampCount = 0;
+  Result rc = timeToPosixTimeWithMyRule(&cal, timestamps, 2, &timestampCount);
+  if (R_SUCCEEDED(rc) && timestampCount > 0) {
+    out = static_cast<std::time_t>(timestamps[0]);
+    return true;
+  }
+  std::printf("[KBORE][TIME] timeToPosixTimeWithMyRule failed rc=0x%x count=%d; falling back to std::mktime\n", static_cast<unsigned int>(rc), static_cast<int>(timestampCount));
+#endif
+
+  std::tm localTime{};
+  localTime.tm_year = year - 1900;
+  localTime.tm_mon = month - 1;
+  localTime.tm_mday = day;
+  localTime.tm_hour = hour;
+  localTime.tm_min = minute;
+  localTime.tm_sec = second;
+  localTime.tm_isdst = -1;
+  out = std::mktime(&localTime);
+  return out != static_cast<std::time_t>(-1);
 }
 
 Button pollButton() {
@@ -62,6 +180,7 @@ Button pollButton() {
   if (down & HidNpadButton_L) return Button::ShoulderLeft;
   if (down & HidNpadButton_R) return Button::ShoulderRight;
   if (down & HidNpadButton_X) return Button::Favorite;
+  if (down & HidNpadButton_Y) return Button::FavoriteToggle;
   if (down & HidNpadButton_Plus) return Button::Menu;
   if (down & HidNpadButton_Minus) return Button::Quit;
 
@@ -96,6 +215,8 @@ Button pollButton() {
           return Button::Back;
         case SDLK_x:
           return Button::Favorite;
+        case SDLK_y:
+          return Button::FavoriteToggle;
         case SDLK_z:
         case SDLK_LEFTBRACKET:
           return Button::ShoulderLeft;
@@ -155,6 +276,7 @@ Button pollButtonBlocking() {
     case 'e': return Button::Select;
     case 'b': return Button::Back;
     case 'x': return Button::Favorite;
+    case 'y': return Button::FavoriteToggle;
     case 'z': return Button::ShoulderLeft;
     case 'c': return Button::ShoulderRight;
     case 'm': return Button::Menu;
@@ -183,6 +305,19 @@ void presentScreen() {
 
 void sleepMs(int ms) {
   std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+}
+
+void setMediaPlaybackActive(bool active) {
+#ifdef __SWITCH__
+  if (mediaPlaybackActive == active) {
+    return;
+  }
+
+  appletSetMediaPlaybackState(active);
+  mediaPlaybackActive = active;
+#else
+  (void)active;
+#endif
 }
 
 

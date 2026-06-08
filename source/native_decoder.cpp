@@ -1175,6 +1175,60 @@ bool NativeDecoder::decodeAudioPacketToSdl(AVPacket *packet) {
 }
 #endif
 
+
+#ifdef NSTV_USE_FFMPEG
+bool NativeDecoder::decodeAudioOnly(NativeDemuxer &demuxer, int maxPackets) {
+  if (!impl_) {
+    error_ = "NativeDecoder internal state is unavailable.";
+    return false;
+  }
+
+  if (!audio_.opened || !impl_->audioCodec || !impl_->audioFrame || !impl_->packet) {
+    error_ = "NativeDecoder requires an open audio decoder before audio-only playback.";
+    return false;
+  }
+
+  AVFormatContext *format = demuxer.formatContext();
+
+  if (!format) {
+    error_ = "NativeDecoder could not access AVFormatContext while decoding audio-only stream.";
+    return false;
+  }
+
+  if (maxPackets <= 0) {
+    maxPackets = 96;
+  }
+
+  for (int i = 0; i < maxPackets; ++i) {
+    demuxer.beginIoGuard(900);
+    int ret = av_read_frame(format, impl_->packet);
+    const bool interrupted = demuxer.wasIoInterrupted();
+    demuxer.endIoGuard();
+
+    if (ret < 0 || interrupted) {
+      error_ = interrupted
+        ? "NativeDecoder audio-only read interrupted by IO guard"
+        : "NativeDecoder could not read next audio packet: " + ffmpegError(ret);
+      return false;
+    }
+
+    if (impl_->packet->stream_index == audio_.streamIndex) {
+      if (!decodeAudioPacketToSdl(impl_->packet)) {
+        av_packet_unref(impl_->packet);
+        return false;
+      }
+
+      av_packet_unref(impl_->packet);
+      return true;
+    }
+
+    av_packet_unref(impl_->packet);
+  }
+
+  return true;
+}
+#endif
+
 bool NativeDecoder::decodeNextVideoFrame(
   NativeDemuxer &demuxer,
   bool outputFrame,

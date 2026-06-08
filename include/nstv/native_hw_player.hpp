@@ -33,6 +33,7 @@ public:
   const Bitmap &frame() const override { return emptyFrame_; }
   const YuvFrame &yuvFrame() const override { return yuvFrame_; }
   bool nativeVideoActive() const override { return nativeRendererReady_ && nativeFramePresented_; }
+  bool isAudioOnly() const override { return audioOnlyMode_; }
   void setNativeVideoAllowed(bool allowed) override;
   void setOverlayVisible(bool visible) override;
   void setOverlayInfo(
@@ -73,6 +74,7 @@ private:
   bool preferNativeRenderer_ = true;
   bool nativeRendererFailed_ = false;
   bool nativeFramePresented_ = false;
+  bool audioOnlyMode_ = false;
   std::string nativeRendererStatus_;
 
   bool clockStarted_ = false;

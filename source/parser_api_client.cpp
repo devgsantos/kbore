@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <ctime>
 #include "nstv/manifest_json.hpp"
+#include "nstv/platform.hpp"
 #include <sstream>
 #include <stdexcept>
 #include <cstdio>
@@ -18,43 +19,28 @@ namespace nstv {
 namespace {
 
 std::string isoLocalTime(std::time_t value) {
-  std::tm localTime{};
-  std::tm utcTime{};
-
-#if defined(_WIN32)
-  localtime_s(&localTime, &value);
-  gmtime_s(&utcTime, &value);
-#else
-  std::tm *result = std::localtime(&value);
-  if (!result) {
+  PlatformLocalTime localTime;
+  if (!localTimeFromUnix(value, localTime)) {
     return "";
   }
-  localTime = *result;
 
-  result = std::gmtime(&value);
-  if (!result) {
-    return "";
-  }
-  utcTime = *result;
-#endif
-
-  const long offsetSeconds = static_cast<long>(std::difftime(std::mktime(&localTime), std::mktime(&utcTime)));
+  const int offsetSeconds = localTime.utcOffsetSeconds;
   const char offsetSign = offsetSeconds < 0 ? '-' : '+';
-  const long absoluteOffset = offsetSeconds < 0 ? -offsetSeconds : offsetSeconds;
-  const int offsetHours = static_cast<int>(absoluteOffset / 3600);
-  const int offsetMinutes = static_cast<int>((absoluteOffset % 3600) / 60);
+  const int absoluteOffset = offsetSeconds < 0 ? -offsetSeconds : offsetSeconds;
+  const int offsetHours = absoluteOffset / 3600;
+  const int offsetMinutes = (absoluteOffset % 3600) / 60;
 
   char buffer[96] = {};
   std::snprintf(
     buffer,
     sizeof(buffer),
     "%04d-%02d-%02dT%02d:%02d:%02d%c%02d:%02d",
-    localTime.tm_year + 1900,
-    localTime.tm_mon + 1,
-    localTime.tm_mday,
-    localTime.tm_hour,
-    localTime.tm_min,
-    localTime.tm_sec,
+    localTime.year,
+    localTime.month,
+    localTime.day,
+    localTime.hour,
+    localTime.minute,
+    localTime.second,
     offsetSign,
     offsetHours,
     offsetMinutes
@@ -63,22 +49,28 @@ std::string isoLocalTime(std::time_t value) {
   return buffer;
 }
 
-std::string currentEpgWindowJson() {
-  const std::time_t now = std::time(nullptr);
+
+std::string currentEpgWindowJson(int epgOffsetMinutes = 0) {
+  const std::time_t now = currentUnixTime();
+  const long long offsetSeconds = static_cast<long long>(epgOffsetMinutes) * 60LL;
+  const std::time_t sourceNow = static_cast<std::time_t>(static_cast<long long>(now) - offsetSeconds);
 
   // Ask the parser for a window centered around the console clock. Some EPG
   // sources contain long programmes that started well before the selected
   // channel became focused; using only now-30m can miss the active programme
   // and the UI then receives the next future item.
-  const std::string nowIso = isoLocalTime(now);
-  const std::string from = isoLocalTime(now - 8 * 60 * 60);
-  const std::string to = isoLocalTime(now + 16 * 60 * 60);
+  // When the playlist has a manual EPG offset, ask the parser for the shifted
+  // source-time window. The app will apply the inverse correction when matching
+  // and displaying programmes.
+  const std::string nowIso = isoLocalTime(sourceNow);
+  const std::string from = isoLocalTime(sourceNow - 8 * 60 * 60);
+  const std::string to = isoLocalTime(sourceNow + 16 * 60 * 60);
 
   if (nowIso.empty() || from.empty() || to.empty()) {
     return "";
   }
 
-  return ",\"now\":\"" + jsonEscape(nowIso) + "\",\"from\":\"" + jsonEscape(from) + "\",\"to\":\"" + jsonEscape(to) + "\"";
+  return ",\"now\":\"" + jsonEscape(nowIso) + "\",\"nowEpoch\":" + std::to_string(static_cast<long long>(sourceNow)) + ",\"deviceNowEpoch\":" + std::to_string(static_cast<long long>(now)) + ",\"epgOffsetMinutes\":" + std::to_string(epgOffsetMinutes) + ",\"from\":\"" + jsonEscape(from) + "\",\"to\":\"" + jsonEscape(to) + "\"";
 }
 
 bool isAllDigits(const std::string &value) {
@@ -621,7 +613,8 @@ EpgPage ParserApiClient::loadEpgPrograms(
   const Channel &channel,
   int page,
   int pageSize,
-  const std::string &manualEpgUrl
+  const std::string &manualEpgUrl,
+  int epgOffsetMinutes
 ) const {
   if (sourceUrl.empty()) {
     throw std::runtime_error("Playlist URL/source is empty");
@@ -632,14 +625,21 @@ EpgPage ParserApiClient::loadEpgPrograms(
   body << "\"provider\":\"" << toString(provider) << "\",";
   body << "\"page\":" << page << ",";
   body << "\"pageSize\":" << pageSize;
-  body << currentEpgWindowJson();
+  body << currentEpgWindowJson(epgOffsetMinutes);
 
   if (!manualEpgUrl.empty()) {
     body << ",\"epgUrl\":\"" << jsonEscape(manualEpgUrl) << "\"";
   }
 
+  const std::string epgChannelId = !channel.tvgId.empty()
+    ? channel.tvgId
+    : (!channel.streamId.empty() ? channel.streamId : channel.id);
+
+  if (!epgChannelId.empty()) {
+    body << ",\"channelId\":\"" << jsonEscape(epgChannelId) << "\"";
+  }
+
   if (!channel.tvgId.empty()) {
-    body << ",\"channelId\":\"" << jsonEscape(channel.tvgId) << "\"";
     body << ",\"tvgId\":\"" << jsonEscape(channel.tvgId) << "\"";
   }
 
@@ -665,9 +665,10 @@ EpgPage ParserApiClient::loadEpgPrograms(
     : "/api/epg/programs";
 
   std::printf(
-    "[KBORE] EPG request path=%s channel='%s' tvgId='%s' tvgName='%s' streamId='%s' manualEpg=%s\n",
+    "[KBORE] EPG request path=%s channel='%s' epgChannelId='%s' tvgId='%s' tvgName='%s' streamId='%s' manualEpg=%s\n",
     path.c_str(),
     channel.name.c_str(),
+    epgChannelId.c_str(),
     channel.tvgId.c_str(),
     channel.tvgName.c_str(),
     channel.streamId.c_str(),
@@ -721,20 +722,25 @@ EpgPage ParserApiClient::epgPageFromJson(const Json &json) const {
       program.channelName = jsonStringOrNumber(item["channelName"], jsonStringOrNumber(item["channel_name"], ""));
       program.title = jsonStringOrNumber(item["title"], jsonStringOrNumber(item["name"], "Program"));
       program.description = jsonStringOrNumber(item["description"], jsonStringOrNumber(item["desc"], ""));
-      program.start = jsonStringOrNumber(
-        item["start"],
-        jsonStringOrNumber(item["start_timestamp"], jsonStringOrNumber(item["startTime"], jsonStringOrNumber(item["rawStart"], "")))
+      // Prefer parser-provided Unix timestamps when available. They are absolute
+      // POSIX/UTC seconds and avoid XMLTV timezone ambiguity when matching NOW.
+      // Raw XMLTV start/stop values remain as fallback for providers that do not
+      // expose *_timestamp fields.
+      const std::string startTimestamp = jsonStringOrNumber(
+        item["start_timestamp"],
+        jsonStringOrNumber(item["startTime"], "")
       );
-      program.stop = jsonStringOrNumber(
-        item["stop"],
-        jsonStringOrNumber(
-          item["end"],
-          jsonStringOrNumber(
-            item["stop_timestamp"],
-            jsonStringOrNumber(item["end_timestamp"], jsonStringOrNumber(item["endTime"], jsonStringOrNumber(item["rawStop"], "")))
-          )
-        )
+      const std::string stopTimestamp = jsonStringOrNumber(
+        item["stop_timestamp"],
+        jsonStringOrNumber(item["end_timestamp"], jsonStringOrNumber(item["endTime"], ""))
       );
+
+      program.start = !startTimestamp.empty()
+        ? startTimestamp
+        : jsonStringOrNumber(item["start"], jsonStringOrNumber(item["rawStart"], ""));
+      program.stop = !stopTimestamp.empty()
+        ? stopTimestamp
+        : jsonStringOrNumber(item["stop"], jsonStringOrNumber(item["end"], jsonStringOrNumber(item["rawStop"], "")));
 
       page.programs.push_back(program);
     }
