@@ -1,6 +1,6 @@
 APP_TITLE      := kboré
 APP_AUTHOR     := Gilson Santos
-APP_VERSION    := 0.3.0
+APP_VERSION    := 1.1.0
 TARGET         := kbore
 BUILD          := build
 SOURCES        := source
