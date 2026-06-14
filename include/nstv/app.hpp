@@ -60,6 +60,7 @@ struct AppState {
   int selectedChannel = 0;
   int selectedAddOption = 0;
   int settingsScroll = 0;
+  int selectedSettingsOption = 0;
 
   std::set<std::string> favoriteIds;
   std::vector<Channel> favoriteChannels;
@@ -78,6 +79,9 @@ struct AppState {
   std::string playerErrorMessage;
   bool hasPlaybackChannel = false;
   Channel playbackChannel;
+  long long playbackStartedAtMs = 0;
+  long long lastPlaybackInputMs = 0;
+  long long lastSleepKeepAliveMs = 0;
 };
 
 class App {
@@ -185,6 +189,9 @@ private:
   const EpgPage *cachedEpgForChannel(const Channel &channel) const;
   std::string epgLineForChannel(const Channel &channel) const;
   std::string epgNowNextLine(const Channel &channel) const;
+  void applyPlaybackSleepPolicy();
+  void resetPlaybackSleepTimers();
+  std::string playbackSleepWarningText(bool compact = false) const;
 
   std::vector<TypeGroup> visibleTypes() const;
   const TypeGroup *selectedTypeGroup() const;
