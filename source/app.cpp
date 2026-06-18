@@ -101,6 +101,67 @@ std::string formatEpgOffsetMinutes(int minutes) {
   return buffer;
 }
 
+std::string playbackSleepBehaviorLabel(PlaybackSleepBehavior behavior) {
+  switch (behavior) {
+    case PlaybackSleepBehavior::SystemDefault: return "System default";
+    case PlaybackSleepBehavior::DockedOnly: return "Docked only";
+    case PlaybackSleepBehavior::AlwaysPrevent: return "Always prevent";
+  }
+
+  return "Docked only";
+}
+
+PlaybackSleepBehavior nextPlaybackSleepBehavior(PlaybackSleepBehavior behavior, int direction) {
+  std::vector<PlaybackSleepBehavior> values{
+    PlaybackSleepBehavior::SystemDefault,
+    PlaybackSleepBehavior::DockedOnly,
+    PlaybackSleepBehavior::AlwaysPrevent
+  };
+
+  auto it = std::find(values.begin(), values.end(), behavior);
+  int index = it == values.end() ? 1 : static_cast<int>(std::distance(values.begin(), it));
+  index = (index + direction + static_cast<int>(values.size())) % static_cast<int>(values.size());
+  return values[static_cast<std::size_t>(index)];
+}
+
+std::string formatMinutesOption(int minutes) {
+  if (minutes <= 0) {
+    return "Off";
+  }
+
+  if (minutes % 60 == 0) {
+    const int hours = minutes / 60;
+    return std::to_string(hours) + (hours == 1 ? " hour" : " hours");
+  }
+
+  return std::to_string(minutes) + " minutes";
+}
+
+std::string formatSecondsClock(long long ms) {
+  if (ms < 0) {
+    ms = 0;
+  }
+
+  long long totalSeconds = (ms + 999) / 1000;
+  const long long minutes = totalSeconds / 60;
+  const long long seconds = totalSeconds % 60;
+
+  char buffer[32] = {};
+  std::snprintf(buffer, sizeof(buffer), "%02lld:%02lld", minutes, seconds);
+  return buffer;
+}
+
+int nextOptionValue(int current, const std::vector<int> &values, int direction) {
+  if (values.empty()) {
+    return current;
+  }
+
+  auto it = std::find(values.begin(), values.end(), current);
+  int index = it == values.end() ? 0 : static_cast<int>(std::distance(values.begin(), it));
+  index = (index + direction + static_cast<int>(values.size())) % static_cast<int>(values.size());
+  return values[static_cast<std::size_t>(index)];
+}
+
 bool isVodType(StreamType type) {
   return type == StreamType::Movies || type == StreamType::Series;
 }
@@ -1314,6 +1375,7 @@ int App::run() {
         handle(button);
       }
 
+      applyPlaybackSleepPolicy();
       render();
       sleepMs(16);
       continue;
@@ -1378,11 +1440,17 @@ void App::handle(Button button) {
         state_.playerLoadFailed = false;
         state_.playerErrorMessage.clear();
         state_.hasPlaybackChannel = false;
+        resetPlaybackSleepTimers();
         break;
       }
 
       if (button != Button::None) {
         state_.playerOverlayUntilMs = now + 5000;
+        state_.lastPlaybackInputMs = now;
+        if (platformIsDockedMode() && state_.config.dockedSleepTimerMinutes > 0) {
+          state_.playbackStartedAtMs = now;
+          state_.message = "Sleep timer reset";
+        }
       }
 
       // Playback commands are intentional only while the overlay is visible.
@@ -1428,17 +1496,19 @@ void App::handle(Button button) {
       }
 
       {
+        const int optionCount = 5;
         const int settingsViewportHeight = 412;
-        const int settingsContentHeight = 558;
-        const int settingsScrollStep = 38;
+        const int settingsContentHeight = 660;
         const int maxSettingsScroll = std::max(0, settingsContentHeight - settingsViewportHeight);
 
         if (button == Button::Up) {
-          state_.settingsScroll = std::max(0, state_.settingsScroll - settingsScrollStep);
+          state_.selectedSettingsOption = std::max(0, state_.selectedSettingsOption - 1);
+          state_.settingsScroll = std::max(0, std::min(maxSettingsScroll, state_.selectedSettingsOption * 74));
           break;
         }
         if (button == Button::Down) {
-          state_.settingsScroll = std::min(maxSettingsScroll, state_.settingsScroll + settingsScrollStep);
+          state_.selectedSettingsOption = std::min(optionCount - 1, state_.selectedSettingsOption + 1);
+          state_.settingsScroll = std::max(0, std::min(maxSettingsScroll, state_.selectedSettingsOption * 74));
           break;
         }
       }
@@ -1446,33 +1516,62 @@ void App::handle(Button button) {
       if (button == Button::Left || button == Button::Right ||
           button == Button::ShoulderLeft || button == Button::ShoulderRight ||
           button == Button::FavoriteToggle) {
-        const PlaylistConfig *active = activePlaylist();
-        if (!active) {
-          state_.message = "No active playlist";
-          break;
-        }
+        const int direction = (button == Button::Left || button == Button::ShoulderLeft) ? -1 : 1;
 
-        for (PlaylistConfig &playlist : state_.config.playlists) {
-          if (playlist.id != active->id) {
-            continue;
+        if (state_.selectedSettingsOption == 0) {
+          const PlaylistConfig *active = activePlaylist();
+          if (!active) {
+            state_.message = "No active playlist";
+            break;
           }
 
-          if (button == Button::FavoriteToggle) {
-            playlist.epgOffsetMinutes = 0;
-          } else {
-            const int step = (button == Button::ShoulderLeft || button == Button::ShoulderRight) ? 60 : 30;
-            playlist.epgOffsetMinutes += (button == Button::Left || button == Button::ShoulderLeft) ? -step : step;
-            playlist.epgOffsetMinutes = std::max(-12 * 60, std::min(12 * 60, playlist.epgOffsetMinutes));
-          }
+          for (PlaylistConfig &playlist : state_.config.playlists) {
+            if (playlist.id != active->id) {
+              continue;
+            }
 
+            if (button == Button::FavoriteToggle) {
+              playlist.epgOffsetMinutes = 0;
+            } else {
+              const int step = (button == Button::ShoulderLeft || button == Button::ShoulderRight) ? 60 : 30;
+              playlist.epgOffsetMinutes += direction * step;
+              playlist.epgOffsetMinutes = std::max(-12 * 60, std::min(12 * 60, playlist.epgOffsetMinutes));
+            }
+
+            saveConfig(state_.config);
+            setRuntimeEpgOffsetMinutes(playlist.epgOffsetMinutes);
+            state_.epgByChannel.clear();
+            state_.currentEpgAvailable = false;
+            state_.message = "EPG offset: " + formatEpgOffsetMinutes(playlist.epgOffsetMinutes);
+            loadVisibleEpgForChannelList();
+            loadSelectedEpg(false, false);
+            break;
+          }
+        } else if (state_.selectedSettingsOption == 1) {
+          state_.config.playbackSleepBehavior = button == Button::FavoriteToggle
+            ? PlaybackSleepBehavior::DockedOnly
+            : nextPlaybackSleepBehavior(state_.config.playbackSleepBehavior, direction);
           saveConfig(state_.config);
-          setRuntimeEpgOffsetMinutes(playlist.epgOffsetMinutes);
-          state_.epgByChannel.clear();
-          state_.currentEpgAvailable = false;
-          state_.message = "EPG offset: " + formatEpgOffsetMinutes(playlist.epgOffsetMinutes);
-          loadVisibleEpgForChannelList();
-          loadSelectedEpg(false, false);
-          break;
+          state_.message = "Playback sleep: " + playbackSleepBehaviorLabel(state_.config.playbackSleepBehavior);
+          applyPlaybackSleepPolicy();
+        } else if (state_.selectedSettingsOption == 2) {
+          state_.config.dockedSleepTimerMinutes = button == Button::FavoriteToggle
+            ? 0
+            : nextOptionValue(state_.config.dockedSleepTimerMinutes, std::vector<int>{0, 30, 60, 120}, direction);
+          saveConfig(state_.config);
+          state_.message = "Docked sleep timer: " + formatMinutesOption(state_.config.dockedSleepTimerMinutes);
+        } else if (state_.selectedSettingsOption == 3) {
+          state_.config.batterySleepTimeoutMinutes = button == Button::FavoriteToggle
+            ? 10
+            : nextOptionValue(state_.config.batterySleepTimeoutMinutes, std::vector<int>{5, 10, 15, 30}, direction);
+          saveConfig(state_.config);
+          state_.message = "Battery warning estimate: " + std::to_string(state_.config.batterySleepTimeoutMinutes) + " minutes";
+        } else if (state_.selectedSettingsOption == 4) {
+          state_.config.sleepWarningSeconds = button == Button::FavoriteToggle
+            ? 60
+            : nextOptionValue(state_.config.sleepWarningSeconds, std::vector<int>{30, 60, 120}, direction);
+          saveConfig(state_.config);
+          state_.message = "Sleep warning lead: " + std::to_string(state_.config.sleepWarningSeconds) + " seconds";
         }
       }
       break;
@@ -2061,6 +2160,7 @@ void App::handleAddPlaylist(Button button) {
     if (state_.selectedAddOption == settingsIndex) {
       state_.screen = ScreenId::Settings;
       state_.settingsScroll = 0;
+      state_.selectedSettingsOption = 0;
       return;
     }
 
@@ -3350,8 +3450,11 @@ void App::openChannel(const Channel &channel) {
   player_->setOverlayVisible(true);
 
   if (player_->open(channel.url)) {
-    setMediaPlaybackActive(true);
-    logLine("[KBORE][PLAYBACK][LIFECYCLE] media playback state enabled");
+    resetPlaybackSleepTimers();
+    state_.playbackStartedAtMs = nowMs();
+    state_.lastPlaybackInputMs = state_.playbackStartedAtMs;
+    applyPlaybackSleepPolicy();
+    logLine("[KBORE][PLAYBACK][LIFECYCLE] playback sleep policy applied");
 
     if (!player_->nativeVideoActive() && gfx_.isSuspendedForNativeVideo()) {
       gfx_.resumeAfterNativeVideo();
@@ -3378,6 +3481,7 @@ void App::openChannel(const Channel &channel) {
     state_.playerLoadFailed = true;
     state_.playerErrorMessage = openError;
     setMediaPlaybackActive(false);
+    resetPlaybackSleepTimers();
     gfx_.resumeAfterNativeVideo();
 
     if (player_) {
@@ -3385,6 +3489,119 @@ void App::openChannel(const Channel &channel) {
       player_.reset();
     }
   }
+}
+
+void App::resetPlaybackSleepTimers() {
+  state_.playbackStartedAtMs = 0;
+  state_.lastPlaybackInputMs = 0;
+  state_.lastSleepKeepAliveMs = 0;
+}
+
+void App::applyPlaybackSleepPolicy() {
+  const bool playbackOpen = state_.screen == ScreenId::Player && player_ && player_->isOpen();
+
+  if (!playbackOpen) {
+    setMediaPlaybackActive(false);
+    return;
+  }
+
+  const long long now = nowMs();
+  if (state_.playbackStartedAtMs <= 0) {
+    state_.playbackStartedAtMs = now;
+  }
+  if (state_.lastPlaybackInputMs <= 0) {
+    state_.lastPlaybackInputMs = now;
+  }
+
+  const bool docked = platformIsDockedMode();
+  bool preventSleep = false;
+
+  switch (state_.config.playbackSleepBehavior) {
+    case PlaybackSleepBehavior::SystemDefault:
+      preventSleep = false;
+      break;
+    case PlaybackSleepBehavior::DockedOnly:
+      preventSleep = docked;
+      break;
+    case PlaybackSleepBehavior::AlwaysPrevent:
+      preventSleep = true;
+      break;
+  }
+
+  if (docked && state_.config.dockedSleepTimerMinutes > 0) {
+    const long long timerMs = static_cast<long long>(state_.config.dockedSleepTimerMinutes) * 60LL * 1000LL;
+    const long long elapsedMs = now - state_.playbackStartedAtMs;
+
+    if (elapsedMs >= timerMs) {
+      logLine("[KBORE][SLEEP] docked playback sleep timer ended; stopping playback");
+      setMediaPlaybackActive(false);
+
+      if (player_) {
+        player_->close();
+        player_.reset();
+      }
+
+      gfx_.resumeAfterNativeVideo();
+      state_.screen = ScreenId::Dashboard;
+      state_.message = "Sleep timer ended";
+      state_.playerStarted = false;
+      state_.playerFrameSeen = false;
+      state_.playerLoading = false;
+      state_.playerLoadFailed = false;
+      state_.playerErrorMessage.clear();
+      state_.hasPlaybackChannel = false;
+      resetPlaybackSleepTimers();
+      return;
+    }
+  }
+
+  setMediaPlaybackActive(preventSleep);
+
+  if (preventSleep && now - state_.lastSleepKeepAliveMs >= 30000) {
+    setMediaPlaybackActive(true);
+    state_.lastSleepKeepAliveMs = now;
+  }
+}
+
+std::string App::playbackSleepWarningText(bool compact) const {
+  const bool playbackOpen = state_.screen == ScreenId::Player && player_ && player_->isOpen();
+  if (!playbackOpen) {
+    return "";
+  }
+
+  const long long now = nowMs();
+  const int warningSeconds = std::max(10, state_.config.sleepWarningSeconds);
+  const long long warningMs = static_cast<long long>(warningSeconds) * 1000LL;
+  const bool docked = platformIsDockedMode();
+
+  if (docked && state_.config.dockedSleepTimerMinutes > 0 && state_.playbackStartedAtMs > 0) {
+    const long long timerMs = static_cast<long long>(state_.config.dockedSleepTimerMinutes) * 60LL * 1000LL;
+    const long long remainingMs = timerMs - (now - state_.playbackStartedAtMs);
+
+    if (remainingMs <= warningMs) {
+      const std::string clock = formatSecondsClock(remainingMs);
+      if (compact) {
+        return "Sleep timer ending soon - Playback stops in ~" + clock + " - Press any button to keep watching";
+      }
+      return "Sleep timer ending soon\nPlayback stops in ~" + clock + "\nPress any button to keep watching";
+    }
+  }
+
+  if (!docked && state_.config.playbackSleepBehavior != PlaybackSleepBehavior::AlwaysPrevent && state_.lastPlaybackInputMs > 0) {
+    const int timeoutMinutes = std::max(1, state_.config.batterySleepTimeoutMinutes);
+    const long long timeoutMs = static_cast<long long>(timeoutMinutes) * 60LL * 1000LL;
+    const long long remainingMs = timeoutMs - (now - state_.lastPlaybackInputMs);
+
+    if (remainingMs <= warningMs) {
+      const std::string clock = formatSecondsClock(remainingMs);
+      if (compact) {
+        return "Console may sleep soon - Auto sleep in ~" + clock + " - Press any button to keep watching";
+      }
+      return "Console may sleep soon\nAuto sleep in ~" + clock + "\nPress any button to keep watching";
+    }
+  }
+
+  return "";
 }
 
 void App::resetLoadedChannels() {
@@ -4906,11 +5123,13 @@ void App::renderPlayerGraphic() {
   const bool isOpen = player_ && player_->isOpen();
   const bool isPaused = player_ && player_->isPaused();
   const bool isAudioOnly = isOpen && player_ && player_->isAudioOnly();
+  const bool sleepWarningActive = !playbackSleepWarningText(true).empty();
   const bool overlayRequested =
     !state_.playerFrameSeen ||
     nowMs() < state_.playerOverlayUntilMs ||
     isPaused ||
-    !isOpen;
+    !isOpen ||
+    sleepWarningActive;
 
   if (isOpen) {
     std::string status;
@@ -4931,9 +5150,13 @@ void App::renderPlayerGraphic() {
     const std::string vodCounter = vodPlayback
       ? ("  " + formatPlaybackTime(vodPositionMs))
       : "";
-    const std::string controls = vodPlayback
+    std::string controls = vodPlayback
       ? "A PAUSE/RESUME   L -30s   < -10s   > +10s   R +30s   B BACK"
       : "A PAUSE/RESUME   B BACK";
+    const std::string sleepWarningCompact = playbackSleepWarningText(true);
+    if (!sleepWarningCompact.empty()) {
+      controls = Graphics::fitText(sleepWarningCompact, 92);
+    }
 
     player_->setOverlayInfo(
       channel ? Graphics::fitText(channel->name, 58) : "",
@@ -5110,13 +5333,14 @@ void App::renderPlayerGraphic() {
     !state_.playerFrameSeen ||
     nowMs() < state_.playerOverlayUntilMs ||
     isPaused ||
-    !isOpen;
+    !isOpen ||
+    !playbackSleepWarningText(true).empty();
 
   if (showOverlay && isOpen) {
     const bool vodPlayback = channel && isVodType(channel->type) && player_ && player_->canSeek();
     const int64_t vodDurationMs = vodPlayback ? player_->durationMs() : 0;
     const int64_t vodPositionMs = vodPlayback ? player_->positionMs() : 0;
-    const std::string controls = vodPlayback
+    std::string controls = vodPlayback
       ? "A PAUSE/RESUME   L -30s   < -10s   > +10s   R +30s   B BACK"
       : "A PAUSE/RESUME   B BACK";
 
@@ -5214,6 +5438,35 @@ void App::renderPlayerGraphic() {
       }
     }
 
+    const std::string sleepWarning = playbackSleepWarningText(false);
+    if (!sleepWarning.empty()) {
+      const int warnW = 560;
+      const int warnH = 88;
+      const int warnX = (Graphics::Width - warnW) / 2;
+      const int warnY = Graphics::Height - 210;
+      gfx_.fillRoundRect(warnX, warnY, warnW, warnH, 18, rgba(15, 23, 42, 238));
+      gfx_.strokeRoundRect(warnX, warnY, warnW, warnH, 18, rgba(0, 191, 255, 135), 2);
+
+      std::istringstream lines(sleepWarning);
+      std::string line;
+      int lineY = warnY + 18;
+      int lineIndex = 0;
+      while (std::getline(lines, line)) {
+        gfx_.drawText(
+          Graphics::fitText(line, 62),
+          warnX + 30,
+          lineY,
+          lineIndex == 0 ? 2 : 1,
+          lineIndex == 0 ? rgb(248, 250, 252) : rgb(203, 213, 225),
+          lineIndex == 0
+        );
+        lineY += lineIndex == 0 ? 26 : 20;
+        ++lineIndex;
+      }
+
+      controls = "Press any button to keep watching    B BACK";
+    }
+
     gfx_.drawTextRight(
       controls,
       Graphics::Width - 28,
@@ -5229,6 +5482,7 @@ void App::renderSettingsGraphic() {
   const Color text = rgb(248, 250, 252);
   const Color muted = rgb(166, 178, 207);
   const Color blue = rgb(0, 191, 255);
+  const Color selectedBg = rgba(14, 165, 233, 45);
   const Color panelTop = rgb(16, 24, 45);
   const Color panelBottom = rgb(7, 11, 22);
 
@@ -5246,40 +5500,84 @@ void App::renderSettingsGraphic() {
   const int contentX = panel.x + 34;
   const int scroll = std::max(0, state_.settingsScroll);
 
-  auto drawLine = [&](const std::string &line, int baseY, int scale, Color color, bool bold) {
+  auto drawLine = [&](const std::string &line, int baseY, int scale, Color color, bool bold, int xOffset = 0) {
     const int y = baseY - scroll;
     const int height = (scale == 4 ? 30 : (scale == 3 ? 24 : 18));
     if (y + height < viewportTop || y > viewportBottom) {
       return;
     }
-    gfx_.drawText(line, contentX, y, scale, color, bold);
+    gfx_.drawText(line, contentX + xOffset, y, scale, color, bold);
+  };
+
+  auto drawSetting = [&](int index, const std::string &title, const std::string &value, const std::string &hint, int &y) {
+    const int rowY = y - scroll;
+    const bool selected = state_.selectedSettingsOption == index;
+
+    if (rowY + 70 >= viewportTop && rowY <= viewportBottom) {
+      if (selected) {
+        gfx_.fillRoundRect(contentX - 14, rowY - 8, panel.w - 68, 70, 12, selectedBg);
+        gfx_.strokeRoundRect(contentX - 14, rowY - 8, panel.w - 68, 70, 12, rgba(0, 191, 255, 95), 1);
+      }
+
+      gfx_.drawText((selected ? "> " : "  ") + title, contentX, rowY, 3, selected ? blue : text, true);
+      gfx_.drawText(Graphics::fitText(value, 72), contentX + 30, rowY + 28, 2, text, true);
+      gfx_.drawText(Graphics::fitText(hint, 88), contentX + 30, rowY + 52, 1, muted, false);
+    }
+
+    y += 78;
   };
 
   const PlaylistConfig *playlist = activePlaylist();
   const int epgOffset = playlist ? playlist->epgOffsetMinutes : 0;
 
   int y = panel.y + 26;
-  drawLine("EPG TIME OFFSET", y, 4, blue, true); y += 42;
-  drawLine("Active playlist: " + Graphics::fitText(activePlaylistName(), 48), y, 2, muted, false); y += 28;
-  drawLine("Current offset: " + formatEpgOffsetMinutes(epgOffset), y, 3, text, true); y += 30;
-  drawLine("Applied before EPG matching and on-screen display.", y, 2, muted, false); y += 28;
-  drawLine("LEFT/RIGHT = 30 min", y, 2, muted, false); y += 26;
-  drawLine("L/R = 1 hour    Y = reset", y, 2, muted, false); y += 42;
+  drawSetting(
+    0,
+    "EPG TIME OFFSET",
+    "Current offset: " + formatEpgOffsetMinutes(epgOffset),
+    "Per-playlist. LEFT/RIGHT = 30 min, L/R = 1 hour, Y = reset.",
+    y
+  );
+  drawSetting(
+    1,
+    "PLAYBACK SLEEP",
+    playbackSleepBehaviorLabel(state_.config.playbackSleepBehavior),
+    "Dashboard follows system. Docked only is the recommended default.",
+    y
+  );
+  drawSetting(
+    2,
+    "DOCKED SLEEP TIMER",
+    formatMinutesOption(state_.config.dockedSleepTimerMinutes),
+    "Optional TV bedtime timer. Any button resets it during playback.",
+    y
+  );
+  drawSetting(
+    3,
+    "BATTERY SLEEP WARNING",
+    "After ~" + std::to_string(state_.config.batterySleepTimeoutMinutes) + " minutes idle",
+    "Handheld mode respects the console sleep settings and only warns the user.",
+    y
+  );
+  drawSetting(
+    4,
+    "WARNING LEAD TIME",
+    std::to_string(state_.config.sleepWarningSeconds) + " seconds before",
+    "Shows: Console may sleep soon / Press any button to keep watching.",
+    y
+  );
 
+  y += 8;
   drawLine("ABOUT KBORE", y, 4, text, true); y += 42;
   drawLine("Kboré is an IPTV/VOD player for user-provided playlists.", y, 2, muted, false); y += 28;
   drawLine("The app does not provide playlists, channels, movies, series or servers.", y, 2, muted, false); y += 28;
-  drawLine("Kboré does not endorse, host, sponsor or verify IPTV providers.", y, 2, muted, false); y += 28;
   drawLine("All playlist URLs, credentials and playback sources are the user's responsibility.", y, 2, muted, false); y += 42;
-
-  drawLine("THIRD-PARTY LIBRARIES", y, 4, text, true); y += 42;
   drawLine("Built with devkitPro/libnx, FFmpeg, Deko3D, SDL, cURL and related libraries.", y, 2, muted, false); y += 28;
-  drawLine("Thank you for using and supporting Kboré.", y, 2, text, true); y += 28;
   drawLine("Developed by Gilson Santos", y, 2, text, true); y += 28;
-  drawLine("github.com/devgsantos", y, 2, blue, true); y += 20;
+  drawLine("github.com/devgsantos", y, 2, blue, true);
 
   const int settingsViewportHeight = 412;
-  const int settingsContentHeight = 558;
+  const int settingsContentHeight = 660;
   const int maxSettingsScroll = std::max(0, settingsContentHeight - settingsViewportHeight);
   if (state_.settingsScroll > 0) {
     gfx_.drawText("^ MORE", panel.x + panel.w - 120, panel.y + 18, 2, blue, true);
@@ -5288,7 +5586,7 @@ void App::renderSettingsGraphic() {
     gfx_.drawText("v MORE", panel.x + panel.w - 120, panel.y + panel.h - 32, 2, blue, true);
   }
 
-  gfx_.drawText("UP/DOWN SCROLL    A / B BACK    LEFT/RIGHT/L/R ADJUST OFFSET    Y RESET", 64, 660, 2, muted, true);
+  gfx_.drawText("UP/DOWN SELECT    LEFT/RIGHT CHANGE    L/R FAST CHANGE    Y RESET    A/B BACK", 64, 660, 2, muted, true);
 }
 
 

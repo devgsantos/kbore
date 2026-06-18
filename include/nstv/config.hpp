@@ -7,6 +7,15 @@
 
 namespace nstv {
 
+enum class PlaybackSleepBehavior {
+  SystemDefault,
+  DockedOnly,
+  AlwaysPrevent
+};
+
+std::string toString(PlaybackSleepBehavior behavior);
+PlaybackSleepBehavior playbackSleepBehaviorFromString(const std::string &value);
+
 struct PlaylistConfig {
   std::string id;
   std::string name;
@@ -44,6 +53,14 @@ struct Config {
   int pageSize = 20;
   int preloadThreshold = 8;
   bool useUnicodeIcons = false;
+
+  // Playback sleep policy. Dashboard always follows the system.
+  // DockedOnly is the recommended default: prevent sleep during docked playback,
+  // but respect system sleep in handheld/battery mode.
+  PlaybackSleepBehavior playbackSleepBehavior = PlaybackSleepBehavior::DockedOnly;
+  int dockedSleepTimerMinutes = 0;      // 0 = Off. Optional timer for TV/docked playback.
+  int batterySleepTimeoutMinutes = 10;  // App-side estimate for warning overlay only.
+  int sleepWarningSeconds = 60;         // Warning lead time for battery/timer overlays.
 
   const PlaylistConfig *activePlaylist() const;
 };

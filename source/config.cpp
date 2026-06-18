@@ -10,6 +10,28 @@
 
 namespace nstv {
 
+std::string toString(PlaybackSleepBehavior behavior) {
+  switch (behavior) {
+    case PlaybackSleepBehavior::SystemDefault: return "system_default";
+    case PlaybackSleepBehavior::DockedOnly: return "docked_only";
+    case PlaybackSleepBehavior::AlwaysPrevent: return "always_prevent";
+  }
+
+  return "docked_only";
+}
+
+PlaybackSleepBehavior playbackSleepBehaviorFromString(const std::string &value) {
+  if (value == "system_default" || value == "system" || value == "default") {
+    return PlaybackSleepBehavior::SystemDefault;
+  }
+
+  if (value == "always_prevent" || value == "always" || value == "prevent_always") {
+    return PlaybackSleepBehavior::AlwaysPrevent;
+  }
+
+  return PlaybackSleepBehavior::DockedOnly;
+}
+
 namespace {
 
 static std::string trimTrailingSlash(std::string value) {
@@ -228,6 +250,12 @@ Config loadConfig() {
         cfg.pageSize = json["pageSize"].asInt(20);
         cfg.preloadThreshold = json["preloadThreshold"].asInt(8);
         cfg.useUnicodeIcons = json["useUnicodeIcons"].asBool(false);
+        cfg.playbackSleepBehavior = playbackSleepBehaviorFromString(
+          json["playback_sleep_behavior"].asString(json["playbackSleepBehavior"].asString("docked_only"))
+        );
+        cfg.dockedSleepTimerMinutes = json["docked_sleep_timer_minutes"].asInt(json["dockedSleepTimerMinutes"].asInt(0));
+        cfg.batterySleepTimeoutMinutes = json["battery_sleep_timeout_minutes"].asInt(json["batterySleepTimeoutMinutes"].asInt(10));
+        cfg.sleepWarningSeconds = json["sleep_warning_seconds"].asInt(json["sleepWarningSeconds"].asInt(60));
 
         if (json["playlists"].isArray()) {
           int index = 0;
@@ -281,6 +309,12 @@ Config loadConfig() {
     if (cfg.pageSize > 1000) cfg.pageSize = 1000;
     if (cfg.preloadThreshold < 1) cfg.preloadThreshold = 1;
     if (cfg.preloadThreshold > 50) cfg.preloadThreshold = 50;
+    if (cfg.dockedSleepTimerMinutes < 0) cfg.dockedSleepTimerMinutes = 0;
+    if (cfg.dockedSleepTimerMinutes > 240) cfg.dockedSleepTimerMinutes = 240;
+    if (cfg.batterySleepTimeoutMinutes < 1) cfg.batterySleepTimeoutMinutes = 10;
+    if (cfg.batterySleepTimeoutMinutes > 120) cfg.batterySleepTimeoutMinutes = 120;
+    if (cfg.sleepWarningSeconds < 10) cfg.sleepWarningSeconds = 10;
+    if (cfg.sleepWarningSeconds > 300) cfg.sleepWarningSeconds = 300;
 
     return cfg;
   };
@@ -323,6 +357,20 @@ Config loadConfig() {
     cfg.playlists = legacy.playlists;
     cfg.activePlaylistId = legacy.activePlaylistId;
   }
+
+  if (cfg.playbackSleepBehavior == PlaybackSleepBehavior::DockedOnly &&
+      legacy.playbackSleepBehavior != PlaybackSleepBehavior::DockedOnly) {
+    cfg.playbackSleepBehavior = legacy.playbackSleepBehavior;
+  }
+  if (cfg.dockedSleepTimerMinutes == 0 && legacy.dockedSleepTimerMinutes != 0) {
+    cfg.dockedSleepTimerMinutes = legacy.dockedSleepTimerMinutes;
+  }
+  if (cfg.batterySleepTimeoutMinutes == 10 && legacy.batterySleepTimeoutMinutes != 10) {
+    cfg.batterySleepTimeoutMinutes = legacy.batterySleepTimeoutMinutes;
+  }
+  if (cfg.sleepWarningSeconds == 60 && legacy.sleepWarningSeconds != 60) {
+    cfg.sleepWarningSeconds = legacy.sleepWarningSeconds;
+  }
 #endif
 
   if (cfg.parserApiBaseUrl.empty()) {
@@ -350,6 +398,10 @@ bool saveConfig(const Config &config) {
   json["pageSize"] = config.pageSize;
   json["preloadThreshold"] = config.preloadThreshold;
   json["useUnicodeIcons"] = config.useUnicodeIcons;
+  json["playback_sleep_behavior"] = toString(config.playbackSleepBehavior);
+  json["docked_sleep_timer_minutes"] = config.dockedSleepTimerMinutes;
+  json["battery_sleep_timeout_minutes"] = config.batterySleepTimeoutMinutes;
+  json["sleep_warning_seconds"] = config.sleepWarningSeconds;
   json["active"] = config.activePlaylistId;
   json["active_playlist_id"] = config.activePlaylistId;
 
