@@ -1324,6 +1324,39 @@ std::string trimText(std::string value) {
   return value;
 }
 
+std::string formatReleaseDate(std::string value) {
+  value = trimText(value);
+  if (value.empty()) {
+    return "";
+  }
+
+  int year = -1;
+  int month = -1;
+  int day = -1;
+
+  if (value.size() >= 10 && value[4] == '-' && value[7] == '-') {
+    year = parseFixedInt(value, 0, 4, -1);
+    month = parseFixedInt(value, 5, 2, -1);
+    day = parseFixedInt(value, 8, 2, -1);
+  } else if (value.size() >= 10 && value[4] == '/' && value[7] == '/') {
+    year = parseFixedInt(value, 0, 4, -1);
+    month = parseFixedInt(value, 5, 2, -1);
+    day = parseFixedInt(value, 8, 2, -1);
+  } else if (value.size() >= 10 && value[2] == '/' && value[5] == '/') {
+    day = parseFixedInt(value, 0, 2, -1);
+    month = parseFixedInt(value, 3, 2, -1);
+    year = parseFixedInt(value, 6, 4, -1);
+  }
+
+  if (year < 0 || year > 9999 || month < 1 || month > 12 || day < 1 || day > 31) {
+    return value;
+  }
+
+  char buffer[32] = {};
+  std::snprintf(buffer, sizeof(buffer), "%02d/%02d/%04d", day, month, year);
+  return buffer;
+}
+
 std::string trimTrailingSlashLocal(std::string value) {
   while (!value.empty() && value.back() == '/') {
     value.pop_back();
@@ -1405,6 +1438,9 @@ App::~App() {
 
   stopChannelWorker();
   stopEpgWorker();
+  if (vodDetailsThread_.joinable()) {
+    vodDetailsThread_.join();
+  }
 }
 
 int App::run() {
@@ -3556,6 +3592,140 @@ void App::drainFinishedEpg() {
   }
 }
 
+std::string App::vodDetailsKeyForChannel(const Channel &channel) const {
+  return state_.manifest.id + ":" + toString(channel.type) + ":" + vodDetailsCacheKey(channel);
+}
+
+const VodDetails *App::cachedVodDetailsForChannel(const Channel &channel) const {
+  const std::string key = vodDetailsKeyForChannel(channel);
+  auto it = state_.vodDetailsByKey.find(key);
+  if (it == state_.vodDetailsByKey.end()) {
+    return nullptr;
+  }
+  return &it->second;
+}
+
+void App::requestVodDetailsForChannel(const Channel &channel) {
+  if (!state_.hasManifest || !isVodType(channel.type)) {
+    return;
+  }
+
+  const std::string key = vodDetailsKeyForChannel(channel);
+  if (state_.vodDetailsByKey.count(key) || state_.vodDetailsAttemptedKeys.count(key)) {
+    return;
+  }
+
+  VodDetails cached;
+  if (loadVodDetails(state_.manifest.id, channel, cached)) {
+    state_.vodDetailsByKey[key] = cached;
+    return;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(vodDetailsMutex_);
+    if (vodDetailsActive_) {
+      return;
+    }
+  }
+
+  if (vodDetailsThread_.joinable()) {
+    vodDetailsThread_.join();
+  }
+
+  const PlaylistConfig *playlist = activePlaylist();
+  const std::string source = state_.manifest.source.empty() && playlist
+    ? playlist->sourceUrl()
+    : state_.manifest.source;
+  if (source.empty()) {
+    return;
+  }
+
+  state_.vodDetailsAttemptedKeys.insert(key);
+
+  VodDetailsJob job;
+  job.config = state_.config;
+  job.manifestId = state_.manifest.id;
+  job.source = source;
+  job.provider = state_.manifest.provider;
+  job.channel = channel;
+  job.key = key;
+  job.language = state_.config.uiLanguage.empty() ? "pt-BR" : state_.config.uiLanguage;
+
+  {
+    std::lock_guard<std::mutex> lock(vodDetailsMutex_);
+    vodDetailsActive_ = true;
+    vodDetailsDone_ = false;
+    vodDetailsJob_ = job;
+    vodDetailsResult_ = VodDetailsResult{};
+  }
+
+  vodDetailsThread_ = std::thread([this, job]() {
+    VodDetailsResult result;
+    result.manifestId = job.manifestId;
+    result.key = job.key;
+    result.channel = job.channel;
+
+    try {
+      ParserApiClient api(job.config);
+      result.details = api.loadVodDetails(job.source, job.provider, job.channel, job.language);
+      if (result.details.title.empty()) {
+        result.details.title = job.channel.name;
+      }
+      if (result.details.posterUrl.empty()) {
+        result.details.posterUrl = job.channel.logo;
+      }
+      saveVodDetails(job.manifestId, job.channel, result.details);
+      result.ok = true;
+    } catch (const std::exception &ex) {
+      result.ok = false;
+      result.error = ex.what();
+    }
+
+    std::lock_guard<std::mutex> lock(vodDetailsMutex_);
+    vodDetailsResult_ = std::move(result);
+    vodDetailsDone_ = true;
+  });
+}
+
+void App::updateVodDetailsLoad() {
+  VodDetailsResult result;
+  bool done = false;
+
+  {
+    std::lock_guard<std::mutex> lock(vodDetailsMutex_);
+    done = vodDetailsActive_ && vodDetailsDone_;
+    if (done) {
+      result = std::move(vodDetailsResult_);
+    }
+  }
+
+  if (!done) {
+    return;
+  }
+
+  if (vodDetailsThread_.joinable()) {
+    vodDetailsThread_.join();
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(vodDetailsMutex_);
+    vodDetailsActive_ = false;
+    vodDetailsDone_ = false;
+    vodDetailsJob_ = VodDetailsJob{};
+    vodDetailsResult_ = VodDetailsResult{};
+  }
+
+  if (!state_.hasManifest || result.manifestId != state_.manifest.id) {
+    return;
+  }
+
+  if (result.ok) {
+    state_.vodDetailsByKey[result.key] = result.details;
+  } else if (!result.error.empty()) {
+    std::printf("[KBORE][VOD] details failed for '%s': %s\n", result.channel.name.c_str(), result.error.c_str());
+  }
+}
+
 std::string App::epgLineForChannel(const Channel &channel) const {
   if (channel.type != StreamType::Live) {
     return "EPG not applicable";
@@ -4861,6 +5031,7 @@ static int gridWindowStart(int selected, int size, int columns, int rows) {
 void App::render() {
   drainFinishedChannelLoads();
   drainFinishedEpg();
+  updateVodDetailsLoad();
   gfx_.beginFrame();
 
   if (splashVisible_) {
@@ -4916,7 +5087,9 @@ void App::renderDashboardGraphic() {
   std::vector<const MediaNode *> nodeChildren;
   std::vector<const MediaNode *> nodePreview;
   Channel selectedNodeChannel;
+  Channel selectedNodeDetailsChannel;
   bool hasSelectedNodeChannel = false;
+  bool hasSelectedNodeDetailsChannel = false;
 
   if (usingNodeTree()) {
     nodeChildren = currentNodeChildren();
@@ -4952,6 +5125,13 @@ void App::renderDashboardGraphic() {
     if (previewNode && (previewNode->playable || !previewNode->url.empty())) {
       selectedNodeChannel = channelFromNode(*previewNode);
       hasSelectedNodeChannel = true;
+
+      const MediaNode *parent = currentNodeParent();
+      if (parent && currentNodeChildrenAreItems() && streamTypeFromString(parent->type) == StreamType::Series) {
+        selectedNodeDetailsChannel = channelFromNode(*parent);
+        selectedNodeDetailsChannel.type = StreamType::Series;
+        hasSelectedNodeDetailsChannel = true;
+      }
     }
   } else if (type) {
     categories = visibleCategoriesForSelectedType();
@@ -4960,6 +5140,9 @@ void App::renderDashboardGraphic() {
   const Channel *selectedChannel = hasSelectedNodeChannel
     ? &selectedNodeChannel
     : selectedChannelPtr();
+  const Channel *detailsChannel = hasSelectedNodeDetailsChannel
+    ? &selectedNodeDetailsChannel
+    : selectedChannel;
 
   const Category *selectedCategory = selectedCategoryPtr();
   const std::string provider = providerLabel(state_.hasManifest ? state_.manifest.provider : Provider::Local);
@@ -5240,16 +5423,7 @@ void App::renderDashboardGraphic() {
       return epgLineForChannel(ch);
     }
 
-    std::string label = ch.type == StreamType::Movies
-      ? "MOVIE"
-      : (ch.type == StreamType::Series ? "SERIES" : "ITEM");
-    if (!ch.group.empty()) {
-      label += " • " + ch.group;
-    }
-    if (!ch.streamId.empty()) {
-      label += " • #" + ch.streamId;
-    }
-    return label;
+    return std::string();
   };
 
   if (usingNodeTree()) {
@@ -5425,21 +5599,58 @@ void App::renderDashboardGraphic() {
   gfx_.fillRoundRect(info.x, info.y, info.w, info.h, 14, rgba(0,0,0,0));
   gfx_.strokeRoundRect(info.x, info.y, info.w, info.h, 14, rgba(72,92,128,35), 1);
   if (selectedChannel) {
-    drawLogoOrFallback(*selectedChannel, info.x + 34, info.y + 13, 154, 62);
-    gfx_.drawText(Graphics::fitText(selectedChannel->name, 42), info.x + 210, info.y + 18, 2, text, true);
+    const Channel &resolvedDetailsChannel = detailsChannel ? *detailsChannel : *selectedChannel;
+    const bool detailsApplies = isVodType(resolvedDetailsChannel.type);
+    const std::string detailsKey = detailsApplies
+      ? vodDetailsKeyForChannel(resolvedDetailsChannel)
+      : std::string();
+    if (detailsApplies && detailsKey != state_.currentVodDetailsKey) {
+      state_.currentVodDetailsKey = detailsKey;
+      requestVodDetailsForChannel(resolvedDetailsChannel);
+    } else if (!detailsApplies) {
+      state_.currentVodDetailsKey.clear();
+    }
+    const VodDetails *details = detailsApplies
+      ? cachedVodDetailsForChannel(resolvedDetailsChannel)
+      : nullptr;
+    Channel displayChannel = resolvedDetailsChannel;
+    if (details && !details->posterUrl.empty()) {
+      displayChannel.logo = details->posterUrl;
+    }
+
+    drawLogoOrFallback(displayChannel, info.x + 34, info.y + 13, 154, 62);
+    const std::string footerTitle = details && !details->title.empty()
+      ? details->title
+      : resolvedDetailsChannel.name;
+    gfx_.drawText(Graphics::fitText(footerTitle, 42), info.x + 210, info.y + 18, 2, text, true);
     std::string detailLine;
     if (selectedChannel->type == StreamType::Live) {
       detailLine = epgNowNextLine(*selectedChannel);
     } else {
-      detailLine =
-        std::string(selectedChannel->type == StreamType::Movies ? "MOVIE" :
-          (selectedChannel->type == StreamType::Series ? "SERIES" : "ITEM")) +
-        "  " +
-        (selectedChannel->group.empty() ? "No category" : selectedChannel->group);
-      if (!selectedChannel->streamId.empty()) {
-        detailLine += "  ID " + selectedChannel->streamId;
-      } else if (!selectedChannel->id.empty()) {
-        detailLine += "  ID " + selectedChannel->id;
+      if (details && (!details->description.empty() || !details->releaseDate.empty())) {
+        detailLine = details->description.empty() ? "No description available." : details->description;
+        std::string meta;
+        if (!details->releaseDate.empty()) {
+          meta += formatReleaseDate(details->releaseDate);
+        }
+        if (!meta.empty()) {
+          detailLine = meta + "\n" + detailLine;
+        }
+      } else if (!detailsKey.empty() &&
+                 state_.vodDetailsAttemptedKeys.count(detailsKey) &&
+                 !state_.vodDetailsByKey.count(detailsKey)) {
+        detailLine = "Loading details...";
+      } else {
+        detailLine =
+          std::string(resolvedDetailsChannel.type == StreamType::Movies ? "MOVIE" :
+            (resolvedDetailsChannel.type == StreamType::Series ? "SERIES" : "ITEM")) +
+          "  " +
+          (resolvedDetailsChannel.group.empty() ? "No category" : resolvedDetailsChannel.group);
+        if (!resolvedDetailsChannel.streamId.empty()) {
+          detailLine += "  ID " + resolvedDetailsChannel.streamId;
+        } else if (!resolvedDetailsChannel.id.empty()) {
+          detailLine += "  ID " + resolvedDetailsChannel.id;
+        }
       }
     }
     drawWrappedText(gfx_, detailLine, info.x + 210, info.y + 46, 2, 86, 1, muted);
@@ -6054,7 +6265,7 @@ void App::renderSettingsGraphic() {
   auto drawLine = [&](const std::string &line, int baseY, int scale, Color color, bool bold, int xOffset = 0) {
     const int y = baseY - scroll;
     const int height = (scale == 4 ? 30 : (scale == 3 ? 24 : 18));
-    if (y + height < viewportTop || y > viewportBottom) {
+    if (y < viewportTop || y + height > viewportBottom) {
       return;
     }
     gfx_.drawText(line, contentX + xOffset, y, scale, color, bold);
@@ -6064,7 +6275,7 @@ void App::renderSettingsGraphic() {
     const int rowY = y - scroll;
     const bool selected = state_.selectedSettingsOption == index;
 
-    if (rowY + 70 >= viewportTop && rowY <= viewportBottom) {
+    if (rowY >= viewportTop && rowY + 70 <= viewportBottom) {
       if (selected) {
         gfx_.fillRoundRect(contentX - 14, rowY - 8, panel.w - 68, 70, 12, selectedBg);
         gfx_.strokeRoundRect(contentX - 14, rowY - 8, panel.w - 68, 70, 12, rgba(0, 191, 255, 95), 1);

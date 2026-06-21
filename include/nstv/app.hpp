@@ -49,6 +49,9 @@ struct AppState {
   std::map<std::string, long long> epgRefreshAttemptMsByKey;
   std::string currentEpgKey;
   bool currentEpgAvailable = false;
+  std::map<std::string, VodDetails> vodDetailsByKey;
+  std::set<std::string> vodDetailsAttemptedKeys;
+  std::string currentVodDetailsKey;
 
   // Dynamic tree navigation. When manifest.nodes is available, the dashboard
   // behaves as a three-column tree browser:
@@ -138,6 +141,25 @@ private:
     std::string error;
   };
 
+  struct VodDetailsJob {
+    Config config;
+    std::string manifestId;
+    std::string source;
+    Provider provider = Provider::M3u;
+    Channel channel;
+    std::string key;
+    std::string language = "pt-BR";
+  };
+
+  struct VodDetailsResult {
+    std::string manifestId;
+    std::string key;
+    Channel channel;
+    bool ok = false;
+    VodDetails details;
+    std::string error;
+  };
+
   void render();
   void renderSplashGraphic();
   void renderDashboard();
@@ -190,6 +212,10 @@ private:
   void stopEpgWorker();
   void epgWorkerLoop();
   void drainFinishedEpg();
+  std::string vodDetailsKeyForChannel(const Channel &channel) const;
+  const VodDetails *cachedVodDetailsForChannel(const Channel &channel) const;
+  void requestVodDetailsForChannel(const Channel &channel);
+  void updateVodDetailsLoad();
   std::string channelEpgKey(const Channel &channel) const;
   std::vector<std::string> channelEpgKeys(const Channel &channel) const;
   const EpgPage *cachedEpgForChannel(const Channel &channel) const;
@@ -281,6 +307,13 @@ private:
   std::set<std::string> epgQueuedKeys_;
   std::vector<EpgResult> epgFinished_;
   std::atomic<bool> epgStop_{false};
+
+  std::thread vodDetailsThread_;
+  mutable std::mutex vodDetailsMutex_;
+  bool vodDetailsActive_ = false;
+  bool vodDetailsDone_ = false;
+  VodDetailsJob vodDetailsJob_;
+  VodDetailsResult vodDetailsResult_;
 
   std::thread playlistLoadThread_;
   mutable std::mutex playlistLoadMutex_;

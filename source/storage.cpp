@@ -131,6 +131,20 @@ std::string epgCachePath(const std::string &playlistId, const Channel &channel) 
     safeFilePart(epgCacheKey(channel)) + ".json";
 }
 
+std::string vodDetailsCacheKey(const Channel &channel) {
+  if (!channel.streamId.empty()) return channel.streamId;
+  if (!channel.id.empty()) return channel.id;
+  if (!channel.tvgId.empty()) return channel.tvgId;
+  return channel.name;
+}
+
+std::string vodDetailsCachePath(const std::string &playlistId, const Channel &channel) {
+  return cacheDir() + "/" +
+    safeFilePart(playlistId.empty() ? "active" : playlistId) + "_vod_" +
+    safeFilePart(toString(channel.type)) + "_" +
+    safeFilePart(vodDetailsCacheKey(channel)) + ".json";
+}
+
 std::string nodeChildrenPageCachePath(
   const std::string &playlistId,
   const std::string &nodeId,
@@ -890,6 +904,52 @@ bool loadEpgPage(
 
   try {
     page = epgPageFromJson(Json::parse(ss.str()));
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+static Json vodDetailsToJson(const VodDetails &details) {
+  Json json(Json::object_t{});
+  json["title"] = details.title;
+  json["description"] = details.description;
+  json["posterUrl"] = details.posterUrl;
+  json["backdropUrl"] = details.backdropUrl;
+  json["releaseDate"] = details.releaseDate;
+  json["provider"] = details.provider;
+  return json;
+}
+
+static VodDetails vodDetailsFromJson(const Json &json) {
+  const Json &root = json["details"].isObject() ? json["details"] : json;
+  VodDetails details;
+  details.title = root["title"].asString(root["name"].asString(""));
+  details.description = root["description"].asString(root["desc"].asString(root["plot"].asString(root["overview"].asString(root["synopsis"].asString("")))));
+  details.posterUrl = root["posterUrl"].asString(root["poster_url"].asString(root["image"].asString(root["stream_icon"].asString(root["cover"].asString(root["poster"].asString(""))))));
+  details.backdropUrl = root["backdropUrl"].asString(root["backdrop_url"].asString(root["backdrop_path"].asString("")));
+  details.releaseDate = root["releaseDate"].asString(root["release_date"].asString(root["firstAirDate"].asString(root["first_air_date"].asString(""))));
+  details.provider = root["provider"].asString("");
+  return details;
+}
+
+bool saveVodDetails(const std::string &playlistId, const Channel &channel, const VodDetails &details) {
+  ensureDataDir();
+  std::ofstream file(vodDetailsCachePath(playlistId, channel), std::ios::binary);
+  if (!file) return false;
+  file << vodDetailsToJson(details).stringify();
+  return true;
+}
+
+bool loadVodDetails(const std::string &playlistId, const Channel &channel, VodDetails &details) {
+  std::ifstream file(vodDetailsCachePath(playlistId, channel), std::ios::binary);
+  if (!file) return false;
+
+  std::ostringstream ss;
+  ss << file.rdbuf();
+
+  try {
+    details = vodDetailsFromJson(Json::parse(ss.str()));
     return true;
   } catch (...) {
     return false;
