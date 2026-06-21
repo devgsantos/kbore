@@ -10,6 +10,50 @@
 
 namespace nstv {
 
+std::string toString(PlaybackSleepBehavior behavior) {
+  switch (behavior) {
+    case PlaybackSleepBehavior::SystemDefault: return "system_default";
+    case PlaybackSleepBehavior::DockedOnly: return "docked_only";
+    case PlaybackSleepBehavior::AlwaysPrevent: return "always_prevent";
+  }
+
+  return "docked_only";
+}
+
+PlaybackSleepBehavior playbackSleepBehaviorFromString(const std::string &value) {
+  if (value == "system_default" || value == "system" || value == "default") {
+    return PlaybackSleepBehavior::SystemDefault;
+  }
+
+  if (value == "always_prevent" || value == "always" || value == "prevent_always") {
+    return PlaybackSleepBehavior::AlwaysPrevent;
+  }
+
+  return PlaybackSleepBehavior::DockedOnly;
+}
+
+std::string toString(ParentalRule rule) {
+  switch (rule) {
+    case ParentalRule::None: return "none";
+    case ParentalRule::Hidden: return "hide";
+    case ParentalRule::Locked: return "lock";
+  }
+
+  return "none";
+}
+
+ParentalRule parentalRuleFromString(const std::string &value) {
+  if (value == "hide" || value == "hidden") {
+    return ParentalRule::Hidden;
+  }
+
+  if (value == "lock" || value == "locked") {
+    return ParentalRule::Locked;
+  }
+
+  return ParentalRule::None;
+}
+
 namespace {
 
 static std::string trimTrailingSlash(std::string value) {
@@ -228,6 +272,28 @@ Config loadConfig() {
         cfg.pageSize = json["pageSize"].asInt(20);
         cfg.preloadThreshold = json["preloadThreshold"].asInt(8);
         cfg.useUnicodeIcons = json["useUnicodeIcons"].asBool(false);
+        cfg.playbackSleepBehavior = playbackSleepBehaviorFromString(
+          json["playback_sleep_behavior"].asString(json["playbackSleepBehavior"].asString("docked_only"))
+        );
+        cfg.dockedSleepTimerMinutes = json["docked_sleep_timer_minutes"].asInt(json["dockedSleepTimerMinutes"].asInt(0));
+        cfg.batterySleepTimeoutMinutes = json["battery_sleep_timeout_minutes"].asInt(json["batterySleepTimeoutMinutes"].asInt(10));
+        cfg.sleepWarningSeconds = json["sleep_warning_seconds"].asInt(json["sleepWarningSeconds"].asInt(60));
+        cfg.manifestRefreshHours = json["manifest_refresh_hours"].asInt(json["manifestRefreshHours"].asInt(24));
+        cfg.epgRefreshHours = json["epg_refresh_hours"].asInt(json["epgRefreshHours"].asInt(12));
+        cfg.uiLanguage = json["ui_language"].asString(json["uiLanguage"].asString("en"));
+        cfg.parentalPin = json["parental_pin"].asString(json["parentalPin"].asString("0000"));
+
+        const Json &parentalRules = json["parental_rules"].isObject()
+          ? json["parental_rules"]
+          : json["parentalRules"];
+        if (parentalRules.isObject()) {
+          for (const auto &entry : parentalRules.asObject()) {
+            ParentalRule rule = parentalRuleFromString(entry.second.asString("none"));
+            if (rule != ParentalRule::None) {
+              cfg.parentalRules[entry.first] = rule;
+            }
+          }
+        }
 
         if (json["playlists"].isArray()) {
           int index = 0;
@@ -281,6 +347,26 @@ Config loadConfig() {
     if (cfg.pageSize > 1000) cfg.pageSize = 1000;
     if (cfg.preloadThreshold < 1) cfg.preloadThreshold = 1;
     if (cfg.preloadThreshold > 50) cfg.preloadThreshold = 50;
+    if (cfg.dockedSleepTimerMinutes < 0) cfg.dockedSleepTimerMinutes = 0;
+    if (cfg.dockedSleepTimerMinutes > 240) cfg.dockedSleepTimerMinutes = 240;
+    if (cfg.batterySleepTimeoutMinutes < 1) cfg.batterySleepTimeoutMinutes = 10;
+    if (cfg.batterySleepTimeoutMinutes > 120) cfg.batterySleepTimeoutMinutes = 120;
+    if (cfg.sleepWarningSeconds < 10) cfg.sleepWarningSeconds = 10;
+    if (cfg.sleepWarningSeconds > 300) cfg.sleepWarningSeconds = 300;
+    if (cfg.manifestRefreshHours < 0) cfg.manifestRefreshHours = 0;
+    if (cfg.manifestRefreshHours > 168) cfg.manifestRefreshHours = 168;
+    if (cfg.epgRefreshHours < 0) cfg.epgRefreshHours = 0;
+    if (cfg.epgRefreshHours > 72) cfg.epgRefreshHours = 72;
+    if (cfg.uiLanguage.empty()) cfg.uiLanguage = "en";
+    cfg.uiLanguage = cfg.uiLanguage.substr(0, 8);
+    cfg.parentalPin.erase(
+      std::remove_if(cfg.parentalPin.begin(), cfg.parentalPin.end(), [](unsigned char c) {
+        return !std::isdigit(c);
+      }),
+      cfg.parentalPin.end()
+    );
+    if (cfg.parentalPin.empty()) cfg.parentalPin = "0000";
+    if (cfg.parentalPin.size() > 8) cfg.parentalPin = cfg.parentalPin.substr(0, 8);
 
     return cfg;
   };
@@ -323,6 +409,35 @@ Config loadConfig() {
     cfg.playlists = legacy.playlists;
     cfg.activePlaylistId = legacy.activePlaylistId;
   }
+
+  if (cfg.playbackSleepBehavior == PlaybackSleepBehavior::DockedOnly &&
+      legacy.playbackSleepBehavior != PlaybackSleepBehavior::DockedOnly) {
+    cfg.playbackSleepBehavior = legacy.playbackSleepBehavior;
+  }
+  if (cfg.dockedSleepTimerMinutes == 0 && legacy.dockedSleepTimerMinutes != 0) {
+    cfg.dockedSleepTimerMinutes = legacy.dockedSleepTimerMinutes;
+  }
+  if (cfg.batterySleepTimeoutMinutes == 10 && legacy.batterySleepTimeoutMinutes != 10) {
+    cfg.batterySleepTimeoutMinutes = legacy.batterySleepTimeoutMinutes;
+  }
+  if (cfg.sleepWarningSeconds == 60 && legacy.sleepWarningSeconds != 60) {
+    cfg.sleepWarningSeconds = legacy.sleepWarningSeconds;
+  }
+  if (cfg.manifestRefreshHours == 24 && legacy.manifestRefreshHours != 24) {
+    cfg.manifestRefreshHours = legacy.manifestRefreshHours;
+  }
+  if (cfg.epgRefreshHours == 12 && legacy.epgRefreshHours != 12) {
+    cfg.epgRefreshHours = legacy.epgRefreshHours;
+  }
+  if (cfg.uiLanguage == "en" && legacy.uiLanguage != "en") {
+    cfg.uiLanguage = legacy.uiLanguage;
+  }
+  if (cfg.parentalPin == "0000" && legacy.parentalPin != "0000") {
+    cfg.parentalPin = legacy.parentalPin;
+  }
+  if (cfg.parentalRules.empty() && !legacy.parentalRules.empty()) {
+    cfg.parentalRules = legacy.parentalRules;
+  }
 #endif
 
   if (cfg.parserApiBaseUrl.empty()) {
@@ -350,6 +465,14 @@ bool saveConfig(const Config &config) {
   json["pageSize"] = config.pageSize;
   json["preloadThreshold"] = config.preloadThreshold;
   json["useUnicodeIcons"] = config.useUnicodeIcons;
+  json["playback_sleep_behavior"] = toString(config.playbackSleepBehavior);
+  json["docked_sleep_timer_minutes"] = config.dockedSleepTimerMinutes;
+  json["battery_sleep_timeout_minutes"] = config.batterySleepTimeoutMinutes;
+  json["sleep_warning_seconds"] = config.sleepWarningSeconds;
+  json["manifest_refresh_hours"] = config.manifestRefreshHours;
+  json["epg_refresh_hours"] = config.epgRefreshHours;
+  json["ui_language"] = config.uiLanguage;
+  json["parental_pin"] = config.parentalPin.empty() ? "0000" : config.parentalPin;
   json["active"] = config.activePlaylistId;
   json["active_playlist_id"] = config.activePlaylistId;
 
@@ -364,6 +487,14 @@ bool saveConfig(const Config &config) {
   }
 
   json["playlists"] = Json(playlists);
+
+  Json::object_t parentalRules;
+  for (const auto &entry : config.parentalRules) {
+    if (entry.second != ParentalRule::None) {
+      parentalRules[entry.first] = toString(entry.second);
+    }
+  }
+  json["parental_rules"] = Json(parentalRules);
 
   std::ofstream file(configPath(), std::ios::binary);
 

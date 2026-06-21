@@ -320,6 +320,15 @@ void setMediaPlaybackActive(bool active) {
 #endif
 }
 
+bool platformIsDockedMode() {
+#ifdef __SWITCH__
+  AppletOperationMode mode = appletGetOperationMode();
+  return mode == AppletOperationMode_Console;
+#else
+  return true;
+#endif
+}
+
 
 std::string requestTextInput(const std::string &title, const std::string &initialValue, int maxLength) {
   if (maxLength < 1) {

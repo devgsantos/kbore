@@ -13,6 +13,7 @@
 #include <mutex>
 #include <thread>
 #include <limits>
+#include <sys/stat.h>
 
 namespace nstv {
 
@@ -99,6 +100,142 @@ std::string formatEpgOffsetMinutes(int minutes) {
     std::snprintf(buffer, sizeof(buffer), "%c%dh%02d", sign, hours, mins);
   }
   return buffer;
+}
+
+std::string playbackSleepBehaviorLabel(PlaybackSleepBehavior behavior) {
+  switch (behavior) {
+    case PlaybackSleepBehavior::SystemDefault: return "System default";
+    case PlaybackSleepBehavior::DockedOnly: return "Docked only";
+    case PlaybackSleepBehavior::AlwaysPrevent: return "Always prevent";
+  }
+
+  return "Docked only";
+}
+
+PlaybackSleepBehavior nextPlaybackSleepBehavior(PlaybackSleepBehavior behavior, int direction) {
+  std::vector<PlaybackSleepBehavior> values{
+    PlaybackSleepBehavior::SystemDefault,
+    PlaybackSleepBehavior::DockedOnly,
+    PlaybackSleepBehavior::AlwaysPrevent
+  };
+
+  auto it = std::find(values.begin(), values.end(), behavior);
+  int index = it == values.end() ? 1 : static_cast<int>(std::distance(values.begin(), it));
+  index = (index + direction + static_cast<int>(values.size())) % static_cast<int>(values.size());
+  return values[static_cast<std::size_t>(index)];
+}
+
+std::string formatMinutesOption(int minutes) {
+  if (minutes <= 0) {
+    return "Off";
+  }
+
+  if (minutes % 60 == 0) {
+    const int hours = minutes / 60;
+    return std::to_string(hours) + (hours == 1 ? " hour" : " hours");
+  }
+
+  return std::to_string(minutes) + " minutes";
+}
+
+std::string formatHoursOption(int hours) {
+  if (hours <= 0) {
+    return "Cache only";
+  }
+
+  if (hours == 1) {
+    return "1 hour";
+  }
+
+  return std::to_string(hours) + " hours";
+}
+
+bool cacheFileFresh(const std::string &path, int refreshHours) {
+  if (refreshHours <= 0) {
+    return true;
+  }
+
+  struct stat info {};
+  if (stat(path.c_str(), &info) != 0) {
+    return false;
+  }
+
+  const std::time_t now = currentUnixTime();
+  if (now <= 0 || info.st_mtime <= 0) {
+    return true;
+  }
+
+  const long long ageSeconds = static_cast<long long>(now - info.st_mtime);
+  return ageSeconds >= 0 && ageSeconds < static_cast<long long>(refreshHours) * 3600LL;
+}
+
+bool playlistManifestCacheFresh(const std::string &playlistId, int refreshHours) {
+  const std::string raw = playlistManifestPath(playlistId);
+  return cacheFileFresh(raw + ".gz", refreshHours) || cacheFileFresh(raw, refreshHours);
+}
+
+std::string digitsOnly(std::string value, std::size_t maxLen = 8) {
+  value.erase(
+    std::remove_if(value.begin(), value.end(), [](unsigned char c) {
+      return !std::isdigit(c);
+    }),
+    value.end()
+  );
+
+  if (value.size() > maxLen) {
+    value = value.substr(0, maxLen);
+  }
+
+  return value;
+}
+
+std::string parentalRuleLabel(ParentalRule rule) {
+  switch (rule) {
+    case ParentalRule::Hidden: return "Hide";
+    case ParentalRule::Locked: return "Lock";
+    case ParentalRule::None: return "Unlock";
+  }
+
+  return "Unlock";
+}
+
+std::string languageLabel(const std::string &language) {
+  if (language == "pt-BR" || language == "pt") return "Portuguese";
+  if (language == "es") return "Spanish";
+  return "English";
+}
+
+std::string nextLanguage(const std::string &language, int direction) {
+  std::vector<std::string> values{"en", "pt-BR", "es"};
+  auto it = std::find(values.begin(), values.end(), language);
+  int index = it == values.end() ? 0 : static_cast<int>(std::distance(values.begin(), it));
+  index = (index + direction + static_cast<int>(values.size())) % static_cast<int>(values.size());
+  return values[static_cast<std::size_t>(index)];
+}
+
+std::string formatSecondsClock(long long ms) {
+  if (ms < 0) {
+    ms = 0;
+  }
+
+  long long totalSeconds = (ms + 999) / 1000;
+  const long long minutes = totalSeconds / 60;
+  const long long seconds = totalSeconds % 60;
+
+  char buffer[32] = {};
+  std::snprintf(buffer, sizeof(buffer), "%02lld:%02lld", minutes, seconds);
+  return buffer;
+}
+
+int nextOptionValue(int current, const std::vector<int> &values, int direction) {
+  if (values.empty()) {
+    return current;
+  }
+
+  auto it = std::find(values.begin(), values.end(), current);
+  int index = it == values.end() ? 0 : static_cast<int>(std::distance(values.begin(), it));
+  index = (index + direction + static_cast<int>(values.size())) % static_cast<int>(values.size());
+  return values[static_cast<std::size_t>(index)];
 }
 
 bool isVodType(StreamType type) {
@@ -604,22 +741,25 @@ bool parseEpgTimeInternal(const std::string &value, std::time_t &timestamp, EpgT
       return false;
     }
 
+    int offsetSeconds = 0;
     std::size_t zonePos = text.find_first_of("+-", 14);
-    if (zonePos != std::string::npos) {
-      int offsetSeconds = 0;
-      if (parseZoneOffsetSeconds(text.substr(zonePos), offsetSeconds)) {
-        if (interpretation == EpgTimeInterpretation::LocalWallClock) {
-          return localWallClockTimestamp(year, month, day, hour, minute, second, timestamp);
-        }
-
-        timestamp = static_cast<std::time_t>(
-          epochFromUtcParts(year, month, day, hour, minute, second) - offsetSeconds
-        );
-        return true;
+    if (zonePos != std::string::npos && parseZoneOffsetSeconds(text.substr(zonePos), offsetSeconds)) {
+      if (interpretation == EpgTimeInterpretation::LocalWallClock) {
+        return localWallClockTimestamp(year, month, day, hour, minute, second, timestamp);
       }
+    } else {
+      /*
+        Match the Android parser: compact XMLTV values without an explicit
+        timezone are interpreted as UTC, while ISO/local date strings without
+        a timezone stay anchored to the device timezone.
+      */
+      offsetSeconds = 0;
     }
 
-    return localWallClockTimestamp(year, month, day, hour, minute, second, timestamp);
+    timestamp = static_cast<std::time_t>(
+      epochFromUtcParts(year, month, day, hour, minute, second) - offsetSeconds
+    );
+    return true;
   }
 
   return false;
@@ -1314,6 +1454,7 @@ int App::run() {
         handle(button);
       }
 
+      applyPlaybackSleepPolicy();
       render();
       sleepMs(16);
       continue;
@@ -1349,6 +1490,7 @@ void App::handle(Button button) {
   switch (state_.screen) {
     case ScreenId::Dashboard: handleDashboard(button); break;
     case ScreenId::AddPlaylist: handleAddPlaylist(button); break;
+    case ScreenId::Parental: handleParental(button); break;
     case ScreenId::Player: {
       const long long now = nowMs();
       const bool isOpen = player_ && player_->isOpen();
@@ -1378,11 +1520,17 @@ void App::handle(Button button) {
         state_.playerLoadFailed = false;
         state_.playerErrorMessage.clear();
         state_.hasPlaybackChannel = false;
+        resetPlaybackSleepTimers();
         break;
       }
 
       if (button != Button::None) {
         state_.playerOverlayUntilMs = now + 5000;
+        state_.lastPlaybackInputMs = now;
+        if (platformIsDockedMode() && state_.config.dockedSleepTimerMinutes > 0) {
+          state_.playbackStartedAtMs = now;
+          state_.message = "Sleep timer reset";
+        }
       }
 
       // Playback commands are intentional only while the overlay is visible.
@@ -1422,57 +1570,118 @@ void App::handle(Button button) {
       break;
     }
     case ScreenId::Settings:
-      if (button == Button::Back || button == Button::Select) {
+      if (button == Button::Back) {
         state_.screen = ScreenId::Dashboard;
         break;
       }
 
       {
+        const int optionCount = 9;
         const int settingsViewportHeight = 412;
-        const int settingsContentHeight = 558;
-        const int settingsScrollStep = 38;
+        const int settingsContentHeight = 970;
         const int maxSettingsScroll = std::max(0, settingsContentHeight - settingsViewportHeight);
 
         if (button == Button::Up) {
-          state_.settingsScroll = std::max(0, state_.settingsScroll - settingsScrollStep);
+          state_.selectedSettingsOption = std::max(0, state_.selectedSettingsOption - 1);
+          state_.settingsScroll = std::max(0, std::min(maxSettingsScroll, state_.selectedSettingsOption * 74));
           break;
         }
         if (button == Button::Down) {
-          state_.settingsScroll = std::min(maxSettingsScroll, state_.settingsScroll + settingsScrollStep);
+          state_.selectedSettingsOption = std::min(optionCount - 1, state_.selectedSettingsOption + 1);
+          state_.settingsScroll = std::max(0, std::min(maxSettingsScroll, state_.selectedSettingsOption * 74));
           break;
         }
       }
 
+      if (button == Button::Select && state_.selectedSettingsOption != 5) {
+        break;
+      }
+
       if (button == Button::Left || button == Button::Right ||
           button == Button::ShoulderLeft || button == Button::ShoulderRight ||
-          button == Button::FavoriteToggle) {
-        const PlaylistConfig *active = activePlaylist();
-        if (!active) {
-          state_.message = "No active playlist";
-          break;
-        }
+          button == Button::FavoriteToggle || button == Button::Select) {
+        const int direction = (button == Button::Left || button == Button::ShoulderLeft) ? -1 : 1;
 
-        for (PlaylistConfig &playlist : state_.config.playlists) {
-          if (playlist.id != active->id) {
-            continue;
+        if (state_.selectedSettingsOption == 0) {
+          const PlaylistConfig *active = activePlaylist();
+          if (!active) {
+            state_.message = "No active playlist";
+            break;
           }
 
-          if (button == Button::FavoriteToggle) {
-            playlist.epgOffsetMinutes = 0;
-          } else {
-            const int step = (button == Button::ShoulderLeft || button == Button::ShoulderRight) ? 60 : 30;
-            playlist.epgOffsetMinutes += (button == Button::Left || button == Button::ShoulderLeft) ? -step : step;
-            playlist.epgOffsetMinutes = std::max(-12 * 60, std::min(12 * 60, playlist.epgOffsetMinutes));
-          }
+          for (PlaylistConfig &playlist : state_.config.playlists) {
+            if (playlist.id != active->id) {
+              continue;
+            }
 
+            if (button == Button::FavoriteToggle) {
+              playlist.epgOffsetMinutes = 0;
+            } else {
+              const int step = (button == Button::ShoulderLeft || button == Button::ShoulderRight) ? 60 : 30;
+              playlist.epgOffsetMinutes += direction * step;
+              playlist.epgOffsetMinutes = std::max(-12 * 60, std::min(12 * 60, playlist.epgOffsetMinutes));
+            }
+
+            saveConfig(state_.config);
+            setRuntimeEpgOffsetMinutes(playlist.epgOffsetMinutes);
+            state_.epgByChannel.clear();
+            state_.currentEpgAvailable = false;
+            state_.message = "EPG offset: " + formatEpgOffsetMinutes(playlist.epgOffsetMinutes);
+            loadVisibleEpgForChannelList();
+            loadSelectedEpg(false, false);
+            break;
+          }
+        } else if (state_.selectedSettingsOption == 1) {
+          state_.config.playbackSleepBehavior = button == Button::FavoriteToggle
+            ? PlaybackSleepBehavior::DockedOnly
+            : nextPlaybackSleepBehavior(state_.config.playbackSleepBehavior, direction);
           saveConfig(state_.config);
-          setRuntimeEpgOffsetMinutes(playlist.epgOffsetMinutes);
-          state_.epgByChannel.clear();
-          state_.currentEpgAvailable = false;
-          state_.message = "EPG offset: " + formatEpgOffsetMinutes(playlist.epgOffsetMinutes);
-          loadVisibleEpgForChannelList();
-          loadSelectedEpg(false, false);
-          break;
+          state_.message = "Playback sleep: " + playbackSleepBehaviorLabel(state_.config.playbackSleepBehavior);
+          applyPlaybackSleepPolicy();
+        } else if (state_.selectedSettingsOption == 2) {
+          state_.config.dockedSleepTimerMinutes = button == Button::FavoriteToggle
+            ? 0
+            : nextOptionValue(state_.config.dockedSleepTimerMinutes, std::vector<int>{0, 30, 60, 120}, direction);
+          saveConfig(state_.config);
+          state_.message = "Docked sleep timer: " + formatMinutesOption(state_.config.dockedSleepTimerMinutes);
+        } else if (state_.selectedSettingsOption == 3) {
+          state_.config.batterySleepTimeoutMinutes = button == Button::FavoriteToggle
+            ? 10
+            : nextOptionValue(state_.config.batterySleepTimeoutMinutes, std::vector<int>{5, 10, 15, 30}, direction);
+          saveConfig(state_.config);
+          state_.message = "Battery warning estimate: " + std::to_string(state_.config.batterySleepTimeoutMinutes) + " minutes";
+        } else if (state_.selectedSettingsOption == 4) {
+          state_.config.sleepWarningSeconds = button == Button::FavoriteToggle
+            ? 60
+            : nextOptionValue(state_.config.sleepWarningSeconds, std::vector<int>{30, 60, 120}, direction);
+          saveConfig(state_.config);
+          state_.message = "Sleep warning lead: " + std::to_string(state_.config.sleepWarningSeconds) + " seconds";
+        } else if (state_.selectedSettingsOption == 5) {
+          if (button == Button::Select) {
+            state_.screen = ScreenId::Parental;
+            state_.selectedParentalType = 0;
+            state_.selectedParentalCategory = 0;
+            break;
+          }
+          state_.message = "Press A to open parental controls";
+        } else if (state_.selectedSettingsOption == 6) {
+          state_.config.manifestRefreshHours = button == Button::FavoriteToggle
+            ? 24
+            : nextOptionValue(state_.config.manifestRefreshHours, std::vector<int>{0, 6, 12, 24, 48, 72}, direction);
+          saveConfig(state_.config);
+          state_.message = "Manifest refresh: " + formatHoursOption(state_.config.manifestRefreshHours);
+        } else if (state_.selectedSettingsOption == 7) {
+          state_.config.epgRefreshHours = button == Button::FavoriteToggle
+            ? 12
+            : nextOptionValue(state_.config.epgRefreshHours, std::vector<int>{0, 3, 6, 12, 24}, direction);
+          saveConfig(state_.config);
+          state_.message = "EPG refresh: " + formatHoursOption(state_.config.epgRefreshHours);
+        } else if (state_.selectedSettingsOption == 8) {
+          state_.config.uiLanguage = button == Button::FavoriteToggle
+            ? "en"
+            : nextLanguage(state_.config.uiLanguage, direction);
+          saveConfig(state_.config);
+          state_.message = "Language: " + languageLabel(state_.config.uiLanguage);
         }
       }
       break;
@@ -1757,6 +1966,12 @@ void App::handleDashboard(Button button) {
           return;
         }
 
+        const std::string nodeKey = parentalKeyForNode(*node);
+        const std::string nodeTitle = node->title.empty() ? node->name : node->title;
+        if (!requestParentalUnlock(nodeKey, nodeTitle)) {
+          return;
+        }
+
         if (nodeCanHaveChildren(*node)) {
           if (!ensureNodeChildrenLoaded(*node)) {
             return;
@@ -1805,6 +2020,12 @@ void App::handleDashboard(Button button) {
             loadSelectedEpg(false, false);
             return;
           }
+          return;
+        }
+
+        const std::string previewKey = parentalKeyForNode(*preview);
+        const std::string previewTitle = preview->title.empty() ? preview->name : preview->title;
+        if (!requestParentalUnlock(previewKey, previewTitle)) {
           return;
         }
 
@@ -1991,6 +2212,10 @@ void App::handleDashboard(Button button) {
     }
 
     if (state_.focus == FocusColumn::Categories) {
+      const Category *category = selectedCategoryPtr();
+      if (category && !requestParentalUnlock(parentalKeyForCategory(*category), category->name)) {
+        return;
+      }
       loadCategory(false);
       state_.focus = FocusColumn::Channels;
       loadVisibleEpgForChannelList();
@@ -2061,6 +2286,7 @@ void App::handleAddPlaylist(Button button) {
     if (state_.selectedAddOption == settingsIndex) {
       state_.screen = ScreenId::Settings;
       state_.settingsScroll = 0;
+      state_.selectedSettingsOption = 0;
       return;
     }
 
@@ -2069,6 +2295,95 @@ void App::handleAddPlaylist(Button button) {
       return;
     }
   }
+}
+
+void App::handleParental(Button button) {
+  const std::vector<StreamType> streamTypes{
+    StreamType::Live,
+    StreamType::Movies,
+    StreamType::Series,
+    StreamType::Radio
+  };
+
+  if (button == Button::Back) {
+    state_.screen = ScreenId::Settings;
+    return;
+  }
+
+  if (button == Button::FavoriteToggle) {
+    changeParentalPin();
+    return;
+  }
+
+  if (button == Button::Left || button == Button::Right ||
+      button == Button::ShoulderLeft || button == Button::ShoulderRight) {
+    const int direction = (button == Button::Left || button == Button::ShoulderLeft) ? -1 : 1;
+    state_.selectedParentalType =
+      (state_.selectedParentalType + direction + static_cast<int>(streamTypes.size())) %
+      static_cast<int>(streamTypes.size());
+    state_.selectedParentalCategory = 0;
+    return;
+  }
+
+  const StreamType activeType = streamTypes[static_cast<std::size_t>(
+    std::clamp(state_.selectedParentalType, 0, static_cast<int>(streamTypes.size()) - 1)
+  )];
+  const std::vector<Category> categories = parentalCategoriesForType(activeType);
+
+  if (button == Button::Up) {
+    state_.selectedParentalCategory = std::max(0, state_.selectedParentalCategory - 1);
+    return;
+  }
+
+  if (button == Button::Down) {
+    state_.selectedParentalCategory = std::min(
+      std::max(0, static_cast<int>(categories.size()) - 1),
+      state_.selectedParentalCategory + 1
+    );
+    return;
+  }
+
+  if (button != Button::Select) {
+    return;
+  }
+
+  if (categories.empty()) {
+    state_.message = "No categories in this stream type";
+    return;
+  }
+
+  const int index = std::clamp(
+    state_.selectedParentalCategory,
+    0,
+    std::max(0, static_cast<int>(categories.size()) - 1)
+  );
+  const Category &category = categories[static_cast<std::size_t>(index)];
+
+  if (!verifyParentalPin("Parental PIN for " + Graphics::fitText(category.name, 24), 3)) {
+    return;
+  }
+
+  const std::string key = parentalKeyForCategory(category);
+  const ParentalRule current = parentalRuleForKey(key);
+  ParentalRule next = ParentalRule::Hidden;
+  if (current == ParentalRule::Hidden) {
+    next = ParentalRule::Locked;
+  } else if (current == ParentalRule::Locked) {
+    next = ParentalRule::None;
+  }
+
+  if (next == ParentalRule::None) {
+    state_.config.parentalRules.erase(key);
+  } else {
+    state_.config.parentalRules[key] = next;
+  }
+
+  saveConfig(state_.config);
+  state_.parentalUnlocked = false;
+  state_.parentalDeniedKey.clear();
+  resetLoadedChannels();
+  normalizeIndexes();
+  state_.message = category.name + ": " + parentalRuleLabel(next);
 }
 
 
@@ -2199,7 +2514,8 @@ void App::startPlaylistLoad(const PlaylistConfig &playlist, bool forceRefresh) {
     try {
       Manifest manifest;
 
-      if (!forceRefresh) {
+      const bool cacheIsFresh = playlistManifestCacheFresh(playlist.id, config.manifestRefreshHours);
+      if (!forceRefresh && cacheIsFresh) {
         setStatus("Loading cached manifest...");
 
         if (loadManifestForPlaylist(manifest, playlist.id) &&
@@ -2217,6 +2533,8 @@ void App::startPlaylistLoad(const PlaylistConfig &playlist, bool forceRefresh) {
           playlistLoadMessage_ = "Preparing interface...";
           return;
         }
+      } else if (!forceRefresh) {
+        setStatus("Refreshing stale manifest cache...");
       }
 
       const std::string sourceUrl = playlist.sourceUrl();
@@ -2611,6 +2929,10 @@ void App::loadCategory(bool append) {
       return;
     }
 
+    if (!requestParentalUnlock(parentalKeyForCategory(*category), category->name)) {
+      return;
+    }
+
     int page = append ? state_.loadedPage + 1 : 1;
     std::string key =
       toString(state_.manifest.provider) + ":" +
@@ -2967,7 +3289,8 @@ void App::loadSelectedEpg(bool force, bool fetchRemote) {
   }
 
   EpgPage cached;
-  if (!force && loadEpgPage(state_.manifest.id, *channel, cached)) {
+  const bool epgCacheFresh = cacheFileFresh(epgCachePath(state_.manifest.id, *channel), state_.config.epgRefreshHours);
+  if (!force && epgCacheFresh && loadEpgPage(state_.manifest.id, *channel, cached)) {
     for (const std::string &alias : channelEpgKeys(*channel)) {
       state_.epgByChannel[alias] = cached;
     }
@@ -3021,7 +3344,8 @@ void App::loadEpgForChannels(const std::vector<Channel> &channels) {
     }
 
     EpgPage cached;
-    if (loadEpgPage(state_.manifest.id, channel, cached)) {
+    const bool epgCacheFresh = cacheFileFresh(epgCachePath(state_.manifest.id, channel), state_.config.epgRefreshHours);
+    if (epgCacheFresh && loadEpgPage(state_.manifest.id, channel, cached)) {
       for (const std::string &alias : channelEpgKeys(channel)) {
         state_.epgByChannel[alias] = cached;
       }
@@ -3350,8 +3674,11 @@ void App::openChannel(const Channel &channel) {
   player_->setOverlayVisible(true);
 
   if (player_->open(channel.url)) {
-    setMediaPlaybackActive(true);
-    logLine("[KBORE][PLAYBACK][LIFECYCLE] media playback state enabled");
+    resetPlaybackSleepTimers();
+    state_.playbackStartedAtMs = nowMs();
+    state_.lastPlaybackInputMs = state_.playbackStartedAtMs;
+    applyPlaybackSleepPolicy();
+    logLine("[KBORE][PLAYBACK][LIFECYCLE] playback sleep policy applied");
 
     if (!player_->nativeVideoActive() && gfx_.isSuspendedForNativeVideo()) {
       gfx_.resumeAfterNativeVideo();
@@ -3378,6 +3705,7 @@ void App::openChannel(const Channel &channel) {
     state_.playerLoadFailed = true;
     state_.playerErrorMessage = openError;
     setMediaPlaybackActive(false);
+    resetPlaybackSleepTimers();
     gfx_.resumeAfterNativeVideo();
 
     if (player_) {
@@ -3385,6 +3713,119 @@ void App::openChannel(const Channel &channel) {
       player_.reset();
     }
   }
+}
+
+void App::resetPlaybackSleepTimers() {
+  state_.playbackStartedAtMs = 0;
+  state_.lastPlaybackInputMs = 0;
+  state_.lastSleepKeepAliveMs = 0;
+}
+
+void App::applyPlaybackSleepPolicy() {
+  const bool playbackOpen = state_.screen == ScreenId::Player && player_ && player_->isOpen();
+
+  if (!playbackOpen) {
+    setMediaPlaybackActive(false);
+    return;
+  }
+
+  const long long now = nowMs();
+  if (state_.playbackStartedAtMs <= 0) {
+    state_.playbackStartedAtMs = now;
+  }
+  if (state_.lastPlaybackInputMs <= 0) {
+    state_.lastPlaybackInputMs = now;
+  }
+
+  const bool docked = platformIsDockedMode();
+  bool preventSleep = false;
+
+  switch (state_.config.playbackSleepBehavior) {
+    case PlaybackSleepBehavior::SystemDefault:
+      preventSleep = false;
+      break;
+    case PlaybackSleepBehavior::DockedOnly:
+      preventSleep = docked;
+      break;
+    case PlaybackSleepBehavior::AlwaysPrevent:
+      preventSleep = true;
+      break;
+  }
+
+  if (docked && state_.config.dockedSleepTimerMinutes > 0) {
+    const long long timerMs = static_cast<long long>(state_.config.dockedSleepTimerMinutes) * 60LL * 1000LL;
+    const long long elapsedMs = now - state_.playbackStartedAtMs;
+
+    if (elapsedMs >= timerMs) {
+      logLine("[KBORE][SLEEP] docked playback sleep timer ended; stopping playback");
+      setMediaPlaybackActive(false);
+
+      if (player_) {
+        player_->close();
+        player_.reset();
+      }
+
+      gfx_.resumeAfterNativeVideo();
+      state_.screen = ScreenId::Dashboard;
+      state_.message = "Sleep timer ended";
+      state_.playerStarted = false;
+      state_.playerFrameSeen = false;
+      state_.playerLoading = false;
+      state_.playerLoadFailed = false;
+      state_.playerErrorMessage.clear();
+      state_.hasPlaybackChannel = false;
+      resetPlaybackSleepTimers();
+      return;
+    }
+  }
+
+  setMediaPlaybackActive(preventSleep);
+
+  if (preventSleep && now - state_.lastSleepKeepAliveMs >= 30000) {
+    setMediaPlaybackActive(true);
+    state_.lastSleepKeepAliveMs = now;
+  }
+}
+
+std::string App::playbackSleepWarningText(bool compact) const {
+  const bool playbackOpen = state_.screen == ScreenId::Player && player_ && player_->isOpen();
+  if (!playbackOpen) {
+    return "";
+  }
+
+  const long long now = nowMs();
+  const int warningSeconds = std::max(10, state_.config.sleepWarningSeconds);
+  const long long warningMs = static_cast<long long>(warningSeconds) * 1000LL;
+  const bool docked = platformIsDockedMode();
+
+  if (docked && state_.config.dockedSleepTimerMinutes > 0 && state_.playbackStartedAtMs > 0) {
+    const long long timerMs = static_cast<long long>(state_.config.dockedSleepTimerMinutes) * 60LL * 1000LL;
+    const long long remainingMs = timerMs - (now - state_.playbackStartedAtMs);
+
+    if (remainingMs <= warningMs) {
+      const std::string clock = formatSecondsClock(remainingMs);
+      if (compact) {
+        return "Sleep timer ending soon - Playback stops in ~" + clock + " - Press any button to keep watching";
+      }
+      return "Sleep timer ending soon\nPlayback stops in ~" + clock + "\nPress any button to keep watching";
+    }
+  }
+
+  if (!docked && state_.config.playbackSleepBehavior != PlaybackSleepBehavior::AlwaysPrevent && state_.lastPlaybackInputMs > 0) {
+    const int timeoutMinutes = std::max(1, state_.config.batterySleepTimeoutMinutes);
+    const long long timeoutMs = static_cast<long long>(timeoutMinutes) * 60LL * 1000LL;
+    const long long remainingMs = timeoutMs - (now - state_.lastPlaybackInputMs);
+
+    if (remainingMs <= warningMs) {
+      const std::string clock = formatSecondsClock(remainingMs);
+      if (compact) {
+        return "Console may sleep soon - Auto sleep in ~" + clock + " - Press any button to keep watching";
+      }
+      return "Console may sleep soon\nAuto sleep in ~" + clock + "\nPress any button to keep watching";
+    }
+  }
+
+  return "";
 }
 
 void App::resetLoadedChannels() {
@@ -3406,6 +3847,9 @@ std::vector<TypeGroup> App::visibleTypes() const {
     groups.push_back(state_.favoritesTypeGroup);
 
     for (const auto &node : state_.manifest.nodes) {
+      if (isParentalHidden(parentalKeyForNode(node))) {
+        continue;
+      }
       TypeGroup group;
       group.id = streamTypeFromString(node.type);
       group.label = node.title.empty() ? node.name : node.title;
@@ -3446,15 +3890,32 @@ const TypeGroup *App::selectedTypeGroup() const {
   return nullptr;
 }
 
+std::vector<Category> App::visibleCategoriesForSelectedType() const {
+  const TypeGroup *type = selectedTypeGroup();
+  if (!type || type->categories.empty()) {
+    return {};
+  }
+
+  std::vector<Category> categories;
+  for (const Category &category : type->categories) {
+    if (!isParentalHidden(parentalKeyForCategory(category))) {
+      categories.push_back(category);
+    }
+  }
+
+  return categories;
+}
+
 const Category *App::selectedCategoryPtr() const {
   if (usingNodeTree()) {
     return nullptr;
   }
 
-  const TypeGroup *type = selectedTypeGroup();
-  if (!type || type->categories.empty()) return nullptr;
-  int index = std::clamp(state_.selectedCategory, 0, static_cast<int>(type->categories.size()) - 1);
-  return &type->categories[index];
+  static thread_local std::vector<Category> visible;
+  visible = visibleCategoriesForSelectedType();
+  if (visible.empty()) return nullptr;
+  int index = std::clamp(state_.selectedCategory, 0, static_cast<int>(visible.size()) - 1);
+  return &visible[static_cast<std::size_t>(index)];
 }
 
 const Channel *App::selectedChannelPtr() const {
@@ -3481,11 +3942,18 @@ const MediaNode *App::selectedRootNode() const {
   }
 
   index -= 1;
-  if (index < 0 || index >= static_cast<int>(state_.manifest.nodes.size())) {
+  std::vector<int> visibleIndexes;
+  for (int i = 0; i < static_cast<int>(state_.manifest.nodes.size()); ++i) {
+    if (!isParentalHidden(parentalKeyForNode(state_.manifest.nodes[static_cast<std::size_t>(i)]))) {
+      visibleIndexes.push_back(i);
+    }
+  }
+
+  if (index < 0 || index >= static_cast<int>(visibleIndexes.size())) {
     return nullptr;
   }
 
-  return &state_.manifest.nodes[static_cast<std::size_t>(index)];
+  return &state_.manifest.nodes[static_cast<std::size_t>(visibleIndexes[static_cast<std::size_t>(index)])];
 }
 
 MediaNode *App::selectedRootNode() {
@@ -3501,11 +3969,18 @@ MediaNode *App::selectedRootNode() {
   }
 
   index -= 1;
-  if (index < 0 || index >= static_cast<int>(state_.manifest.nodes.size())) {
+  std::vector<int> visibleIndexes;
+  for (int i = 0; i < static_cast<int>(state_.manifest.nodes.size()); ++i) {
+    if (!isParentalHidden(parentalKeyForNode(state_.manifest.nodes[static_cast<std::size_t>(i)]))) {
+      visibleIndexes.push_back(i);
+    }
+  }
+
+  if (index < 0 || index >= static_cast<int>(visibleIndexes.size())) {
     return nullptr;
   }
 
-  return &state_.manifest.nodes[static_cast<std::size_t>(index)];
+  return &state_.manifest.nodes[static_cast<std::size_t>(visibleIndexes[static_cast<std::size_t>(index)])];
 }
 
 const MediaNode *App::nodeAtPath(const MediaNode *root, const std::vector<int> &path) const {
@@ -3557,18 +4032,7 @@ MediaNode *App::currentNodeParent() {
 }
 
 std::vector<const MediaNode *> App::currentNodeChildren() const {
-  std::vector<const MediaNode *> nodes;
-  const MediaNode *parent = currentNodeParent();
-
-  if (!parent) {
-    return nodes;
-  }
-
-  for (const auto &child : parent->children) {
-    nodes.push_back(&child);
-  }
-
-  return nodes;
+  return filteredNodeChildren(currentNodeParent());
 }
 
 bool App::currentNodeChildrenAreItems() const {
@@ -3616,13 +4080,24 @@ MediaNode *App::selectedCurrentNode() {
     return nullptr;
   }
 
+  std::vector<int> visibleIndexes;
+  for (int i = 0; i < static_cast<int>(parent->children.size()); ++i) {
+    if (!isParentalHidden(parentalKeyForNode(parent->children[static_cast<std::size_t>(i)]))) {
+      visibleIndexes.push_back(i);
+    }
+  }
+
+  if (visibleIndexes.empty()) {
+    return nullptr;
+  }
+
   int index = std::clamp(
     state_.selectedCategory,
     0,
-    std::max(0, static_cast<int>(parent->children.size()) - 1)
+    std::max(0, static_cast<int>(visibleIndexes.size()) - 1)
   );
 
-  return &parent->children[static_cast<std::size_t>(index)];
+  return &parent->children[static_cast<std::size_t>(visibleIndexes[static_cast<std::size_t>(index)])];
 }
 
 std::vector<const MediaNode *> App::previewNodeChildren() const {
@@ -3636,7 +4111,9 @@ std::vector<const MediaNode *> App::previewNodeChildren() const {
     }
 
     for (const auto &child : parent->children) {
-      nodes.push_back(&child);
+      if (!isParentalHidden(parentalKeyForNode(child))) {
+        nodes.push_back(&child);
+      }
     }
 
     return nodes;
@@ -3650,12 +4127,14 @@ std::vector<const MediaNode *> App::previewNodeChildren() const {
 
   if (!selected->children.empty()) {
     for (const auto &child : selected->children) {
-      nodes.push_back(&child);
+      if (!isParentalHidden(parentalKeyForNode(child))) {
+        nodes.push_back(&child);
+      }
     }
     return nodes;
   }
 
-  if (selected->playable || !selected->url.empty()) {
+  if ((selected->playable || !selected->url.empty()) && !isParentalHidden(parentalKeyForNode(*selected))) {
     nodes.push_back(selected);
   }
 
@@ -3702,13 +4181,24 @@ MediaNode *App::selectedPreviewNode() {
   }
 
   if (!selected->children.empty()) {
+    std::vector<int> visibleIndexes;
+    for (int i = 0; i < static_cast<int>(selected->children.size()); ++i) {
+      if (!isParentalHidden(parentalKeyForNode(selected->children[static_cast<std::size_t>(i)]))) {
+        visibleIndexes.push_back(i);
+      }
+    }
+
+    if (visibleIndexes.empty()) {
+      return nullptr;
+    }
+
     int index = std::clamp(
       state_.selectedChannel,
       0,
-      std::max(0, static_cast<int>(selected->children.size()) - 1)
+      std::max(0, static_cast<int>(visibleIndexes.size()) - 1)
     );
 
-    return &selected->children[static_cast<std::size_t>(index)];
+    return &selected->children[static_cast<std::size_t>(visibleIndexes[static_cast<std::size_t>(index)])];
   }
 
   if (selected->playable || !selected->url.empty()) {
@@ -3716,6 +4206,157 @@ MediaNode *App::selectedPreviewNode() {
   }
 
   return nullptr;
+}
+
+std::string App::parentalKeyForCategory(StreamType type, const std::string &id, const std::string &name) const {
+  std::string stable = id.empty() ? name : id;
+  stable = trimText(stable);
+  if (stable.empty()) {
+    stable = "unknown";
+  }
+  return state_.manifest.id + ":" + toString(type) + ":" + stable;
+}
+
+std::string App::parentalKeyForCategory(const Category &category) const {
+  return parentalKeyForCategory(category.type, category.id, category.name);
+}
+
+std::string App::parentalKeyForNode(const MediaNode &node) const {
+  const StreamType type = streamTypeFromString(node.type);
+  const std::string name = node.title.empty() ? node.name : node.title;
+  return parentalKeyForCategory(type, node.id, name);
+}
+
+ParentalRule App::parentalRuleForKey(const std::string &key) const {
+  auto it = state_.config.parentalRules.find(key);
+  return it == state_.config.parentalRules.end() ? ParentalRule::None : it->second;
+}
+
+bool App::isParentalHidden(const std::string &key) const {
+  return parentalRuleForKey(key) == ParentalRule::Hidden;
+}
+
+bool App::isParentalLocked(const std::string &key) const {
+  return parentalRuleForKey(key) == ParentalRule::Locked &&
+    (!state_.parentalUnlocked || state_.parentalDeniedKey == key);
+}
+
+bool App::verifyParentalPin(const std::string &title, int maxAttempts) {
+  const std::string expected = state_.config.parentalPin.empty() ? "0000" : state_.config.parentalPin;
+
+  for (int attempt = 0; attempt < maxAttempts; ++attempt) {
+    std::string prompt = title;
+    if (attempt > 0) {
+      prompt += " - wrong PIN";
+    }
+
+    const std::string entered = digitsOnly(requestTextInput(prompt, "", 8));
+    if (entered.empty()) {
+      state_.message = "Parental PIN cancelled";
+      return false;
+    }
+
+    if (entered == expected) {
+      state_.message = "Parental PIN accepted";
+      return true;
+    }
+
+    state_.message = "Wrong parental PIN";
+    render();
+  }
+
+  state_.message = "You don't have permission to watch this content.";
+  return false;
+}
+
+bool App::requestParentalUnlock(const std::string &key, const std::string &title) {
+  if (!isParentalLocked(key)) {
+    return true;
+  }
+
+  if (verifyParentalPin("PIN: " + Graphics::fitText(title, 28), 3)) {
+    state_.parentalUnlocked = true;
+    state_.parentalDeniedKey.clear();
+    return true;
+  }
+
+  state_.parentalDeniedKey = key;
+  return false;
+}
+
+void App::changeParentalPin() {
+  if (!verifyParentalPin("Current parental PIN", 3)) {
+    return;
+  }
+
+  const std::string next = digitsOnly(requestTextInput("New numeric parental PIN", state_.config.parentalPin, 8));
+  if (next.size() < 4) {
+    state_.message = "PIN must have at least 4 numbers";
+    return;
+  }
+
+  state_.config.parentalPin = next;
+  saveConfig(state_.config);
+  state_.message = "Parental PIN changed";
+}
+
+std::vector<const MediaNode *> App::filteredNodeChildren(const MediaNode *parent) const {
+  std::vector<const MediaNode *> nodes;
+  if (!parent) {
+    return nodes;
+  }
+
+  for (const auto &child : parent->children) {
+    if (!isParentalHidden(parentalKeyForNode(child))) {
+      nodes.push_back(&child);
+    }
+  }
+
+  return nodes;
+}
+
+std::vector<Category> App::parentalCategoriesForType(StreamType type) const {
+  std::vector<Category> categories;
+
+  if (usingNodeTree()) {
+    for (const MediaNode &node : state_.manifest.nodes) {
+      if (streamTypeFromString(node.type) != type) {
+        continue;
+      }
+
+      Category category;
+      category.id = node.id;
+      category.name = node.title.empty() ? node.name : node.title;
+      category.totalChannels = nodeCount(node);
+      category.type = type;
+      categories.push_back(category);
+
+      for (const MediaNode &child : node.children) {
+        if (child.playable || !nodeCanHaveChildren(child)) {
+          continue;
+        }
+        Category childCategory;
+        childCategory.id = child.id;
+        childCategory.name = child.title.empty() ? child.name : child.title;
+        childCategory.totalChannels = nodeCount(child);
+        childCategory.type = streamTypeFromString(child.type);
+        if (childCategory.type == type) {
+          categories.push_back(childCategory);
+        }
+      }
+    }
+    return categories;
+  }
+
+  for (const TypeGroup &group : state_.manifest.types) {
+    if (group.id != type) {
+      continue;
+    }
+    categories.insert(categories.end(), group.categories.begin(), group.categories.end());
+    break;
+  }
+
+  return categories;
 }
 
 bool App::ensureNodeChildrenLoaded(MediaNode &node) {
@@ -3866,7 +4507,21 @@ void App::enterNode(const MediaNode &node, int childIndex) {
   // the UI can render the empty list for that parent.
   const bool enteredNodeContainsItems = nodeChildrenAreItems(node) || node.children.empty();
 
-  state_.nodePath.push_back(childIndex);
+  int rawChildIndex = childIndex;
+  if (const MediaNode *parent = currentNodeParent()) {
+    for (int i = 0; i < static_cast<int>(parent->children.size()); ++i) {
+      const MediaNode &candidate = parent->children[static_cast<std::size_t>(i)];
+      if (&candidate == &node ||
+          (!candidate.id.empty() && candidate.id == node.id) ||
+          ((!candidate.title.empty() || !candidate.name.empty()) &&
+           (candidate.title.empty() ? candidate.name : candidate.title) == (node.title.empty() ? node.name : node.title))) {
+        rawChildIndex = i;
+        break;
+      }
+    }
+  }
+
+  state_.nodePath.push_back(rawChildIndex);
   state_.selectedCategory = 0;
   state_.selectedChannel = 0;
   resetLoadedChannels();
@@ -4175,8 +4830,7 @@ void App::normalizeIndexes() {
     return;
   }
 
-  const TypeGroup *type = selectedTypeGroup();
-  int categories = type ? static_cast<int>(type->categories.size()) : 0;
+  int categories = static_cast<int>(visibleCategoriesForSelectedType().size());
   state_.selectedCategory = std::clamp(state_.selectedCategory, 0, std::max(0, categories - 1));
   state_.selectedChannel = std::clamp(state_.selectedChannel, 0, std::max(0, static_cast<int>(state_.loadedChannels.size()) - 1));
 }
@@ -4226,6 +4880,7 @@ void App::render() {
     case ScreenId::AddPlaylist: renderAddPlaylistGraphic(); break;
     case ScreenId::Player: renderPlayerGraphic(); break;
     case ScreenId::Settings: renderSettingsGraphic(); break;
+    case ScreenId::Parental: renderParentalGraphic(); break;
     case ScreenId::Playlists: renderAddPlaylistGraphic(); break;
   }
 
@@ -4299,7 +4954,7 @@ void App::renderDashboardGraphic() {
       hasSelectedNodeChannel = true;
     }
   } else if (type) {
-    categories = type->categories;
+    categories = visibleCategoriesForSelectedType();
   }
 
   const Channel *selectedChannel = hasSelectedNodeChannel
@@ -4580,6 +5235,23 @@ void App::renderDashboardGraphic() {
     drawFavoriteMarker(indicator, x + w - 42, y + 14, 24);
   };
 
+  auto itemSubtitle = [&](const Channel &ch) {
+    if (ch.type == StreamType::Live) {
+      return epgLineForChannel(ch);
+    }
+
+    std::string label = ch.type == StreamType::Movies
+      ? "MOVIE"
+      : (ch.type == StreamType::Series ? "SERIES" : "ITEM");
+    if (!ch.group.empty()) {
+      label += " • " + ch.group;
+    }
+    if (!ch.streamId.empty()) {
+      label += " • #" + ch.streamId;
+    }
+    return label;
+  };
+
   if (usingNodeTree()) {
     if (state_.channelGridView) {
       const int cardGap = 12;
@@ -4612,7 +5284,7 @@ void App::renderDashboardGraphic() {
           Channel ch = channelFromNode(*node);
           std::string sub = folder
             ? ("FOLDER • " + std::to_string(nodeCount(*node)) + " ITEMS")
-            : (playable ? epgLineForChannel(ch) : "EMPTY");
+            : (playable ? itemSubtitle(ch) : "EMPTY");
           std::string indicator = isFavorite(ch) ? "*" : (folder ? ">" : "<3");
 
           drawItemCard(
@@ -4658,7 +5330,7 @@ void App::renderDashboardGraphic() {
 
         std::string sub = folder
           ? ("FOLDER • " + std::to_string(nodeCount(*node)) + " ITEMS")
-          : (playable ? epgLineForChannel(ch) : "EMPTY");
+          : (playable ? itemSubtitle(ch) : "EMPTY");
 
         gfx_.drawText(Graphics::fitText(sub, 42), nameX, y + 32, 2, muted, false);
         drawFavoriteMarker(isFavorite(ch) ? "*" : (folder ? ">" : "<3"), channelsPanel.x + channelsPanel.w - 52, y + 13, 24);
@@ -4694,7 +5366,7 @@ void App::renderDashboardGraphic() {
           const bool selected = index == state_.selectedChannel;
           drawItemCard(
             ch,
-            epgLineForChannel(ch),
+            itemSubtitle(ch),
             isFavorite(ch) ? "*" : "<3",
             selected,
             startX + col * (cardW + cardGap),
@@ -4720,7 +5392,7 @@ void App::renderDashboardGraphic() {
 
         const int nameX = channelsPanel.x + 94;
         gfx_.drawText(Graphics::fitText(ch.name, 35), nameX, y + 9, 3, text, true);
-        gfx_.drawText(Graphics::fitText(epgLineForChannel(ch), 42), nameX, y + 32, 2, muted, false);
+        gfx_.drawText(Graphics::fitText(itemSubtitle(ch), 42), nameX, y + 32, 2, muted, false);
         drawFavoriteMarker(isFavorite(ch) ? "*" : "<3", channelsPanel.x + channelsPanel.w - 52, y + 13, 24);
       }
     }
@@ -4755,7 +5427,22 @@ void App::renderDashboardGraphic() {
   if (selectedChannel) {
     drawLogoOrFallback(*selectedChannel, info.x + 34, info.y + 13, 154, 62);
     gfx_.drawText(Graphics::fitText(selectedChannel->name, 42), info.x + 210, info.y + 18, 2, text, true);
-    drawWrappedText(gfx_, epgNowNextLine(*selectedChannel), info.x + 210, info.y + 46, 2, 86, 1, muted);
+    std::string detailLine;
+    if (selectedChannel->type == StreamType::Live) {
+      detailLine = epgNowNextLine(*selectedChannel);
+    } else {
+      detailLine =
+        std::string(selectedChannel->type == StreamType::Movies ? "MOVIE" :
+          (selectedChannel->type == StreamType::Series ? "SERIES" : "ITEM")) +
+        "  " +
+        (selectedChannel->group.empty() ? "No category" : selectedChannel->group);
+      if (!selectedChannel->streamId.empty()) {
+        detailLine += "  ID " + selectedChannel->streamId;
+      } else if (!selectedChannel->id.empty()) {
+        detailLine += "  ID " + selectedChannel->id;
+      }
+    }
+    drawWrappedText(gfx_, detailLine, info.x + 210, info.y + 46, 2, 86, 1, muted);
   } else {
     gfx_.drawText(state_.hasManifest ? Graphics::fitText(state_.manifest.name, 34) : "NSTV", info.x + 40, info.y + 30, 4, text, true);
   }
@@ -4906,11 +5593,13 @@ void App::renderPlayerGraphic() {
   const bool isOpen = player_ && player_->isOpen();
   const bool isPaused = player_ && player_->isPaused();
   const bool isAudioOnly = isOpen && player_ && player_->isAudioOnly();
+  const bool sleepWarningActive = !playbackSleepWarningText(true).empty();
   const bool overlayRequested =
     !state_.playerFrameSeen ||
     nowMs() < state_.playerOverlayUntilMs ||
     isPaused ||
-    !isOpen;
+    !isOpen ||
+    sleepWarningActive;
 
   if (isOpen) {
     std::string status;
@@ -4931,9 +5620,13 @@ void App::renderPlayerGraphic() {
     const std::string vodCounter = vodPlayback
       ? ("  " + formatPlaybackTime(vodPositionMs))
       : "";
-    const std::string controls = vodPlayback
+    std::string controls = vodPlayback
       ? "A PAUSE/RESUME   L -30s   < -10s   > +10s   R +30s   B BACK"
       : "A PAUSE/RESUME   B BACK";
+    const std::string sleepWarningCompact = playbackSleepWarningText(true);
+    if (!sleepWarningCompact.empty()) {
+      controls = Graphics::fitText(sleepWarningCompact, 92);
+    }
 
     player_->setOverlayInfo(
       channel ? Graphics::fitText(channel->name, 58) : "",
@@ -5110,13 +5803,14 @@ void App::renderPlayerGraphic() {
     !state_.playerFrameSeen ||
     nowMs() < state_.playerOverlayUntilMs ||
     isPaused ||
-    !isOpen;
+    !isOpen ||
+    !playbackSleepWarningText(true).empty();
 
   if (showOverlay && isOpen) {
     const bool vodPlayback = channel && isVodType(channel->type) && player_ && player_->canSeek();
     const int64_t vodDurationMs = vodPlayback ? player_->durationMs() : 0;
     const int64_t vodPositionMs = vodPlayback ? player_->positionMs() : 0;
-    const std::string controls = vodPlayback
+    std::string controls = vodPlayback
       ? "A PAUSE/RESUME   L -30s   < -10s   > +10s   R +30s   B BACK"
       : "A PAUSE/RESUME   B BACK";
 
@@ -5214,6 +5908,35 @@ void App::renderPlayerGraphic() {
       }
     }
 
+    const std::string sleepWarning = playbackSleepWarningText(false);
+    if (!sleepWarning.empty()) {
+      const int warnW = 560;
+      const int warnH = 88;
+      const int warnX = (Graphics::Width - warnW) / 2;
+      const int warnY = Graphics::Height - 210;
+      gfx_.fillRoundRect(warnX, warnY, warnW, warnH, 18, rgba(15, 23, 42, 238));
+      gfx_.strokeRoundRect(warnX, warnY, warnW, warnH, 18, rgba(0, 191, 255, 135), 2);
+
+      std::istringstream lines(sleepWarning);
+      std::string line;
+      int lineY = warnY + 18;
+      int lineIndex = 0;
+      while (std::getline(lines, line)) {
+        gfx_.drawText(
+          Graphics::fitText(line, 62),
+          warnX + 30,
+          lineY,
+          lineIndex == 0 ? 2 : 1,
+          lineIndex == 0 ? rgb(248, 250, 252) : rgb(203, 213, 225),
+          lineIndex == 0
+        );
+        lineY += lineIndex == 0 ? 26 : 20;
+        ++lineIndex;
+      }
+
+      controls = "Press any button to keep watching    B BACK";
+    }
+
     gfx_.drawTextRight(
       controls,
       Graphics::Width - 28,
@@ -5225,10 +5948,92 @@ void App::renderPlayerGraphic() {
   }
 }
 
+void App::renderParentalGraphic() {
+  const Color text = rgb(248, 250, 252);
+  const Color muted = rgb(166, 178, 207);
+  const Color blue = rgb(0, 191, 255);
+  const Color warning = rgb(251, 191, 36);
+  const Color danger = rgb(248, 113, 113);
+  const Color panelTop = rgb(16, 24, 45);
+  const Color panelBottom = rgb(7, 11, 22);
+
+  const std::vector<StreamType> streamTypes{
+    StreamType::Live,
+    StreamType::Movies,
+    StreamType::Series,
+    StreamType::Radio
+  };
+
+  state_.selectedParentalType = std::clamp(
+    state_.selectedParentalType,
+    0,
+    std::max(0, static_cast<int>(streamTypes.size()) - 1)
+  );
+
+  const StreamType activeType = streamTypes[static_cast<std::size_t>(state_.selectedParentalType)];
+  const std::vector<Category> categories = parentalCategoriesForType(activeType);
+  state_.selectedParentalCategory = std::clamp(
+    state_.selectedParentalCategory,
+    0,
+    std::max(0, static_cast<int>(categories.size()) - 1)
+  );
+
+  gfx_.fillVerticalGradient(0, 0, Graphics::Width, Graphics::Height, rgb(7, 11, 22), rgb(2, 5, 11));
+  gfx_.drawImageFileCentered("romfs:/logo/logo-horizontal.png", 34, 28, 300, 72);
+  gfx_.drawText("PARENTAL CONTROL", 80, 104, 5, text, true);
+  gfx_.drawText("PIN is numeric and entered with the Switch software keyboard.", 80, 142, 2, muted, false);
+
+  Rect panel{64, 180, 1152, 452};
+  gfx_.fillVerticalGradient(panel.x, panel.y, panel.w, panel.h, panelTop, panelBottom);
+  gfx_.strokeRoundRect(panel.x, panel.y, panel.w, panel.h, 18, rgba(72, 92, 128, 55), 1);
+
+  int tabX = panel.x + 28;
+  for (int i = 0; i < static_cast<int>(streamTypes.size()); ++i) {
+    const bool selected = i == state_.selectedParentalType;
+    const int tabW = 170;
+    gfx_.fillRoundRect(tabX, panel.y + 24, tabW, 36, 10, selected ? rgba(14, 165, 233, 95) : rgba(15, 23, 42, 160));
+    gfx_.strokeRoundRect(tabX, panel.y + 24, tabW, 36, 10, selected ? blue : rgba(72, 92, 128, 45), selected ? 2 : 1);
+    gfx_.drawText(typeIcon(streamTypes[static_cast<std::size_t>(i)], state_.config.useUnicodeIcons), tabX + 16, panel.y + 35, 1, selected ? text : muted, true);
+    gfx_.drawText(Graphics::fitText(toString(streamTypes[static_cast<std::size_t>(i)]), 14), tabX + 56, panel.y + 34, 2, selected ? text : muted, true);
+    tabX += tabW + 14;
+  }
+
+  if (categories.empty()) {
+    gfx_.drawText("No categories loaded for this stream type.", panel.x + 40, panel.y + 118, 3, muted, true);
+    gfx_.drawText("Load a playlist first, then return here to protect categories.", panel.x + 40, panel.y + 154, 2, muted, false);
+  } else {
+    const int rows = 8;
+    const int start = windowStart(state_.selectedParentalCategory, static_cast<int>(categories.size()), rows);
+
+    for (int i = 0; i < rows; ++i) {
+      const int index = start + i;
+      if (index >= static_cast<int>(categories.size())) {
+        break;
+      }
+
+      const Category &category = categories[static_cast<std::size_t>(index)];
+      const bool selected = index == state_.selectedParentalCategory;
+      const ParentalRule rule = parentalRuleForKey(parentalKeyForCategory(category));
+      const int y = panel.y + 92 + i * 42;
+      const Color badgeColor = rule == ParentalRule::Hidden
+        ? danger
+        : (rule == ParentalRule::Locked ? warning : muted);
+
+      gfx_.fillRoundRect(panel.x + 28, y, panel.w - 56, 36, 10, selected ? rgba(18, 45, 94, 230) : rgba(15, 23, 42, 180));
+      gfx_.strokeRoundRect(panel.x + 28, y, panel.w - 56, 36, 10, selected ? blue : rgba(72, 92, 128, 24), selected ? 2 : 1);
+      gfx_.drawText(Graphics::fitText(category.name, 58), panel.x + 48, y + 10, 2, selected ? text : muted, true);
+      gfx_.drawTextRight(parentalRuleLabel(rule), panel.x + panel.w - 54, y + 10, 2, badgeColor, true);
+    }
+  }
+
+  gfx_.drawText("LEFT/RIGHT TYPE    UP/DOWN CATEGORY    A CHANGE HIDE/LOCK/UNLOCK    Y CHANGE PIN    B BACK", 64, 660, 2, muted, true);
+}
+
 void App::renderSettingsGraphic() {
   const Color text = rgb(248, 250, 252);
   const Color muted = rgb(166, 178, 207);
   const Color blue = rgb(0, 191, 255);
+  const Color selectedBg = rgba(14, 165, 233, 45);
   const Color panelTop = rgb(16, 24, 45);
   const Color panelBottom = rgb(7, 11, 22);
 
@@ -5246,40 +6051,113 @@ void App::renderSettingsGraphic() {
   const int contentX = panel.x + 34;
   const int scroll = std::max(0, state_.settingsScroll);
 
-  auto drawLine = [&](const std::string &line, int baseY, int scale, Color color, bool bold) {
+  auto drawLine = [&](const std::string &line, int baseY, int scale, Color color, bool bold, int xOffset = 0) {
     const int y = baseY - scroll;
     const int height = (scale == 4 ? 30 : (scale == 3 ? 24 : 18));
     if (y + height < viewportTop || y > viewportBottom) {
       return;
     }
-    gfx_.drawText(line, contentX, y, scale, color, bold);
+    gfx_.drawText(line, contentX + xOffset, y, scale, color, bold);
+  };
+
+  auto drawSetting = [&](int index, const std::string &title, const std::string &value, const std::string &hint, int &y) {
+    const int rowY = y - scroll;
+    const bool selected = state_.selectedSettingsOption == index;
+
+    if (rowY + 70 >= viewportTop && rowY <= viewportBottom) {
+      if (selected) {
+        gfx_.fillRoundRect(contentX - 14, rowY - 8, panel.w - 68, 70, 12, selectedBg);
+        gfx_.strokeRoundRect(contentX - 14, rowY - 8, panel.w - 68, 70, 12, rgba(0, 191, 255, 95), 1);
+      }
+
+      gfx_.drawText((selected ? "> " : "  ") + title, contentX, rowY, 3, selected ? blue : text, true);
+      gfx_.drawText(Graphics::fitText(value, 72), contentX + 30, rowY + 28, 2, text, true);
+      gfx_.drawText(Graphics::fitText(hint, 88), contentX + 30, rowY + 52, 1, muted, false);
+    }
+
+    y += 78;
   };
 
   const PlaylistConfig *playlist = activePlaylist();
   const int epgOffset = playlist ? playlist->epgOffsetMinutes : 0;
 
   int y = panel.y + 26;
-  drawLine("EPG TIME OFFSET", y, 4, blue, true); y += 42;
-  drawLine("Active playlist: " + Graphics::fitText(activePlaylistName(), 48), y, 2, muted, false); y += 28;
-  drawLine("Current offset: " + formatEpgOffsetMinutes(epgOffset), y, 3, text, true); y += 30;
-  drawLine("Applied before EPG matching and on-screen display.", y, 2, muted, false); y += 28;
-  drawLine("LEFT/RIGHT = 30 min", y, 2, muted, false); y += 26;
-  drawLine("L/R = 1 hour    Y = reset", y, 2, muted, false); y += 42;
+  drawSetting(
+    0,
+    "EPG TIME OFFSET",
+    "Current offset: " + formatEpgOffsetMinutes(epgOffset),
+    "Per-playlist. LEFT/RIGHT = 30 min, L/R = 1 hour, Y = reset.",
+    y
+  );
+  drawSetting(
+    1,
+    "PLAYBACK SLEEP",
+    playbackSleepBehaviorLabel(state_.config.playbackSleepBehavior),
+    "Dashboard follows system. Docked only is the recommended default.",
+    y
+  );
+  drawSetting(
+    2,
+    "DOCKED SLEEP TIMER",
+    formatMinutesOption(state_.config.dockedSleepTimerMinutes),
+    "Optional TV bedtime timer. Any button resets it during playback.",
+    y
+  );
+  drawSetting(
+    3,
+    "BATTERY SLEEP WARNING",
+    "After ~" + std::to_string(state_.config.batterySleepTimeoutMinutes) + " minutes idle",
+    "Handheld mode respects the console sleep settings and only warns the user.",
+    y
+  );
+  drawSetting(
+    4,
+    "WARNING LEAD TIME",
+    std::to_string(state_.config.sleepWarningSeconds) + " seconds before",
+    "Shows: Console may sleep soon / Press any button to keep watching.",
+    y
+  );
+  drawSetting(
+    5,
+    "PARENTAL CONTROL",
+    std::to_string(state_.config.parentalRules.size()) + " protected categor" +
+      (state_.config.parentalRules.size() == 1 ? "y" : "ies"),
+    "A = manage categories, X = reset selected options inside parental screen.",
+    y
+  );
+  drawSetting(
+    6,
+    "MANIFEST REFRESH",
+    formatHoursOption(state_.config.manifestRefreshHours),
+    "Uses local cache until this interval expires. X resets to 24 hours.",
+    y
+  );
+  drawSetting(
+    7,
+    "EPG REFRESH",
+    formatHoursOption(state_.config.epgRefreshHours),
+    "EPG remains on demand and cached. X resets to 12 hours.",
+    y
+  );
+  drawSetting(
+    8,
+    "LANGUAGE",
+    languageLabel(state_.config.uiLanguage),
+    "Switch UI strings are staged for English, Portuguese and Spanish.",
+    y
+  );
 
+  y += 8;
   drawLine("ABOUT KBORE", y, 4, text, true); y += 42;
   drawLine("Kboré is an IPTV/VOD player for user-provided playlists.", y, 2, muted, false); y += 28;
   drawLine("The app does not provide playlists, channels, movies, series or servers.", y, 2, muted, false); y += 28;
-  drawLine("Kboré does not endorse, host, sponsor or verify IPTV providers.", y, 2, muted, false); y += 28;
   drawLine("All playlist URLs, credentials and playback sources are the user's responsibility.", y, 2, muted, false); y += 42;
-
-  drawLine("THIRD-PARTY LIBRARIES", y, 4, text, true); y += 42;
   drawLine("Built with devkitPro/libnx, FFmpeg, Deko3D, SDL, cURL and related libraries.", y, 2, muted, false); y += 28;
-  drawLine("Thank you for using and supporting Kboré.", y, 2, text, true); y += 28;
   drawLine("Developed by Gilson Santos", y, 2, text, true); y += 28;
-  drawLine("github.com/devgsantos", y, 2, blue, true); y += 20;
+  drawLine("github.com/devgsantos", y, 2, blue, true);
 
   const int settingsViewportHeight = 412;
-  const int settingsContentHeight = 558;
+  const int settingsContentHeight = 970;
   const int maxSettingsScroll = std::max(0, settingsContentHeight - settingsViewportHeight);
   if (state_.settingsScroll > 0) {
     gfx_.drawText("^ MORE", panel.x + panel.w - 120, panel.y + 18, 2, blue, true);
@@ -5288,7 +6166,7 @@ void App::renderSettingsGraphic() {
     gfx_.drawText("v MORE", panel.x + panel.w - 120, panel.y + panel.h - 32, 2, blue, true);
   }
 
-  gfx_.drawText("UP/DOWN SCROLL    A / B BACK    LEFT/RIGHT/L/R ADJUST OFFSET    Y RESET", 64, 660, 2, muted, true);
+  gfx_.drawText("UP/DOWN SELECT    LEFT/RIGHT CHANGE    L/R FAST CHANGE    Y RESET    A OPEN    B BACK", 64, 660, 2, muted, true);
 }
 
 
@@ -5435,6 +6313,7 @@ std::string App::screenTitle(ScreenId screen) {
     case ScreenId::AddPlaylist: return "Add Playlist";
     case ScreenId::Player: return "Player";
     case ScreenId::Settings: return "Settings";
+    case ScreenId::Parental: return "Parental Control";
   }
   return "NSTV";
 }

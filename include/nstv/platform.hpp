@@ -44,6 +44,7 @@ std::time_t currentUnixTime();
 bool localTimeFromUnix(std::time_t timestamp, PlatformLocalTime &out);
 bool unixTimeFromLocal(int year, int month, int day, int hour, int minute, int second, std::time_t &out);
 void setMediaPlaybackActive(bool active);
+bool platformIsDockedMode();
 std::string requestTextInput(const std::string &title, const std::string &initialValue = "", int maxLength = 512);
 
 } // namespace nstv

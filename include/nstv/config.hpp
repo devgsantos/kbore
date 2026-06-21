@@ -3,9 +3,28 @@
 #include "nstv/models.hpp"
 
 #include <string>
+#include <map>
 #include <vector>
 
 namespace nstv {
+
+enum class PlaybackSleepBehavior {
+  SystemDefault,
+  DockedOnly,
+  AlwaysPrevent
+};
+
+enum class ParentalRule {
+  None,
+  Hidden,
+  Locked
+};
+
+std::string toString(ParentalRule rule);
+ParentalRule parentalRuleFromString(const std::string &value);
+
+std::string toString(PlaybackSleepBehavior behavior);
+PlaybackSleepBehavior playbackSleepBehaviorFromString(const std::string &value);
 
 struct PlaylistConfig {
   std::string id;
@@ -44,6 +63,21 @@ struct Config {
   int pageSize = 20;
   int preloadThreshold = 8;
   bool useUnicodeIcons = false;
+
+  // Playback sleep policy. Dashboard always follows the system.
+  // DockedOnly is the recommended default: prevent sleep during docked playback,
+  // but respect system sleep in handheld/battery mode.
+  PlaybackSleepBehavior playbackSleepBehavior = PlaybackSleepBehavior::DockedOnly;
+  int dockedSleepTimerMinutes = 0;      // 0 = Off. Optional timer for TV/docked playback.
+  int batterySleepTimeoutMinutes = 10;  // App-side estimate for warning overlay only.
+  int sleepWarningSeconds = 60;         // Warning lead time for battery/timer overlays.
+
+  int manifestRefreshHours = 24;        // 0 = always use cache until manual reload.
+  int epgRefreshHours = 12;             // 0 = cache-only after first successful fetch.
+  std::string uiLanguage = "en";
+
+  std::string parentalPin = "0000";
+  std::map<std::string, ParentalRule> parentalRules;
 
   const PlaylistConfig *activePlaylist() const;
 };
