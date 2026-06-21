@@ -726,21 +726,53 @@ EpgPage ParserApiClient::epgPageFromJson(const Json &json) const {
       // POSIX/UTC seconds and avoid XMLTV timezone ambiguity when matching NOW.
       // Raw XMLTV start/stop values remain as fallback for providers that do not
       // expose *_timestamp fields.
-      const std::string startTimestamp = jsonStringOrNumber(
-        item["start_timestamp"],
-        jsonStringOrNumber(item["startTime"], "")
+      program.start = jsonStringOrNumber(
+        item["startEpochSeconds"],
+        jsonStringOrNumber(
+          item["start_timestamp"],
+          jsonStringOrNumber(
+            item["start_time"],
+            jsonStringOrNumber(
+              item["start_datetime"],
+              jsonStringOrNumber(
+                item["startDate"],
+                jsonStringOrNumber(item["startTime"], jsonStringOrNumber(item["start"], jsonStringOrNumber(item["rawStart"], "")))
+              )
+            )
+          )
+        )
       );
-      const std::string stopTimestamp = jsonStringOrNumber(
-        item["stop_timestamp"],
-        jsonStringOrNumber(item["end_timestamp"], jsonStringOrNumber(item["endTime"], ""))
+      program.stop = jsonStringOrNumber(
+        item["stopEpochSeconds"],
+        jsonStringOrNumber(
+          item["stop_timestamp"],
+          jsonStringOrNumber(
+            item["end_timestamp"],
+            jsonStringOrNumber(
+              item["stop_time"],
+              jsonStringOrNumber(
+                item["end_time"],
+                jsonStringOrNumber(
+                  item["end_datetime"],
+                  jsonStringOrNumber(
+                    item["stopDate"],
+                    jsonStringOrNumber(
+                      item["endDate"],
+                      jsonStringOrNumber(
+                        item["endEpochSeconds"],
+                        jsonStringOrNumber(
+                          item["endTime"],
+                          jsonStringOrNumber(item["stopTime"], jsonStringOrNumber(item["end"], jsonStringOrNumber(item["stop"], jsonStringOrNumber(item["rawStop"], ""))))
+                        )
+                      )
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
       );
-
-      program.start = !startTimestamp.empty()
-        ? startTimestamp
-        : jsonStringOrNumber(item["start"], jsonStringOrNumber(item["rawStart"], ""));
-      program.stop = !stopTimestamp.empty()
-        ? stopTimestamp
-        : jsonStringOrNumber(item["stop"], jsonStringOrNumber(item["end"], jsonStringOrNumber(item["rawStop"], "")));
 
       page.programs.push_back(program);
     }

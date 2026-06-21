@@ -26,7 +26,7 @@
 
 namespace nstv {
 
-enum class ScreenId { Dashboard, Playlists, AddPlaylist, Player, Settings };
+enum class ScreenId { Dashboard, Playlists, AddPlaylist, Player, Settings, Parental };
 enum class FocusColumn { Playlist, Types, Categories, Channels };
 
 struct AppState {
@@ -61,6 +61,10 @@ struct AppState {
   int selectedAddOption = 0;
   int settingsScroll = 0;
   int selectedSettingsOption = 0;
+  int selectedParentalType = 0;
+  int selectedParentalCategory = 0;
+  bool parentalUnlocked = false;
+  std::string parentalDeniedKey;
 
   std::set<std::string> favoriteIds;
   std::vector<Channel> favoriteChannels;
@@ -141,6 +145,7 @@ private:
   void renderAddPlaylistGraphic();
   void renderPlayerGraphic();
   void renderSettingsGraphic();
+  void renderParentalGraphic();
   void renderLoadingOverlay(const std::string &message);
   void renderAddPlaylist();
   void renderPlayer();
@@ -148,6 +153,7 @@ private:
   void handle(Button button);
   void handleDashboard(Button button);
   void handleAddPlaylist(Button button);
+  void handleParental(Button button);
 
   const PlaylistConfig *activePlaylist() const;
   std::string activePlaylistName() const;
@@ -195,6 +201,7 @@ private:
 
   std::vector<TypeGroup> visibleTypes() const;
   const TypeGroup *selectedTypeGroup() const;
+  std::vector<Category> visibleCategoriesForSelectedType() const;
   const Category *selectedCategoryPtr() const;
   const Channel *selectedChannelPtr() const;
 
@@ -211,6 +218,17 @@ private:
   MediaNode *selectedPreviewNode();
   std::vector<const MediaNode *> currentNodeChildren() const;
   std::vector<const MediaNode *> previewNodeChildren() const;
+  std::string parentalKeyForCategory(StreamType type, const std::string &id, const std::string &name) const;
+  std::string parentalKeyForCategory(const Category &category) const;
+  std::string parentalKeyForNode(const MediaNode &node) const;
+  ParentalRule parentalRuleForKey(const std::string &key) const;
+  bool isParentalHidden(const std::string &key) const;
+  bool isParentalLocked(const std::string &key) const;
+  bool requestParentalUnlock(const std::string &key, const std::string &title);
+  bool verifyParentalPin(const std::string &title, int maxAttempts = 3);
+  void changeParentalPin();
+  std::vector<const MediaNode *> filteredNodeChildren(const MediaNode *parent) const;
+  std::vector<Category> parentalCategoriesForType(StreamType type) const;
   bool currentNodeChildrenAreItems() const;
   bool ensureNodeChildrenLoaded(MediaNode &node);
   Channel channelFromNode(const MediaNode &node) const;
