@@ -741,22 +741,25 @@ bool parseEpgTimeInternal(const std::string &value, std::time_t &timestamp, EpgT
       return false;
     }
 
+    int offsetSeconds = 0;
     std::size_t zonePos = text.find_first_of("+-", 14);
-    if (zonePos != std::string::npos) {
-      int offsetSeconds = 0;
-      if (parseZoneOffsetSeconds(text.substr(zonePos), offsetSeconds)) {
-        if (interpretation == EpgTimeInterpretation::LocalWallClock) {
-          return localWallClockTimestamp(year, month, day, hour, minute, second, timestamp);
-        }
-
-        timestamp = static_cast<std::time_t>(
-          epochFromUtcParts(year, month, day, hour, minute, second) - offsetSeconds
-        );
-        return true;
+    if (zonePos != std::string::npos && parseZoneOffsetSeconds(text.substr(zonePos), offsetSeconds)) {
+      if (interpretation == EpgTimeInterpretation::LocalWallClock) {
+        return localWallClockTimestamp(year, month, day, hour, minute, second, timestamp);
       }
+    } else {
+      /*
+        Match the Android parser: compact XMLTV values without an explicit
+        timezone are interpreted as UTC, while ISO/local date strings without
+        a timezone stay anchored to the device timezone.
+      */
+      offsetSeconds = 0;
     }
 
-    return localWallClockTimestamp(year, month, day, hour, minute, second, timestamp);
+    timestamp = static_cast<std::time_t>(
+      epochFromUtcParts(year, month, day, hour, minute, second) - offsetSeconds
+    );
+    return true;
   }
 
   return false;
