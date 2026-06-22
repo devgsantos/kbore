@@ -690,6 +690,52 @@ EpgPage ParserApiClient::loadEpgPrograms(
   return pageResult;
 }
 
+VodDetails ParserApiClient::loadVodDetails(
+  const std::string &sourceUrl,
+  Provider provider,
+  const Channel &channel,
+  const std::string &language
+) const {
+  if (sourceUrl.empty()) {
+    throw std::runtime_error("Playlist URL/source is empty");
+  }
+
+  const bool series = channel.type == StreamType::Series;
+  const std::string itemId = !channel.streamId.empty() ? channel.streamId : channel.id;
+  std::string seriesId = itemId.empty() ? channel.id : itemId;
+  const std::string marker = "/series/";
+  const std::size_t markerPos = seriesId.rfind(marker);
+  if (markerPos != std::string::npos) {
+    seriesId = seriesId.substr(markerPos + marker.size());
+    const std::size_t slashPos = seriesId.find('/');
+    if (slashPos != std::string::npos) {
+      seriesId = seriesId.substr(0, slashPos);
+    }
+  }
+
+  std::ostringstream body;
+  body << "{\"url\":\"" << jsonEscape(sourceUrl) << "\",";
+  body << "\"provider\":\"" << toString(provider) << "\",";
+  body << "\"title\":\"" << jsonEscape(channel.name) << "\",";
+  body << "\"language\":\"" << jsonEscape(language.empty() ? "pt-BR" : language) << "\"";
+
+  if (series) {
+    body << ",\"nodeId\":\"" << jsonEscape(channel.id) << "\"";
+    body << ",\"seriesId\":\"" << jsonEscape(seriesId) << "\"";
+    if (!channel.groupId.empty()) {
+      body << ",\"categoryId\":\"" << jsonEscape(channel.groupId) << "\"";
+    }
+  } else {
+    body << ",\"channelId\":\"" << jsonEscape(itemId.empty() ? channel.id : itemId) << "\"";
+    body << ",\"streamId\":\"" << jsonEscape(itemId.empty() ? channel.id : itemId) << "\"";
+  }
+
+  body << "}";
+
+  Json json = requestJson(endpoint(series ? "/api/series-details" : "/api/movie-details"), body.str());
+  return vodDetailsFromJson(json, channel);
+}
+
 EpgPage ParserApiClient::epgPageFromJson(const Json &json) const {
   const Json &root = json["data"].isObject()
     ? json["data"]
@@ -859,6 +905,66 @@ EpgPage ParserApiClient::epgPageFromJson(const Json &json) const {
   }
 
   return page;
+}
+
+VodDetails ParserApiClient::vodDetailsFromJson(const Json &json, const Channel &fallback) const {
+  static const Json emptyJson;
+  const Json &root = json["data"].isObject() ? json["data"] : json;
+  const Json &details = root["movie"].isObject()
+    ? root["movie"]
+    : (root["series"].isObject()
+      ? root["series"]
+      : (root["show"].isObject()
+        ? root["show"]
+        : (root["tv"].isObject() ? root["tv"] : root)));
+  const Json &channel = root["channel"].isObject() ? root["channel"] : emptyJson;
+
+  auto imageString = [](const Json &item) {
+    return jsonStringOrNumber(
+      item["posterUrl"],
+      jsonStringOrNumber(
+        item["poster_url"],
+        jsonStringOrNumber(
+          item["image"],
+          jsonStringOrNumber(
+            item["stream_icon"],
+            jsonStringOrNumber(item["cover"], jsonStringOrNumber(item["poster"], jsonStringOrNumber(item["thumbnail"], jsonStringOrNumber(item["icon"], ""))))
+          )
+        )
+      )
+    );
+  };
+
+  auto descriptionString = [](const Json &item) {
+    return jsonStringOrNumber(
+      item["description"],
+      jsonStringOrNumber(item["desc"], jsonStringOrNumber(item["plot"], jsonStringOrNumber(item["overview"], jsonStringOrNumber(item["synopsis"], ""))))
+    );
+  };
+
+  VodDetails out;
+  out.title = jsonStringOrNumber(
+    details["title"],
+    jsonStringOrNumber(details["name"], jsonStringOrNumber(channel["title"], jsonStringOrNumber(channel["name"], fallback.name)))
+  );
+  out.description = descriptionString(details);
+  if (out.description.empty()) {
+    out.description = descriptionString(channel);
+  }
+  out.posterUrl = imageString(details);
+  if (out.posterUrl.empty()) {
+    out.posterUrl = imageString(channel);
+  }
+  if (out.posterUrl.empty()) {
+    out.posterUrl = fallback.logo;
+  }
+  out.backdropUrl = jsonStringOrNumber(details["backdropUrl"], jsonStringOrNumber(details["backdrop_url"], jsonStringOrNumber(details["backdrop_path"], "")));
+  out.releaseDate = jsonStringOrNumber(
+    details["releaseDate"],
+    jsonStringOrNumber(details["release_date"], jsonStringOrNumber(details["firstAirDate"], jsonStringOrNumber(details["first_air_date"], "")))
+  );
+  out.provider = jsonStringOrNumber(root["provider"], "");
+  return out;
 }
 
 } // namespace nstv

@@ -49,6 +49,13 @@ public:
     int epgOffsetMinutes = 0
   ) const;
 
+  VodDetails loadVodDetails(
+    const std::string &sourceUrl,
+    Provider provider,
+    const Channel &channel,
+    const std::string &language = "pt-BR"
+  ) const;
+
 private:
   Manifest loadManifestEndpoint(const std::string &endpoint, const std::string &sourceUrl, Provider provider) const;
   ManifestLoadResult loadManifestEndpointWithCacheText(const std::string &endpoint, const std::string &sourceUrl, Provider provider) const;
@@ -67,6 +74,7 @@ private:
   void appendNodeTypes(const MediaNode &node, Manifest &manifest) const;
   ChannelPage channelPageFromJson(const Json &json) const;
   EpgPage epgPageFromJson(const Json &json) const;
+  VodDetails vodDetailsFromJson(const Json &json, const Channel &fallback) const;
   std::string endpoint(const std::string &path) const;
   std::map<std::string, std::string> authHeaders() const;
   std::string requestBody(const std::string &url, const std::string &body) const;

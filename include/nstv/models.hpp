@@ -85,6 +85,15 @@ struct EpgPage {
   bool hasNextPage = false;
 };
 
+struct VodDetails {
+  std::string title;
+  std::string description;
+  std::string posterUrl;
+  std::string backdropUrl;
+  std::string releaseDate;
+  std::string provider;
+};
+
 struct Manifest {
   std::string id;
   std::string name;

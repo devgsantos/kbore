@@ -71,6 +71,11 @@ bool loadEpgPage(
   EpgPage &page
 );
 
+std::string vodDetailsCacheKey(const Channel &channel);
+std::string vodDetailsCachePath(const std::string &playlistId, const Channel &channel);
+bool saveVodDetails(const std::string &playlistId, const Channel &channel, const VodDetails &details);
+bool loadVodDetails(const std::string &playlistId, const Channel &channel, VodDetails &details);
+
 std::string nodeChildrenPageCachePath(
   const std::string &playlistId,
   const std::string &nodeId,
