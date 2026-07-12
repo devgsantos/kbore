@@ -2,6 +2,7 @@
 #include "nstv/log.hpp"
 #include <algorithm>
 #include <cctype>
+#include <functional>
 #include <iostream>
 #include <iterator>
 #include <sstream>
@@ -1394,6 +1395,34 @@ bool nodeChildrenAreItems(const MediaNode &node) {
   }
 
   return hasPlayableItem;
+}
+
+std::string nodeDisplayTitle(const MediaNode &node) {
+  return node.title.empty() ? node.name : node.title;
+}
+
+bool channelMatchesNode(const Channel &channel, const MediaNode &node) {
+  if (!channel.id.empty() && !node.id.empty() && channel.id == node.id) {
+    return true;
+  }
+
+  if (!channel.url.empty() && !node.url.empty() && channel.url == node.url) {
+    return true;
+  }
+
+  if (!channel.streamId.empty() && !node.streamId.empty() && channel.streamId == node.streamId) {
+    return true;
+  }
+
+  if (!channel.tvgId.empty() && !node.tvgId.empty() && channel.tvgId == node.tvgId) {
+    return true;
+  }
+
+  const std::string title = nodeDisplayTitle(node);
+  return !channel.name.empty() &&
+    !title.empty() &&
+    channel.name == title &&
+    channel.type == streamTypeFromString(node.type);
 }
 
 }
@@ -3802,7 +3831,19 @@ void App::playSelectedChannel() {
     return;
   }
 
-  openChannel(*channel);
+  Channel selected = *channel;
+  if (usingNodeTree()) {
+    NodeSelection selection;
+    if (resolveNodeSelectionForChannel(selected, selection)) {
+      resetLoadedChannels();
+      applyNodeSelection(selection);
+    } else if (!state_.loadedChannels.empty()) {
+      resetLoadedChannels();
+      state_.message = "Selected result is not in the loaded node tree";
+    }
+  }
+
+  openChannel(selected);
 }
 
 void App::openChannel(const Channel &channel) {
@@ -4665,6 +4706,103 @@ Channel App::channelFromNode(const MediaNode &node) const {
   channel.streamId = node.streamId;
   channel.type = streamTypeFromString(node.type);
   return channel;
+}
+
+bool App::resolveNodeSelectionForChannel(const Channel &channel, NodeSelection &selection) const {
+  if (!usingNodeTree()) {
+    return false;
+  }
+
+  auto visibleChildIndex = [this](const MediaNode &parent, int rawIndex) {
+    int visibleIndex = 0;
+
+    for (int i = 0; i < static_cast<int>(parent.children.size()); ++i) {
+      const MediaNode &child = parent.children[static_cast<std::size_t>(i)];
+      if (isParentalHidden(parentalKeyForNode(child))) {
+        continue;
+      }
+
+      if (i == rawIndex) {
+        return visibleIndex;
+      }
+
+      ++visibleIndex;
+    }
+
+    return -1;
+  };
+
+  std::function<bool(const MediaNode &, int, std::vector<int> &)> visit =
+    [&](const MediaNode &node, int selectedType, std::vector<int> &path) -> bool {
+      if (channelMatchesNode(channel, node)) {
+        selection.selectedType = selectedType;
+        selection.nodePath = path;
+        selection.selectedCategory = 0;
+        selection.selectedChannel = 0;
+        selection.focus = FocusColumn::Channels;
+        return true;
+      }
+
+      for (int i = 0; i < static_cast<int>(node.children.size()); ++i) {
+        const MediaNode &child = node.children[static_cast<std::size_t>(i)];
+        if (isParentalHidden(parentalKeyForNode(child))) {
+          continue;
+        }
+
+        if (channelMatchesNode(channel, child)) {
+          const bool parentContainsItems = nodeChildrenAreItems(node);
+          selection.selectedType = selectedType;
+          selection.nodePath = path;
+          selection.selectedCategory = parentContainsItems ? 0 : visibleChildIndex(node, i);
+          selection.selectedChannel = parentContainsItems ? visibleChildIndex(node, i) : 0;
+          selection.focus = parentContainsItems ? FocusColumn::Channels : FocusColumn::Categories;
+          return true;
+        }
+
+        path.push_back(i);
+        if (visit(child, selectedType, path)) {
+          return true;
+        }
+        path.pop_back();
+      }
+
+      return false;
+    };
+
+  if (channel.type == StreamType::Favorites) {
+    std::vector<int> favoritePath;
+    if (visit(state_.favoritesRootNode, 0, favoritePath)) {
+      return true;
+    }
+  }
+
+  int visibleTypeIndex = 1;
+  for (const MediaNode &root : state_.manifest.nodes) {
+    if (isParentalHidden(parentalKeyForNode(root))) {
+      continue;
+    }
+
+    std::vector<int> path;
+    if (visit(root, visibleTypeIndex, path)) {
+      return true;
+    }
+
+    ++visibleTypeIndex;
+  }
+
+  std::vector<int> favoritePath;
+  return visit(state_.favoritesRootNode, 0, favoritePath);
+}
+
+void App::applyNodeSelection(const NodeSelection &selection) {
+  state_.selectedType = selection.selectedType;
+  state_.nodePath = selection.nodePath;
+  state_.selectedCategory = std::max(0, selection.selectedCategory);
+  state_.selectedChannel = std::max(0, selection.selectedChannel);
+  state_.focus = selection.focus;
+  normalizeIndexes();
+  loadVisibleEpgForChannelList();
+  loadSelectedEpg(false, false);
 }
 
 void App::enterNode(const MediaNode &node, int childIndex) {

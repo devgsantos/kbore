@@ -160,6 +160,14 @@ private:
     std::string error;
   };
 
+  struct NodeSelection {
+    int selectedType = 0;
+    std::vector<int> nodePath;
+    int selectedCategory = 0;
+    int selectedChannel = 0;
+    FocusColumn focus = FocusColumn::Channels;
+  };
+
   void render();
   void renderSplashGraphic();
   void renderDashboard();
@@ -258,6 +266,8 @@ private:
   bool currentNodeChildrenAreItems() const;
   bool ensureNodeChildrenLoaded(MediaNode &node);
   Channel channelFromNode(const MediaNode &node) const;
+  bool resolveNodeSelectionForChannel(const Channel &channel, NodeSelection &selection) const;
+  void applyNodeSelection(const NodeSelection &selection);
   void enterNode(const MediaNode &node, int childIndex);
   void playNode(const MediaNode &node);
   void loadFavoritesForActivePlaylist();
