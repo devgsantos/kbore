@@ -26,12 +26,17 @@ namespace nstv {
 #ifdef __SWITCH__
 static PadState pad;
 static bool mediaPlaybackActive = false;
+static bool touchActive = false;
+static u32 touchFingerId = 0;
+static int touchX = 0;
+static int touchY = 0;
 #endif
 
 void platformInit() {
 #ifdef __SWITCH__
   padConfigureInput(1, HidNpadStyleSet_NpadStandard);
   padInitializeDefault(&pad);
+  hidInitializeTouchScreen();
   socketInitializeDefault();
   curl_global_init(CURL_GLOBAL_DEFAULT);
 #else
@@ -162,84 +167,134 @@ bool unixTimeFromLocal(int year, int month, int day, int hour, int minute, int s
   return out != static_cast<std::time_t>(-1);
 }
 
-Button pollButton() {
+InputEvent pollInput() {
 #ifdef __SWITCH__
   if (!appletMainLoop()) {
-    return Button::Quit;
+    return {InputType::Button, Button::Quit};
   }
 
   padUpdate(&pad);
   u64 down = padGetButtonsDown(&pad);
 
-  if (down & HidNpadButton_Up) return Button::Up;
-  if (down & HidNpadButton_Down) return Button::Down;
-  if (down & HidNpadButton_Left) return Button::Left;
-  if (down & HidNpadButton_Right) return Button::Right;
-  if (down & HidNpadButton_A) return Button::Select;
-  if (down & HidNpadButton_B) return Button::Back;
-  if (down & HidNpadButton_L) return Button::ShoulderLeft;
-  if (down & HidNpadButton_R) return Button::ShoulderRight;
-  if (down & HidNpadButton_X) return Button::Favorite;
-  if (down & HidNpadButton_Y) return Button::FavoriteToggle;
-  if (down & HidNpadButton_Plus) return Button::Menu;
-  if (down & HidNpadButton_Minus) return Button::Quit;
+  if (down & HidNpadButton_Up) return {InputType::Button, Button::Up};
+  if (down & HidNpadButton_Down) return {InputType::Button, Button::Down};
+  if (down & HidNpadButton_Left) return {InputType::Button, Button::Left};
+  if (down & HidNpadButton_Right) return {InputType::Button, Button::Right};
+  if (down & HidNpadButton_A) return {InputType::Button, Button::Select};
+  if (down & HidNpadButton_B) return {InputType::Button, Button::Back};
+  if (down & HidNpadButton_L) return {InputType::Button, Button::ShoulderLeft};
+  if (down & HidNpadButton_R) return {InputType::Button, Button::ShoulderRight};
+  if (down & HidNpadButton_X) return {InputType::Button, Button::Favorite};
+  if (down & HidNpadButton_Y) return {InputType::Button, Button::FavoriteToggle};
+  if (down & HidNpadButton_Plus) return {InputType::Button, Button::Menu};
+  if (down & HidNpadButton_Minus) return {InputType::Button, Button::Quit};
 
-  return Button::None;
+  HidTouchScreenState state{};
+  const bool hasTouch = hidGetTouchScreenStates(&state, 1) > 0 && state.count > 0;
+  if (hasTouch) {
+    const HidTouchState *touch = &state.touches[0];
+    if (touchActive) {
+      for (int i = 0; i < state.count; ++i) {
+        if (state.touches[i].finger_id == touchFingerId) {
+          touch = &state.touches[i];
+          break;
+        }
+      }
+    }
+
+    touchX = static_cast<int>(touch->x);
+    touchY = static_cast<int>(touch->y);
+    if (!touchActive) {
+      touchActive = true;
+      touchFingerId = touch->finger_id;
+      return {InputType::TouchDown, Button::None, touchX, touchY, static_cast<int>(touchFingerId)};
+    }
+    return {InputType::TouchMove, Button::None, touchX, touchY, static_cast<int>(touchFingerId)};
+  }
+
+  if (touchActive) {
+    touchActive = false;
+    return {InputType::TouchUp, Button::None, touchX, touchY, static_cast<int>(touchFingerId)};
+  }
+
+  return {};
 #else
 #ifdef NSTV_USE_SDL
   SDL_Event event;
   while (SDL_PollEvent(&event)) {
-    if (event.type == SDL_QUIT) return Button::Quit;
+    if (event.type == SDL_QUIT) return {InputType::Button, Button::Quit};
+
+    int windowW = 1280;
+    int windowH = 720;
+    SDL_Window *window = SDL_GetWindowFromID(event.window.windowID);
+    if (window) SDL_GetWindowSize(window, &windowW, &windowH);
+    auto logicalX = [&](int x) { return windowW > 0 ? x * 1280 / windowW : x; };
+    auto logicalY = [&](int y) { return windowH > 0 ? y * 720 / windowH : y; };
+
+    if (event.type == SDL_MOUSEBUTTONDOWN && event.button.button == SDL_BUTTON_LEFT) {
+      return {InputType::TouchDown, Button::None, logicalX(event.button.x), logicalY(event.button.y), 0};
+    }
+    if (event.type == SDL_MOUSEMOTION && (event.motion.state & SDL_BUTTON_LMASK)) {
+      return {InputType::TouchMove, Button::None, logicalX(event.motion.x), logicalY(event.motion.y), 0};
+    }
+    if (event.type == SDL_MOUSEBUTTONUP && event.button.button == SDL_BUTTON_LEFT) {
+      return {InputType::TouchUp, Button::None, logicalX(event.button.x), logicalY(event.button.y), 0};
+    }
 
     if (event.type == SDL_KEYDOWN) {
       switch (event.key.keysym.sym) {
         case SDLK_UP:
         case SDLK_w:
-          return Button::Up;
+          return {InputType::Button, Button::Up};
         case SDLK_DOWN:
         case SDLK_s:
-          return Button::Down;
+          return {InputType::Button, Button::Down};
         case SDLK_LEFT:
         case SDLK_a:
-          return Button::Left;
+          return {InputType::Button, Button::Left};
         case SDLK_RIGHT:
         case SDLK_d:
-          return Button::Right;
+          return {InputType::Button, Button::Right};
         case SDLK_RETURN:
         case SDLK_SPACE:
         case SDLK_e:
-          return Button::Select;
+          return {InputType::Button, Button::Select};
         case SDLK_BACKSPACE:
         case SDLK_ESCAPE:
         case SDLK_b:
-          return Button::Back;
+          return {InputType::Button, Button::Back};
         case SDLK_x:
-          return Button::Favorite;
+          return {InputType::Button, Button::Favorite};
         case SDLK_y:
-          return Button::FavoriteToggle;
+          return {InputType::Button, Button::FavoriteToggle};
         case SDLK_z:
         case SDLK_LEFTBRACKET:
-          return Button::ShoulderLeft;
+          return {InputType::Button, Button::ShoulderLeft};
         case SDLK_c:
         case SDLK_RIGHTBRACKET:
-          return Button::ShoulderRight;
+          return {InputType::Button, Button::ShoulderRight};
         case SDLK_m:
         case SDLK_PLUS:
         case SDLK_EQUALS:
-          return Button::Menu;
+          return {InputType::Button, Button::Menu};
         case SDLK_q:
-          return Button::Quit;
+          return {InputType::Button, Button::Quit};
         default:
           break;
       }
     }
   }
 
-  return Button::None;
+  return {};
 #else
-  return Button::None;
+  return {};
 #endif
 #endif
+}
+
+Button pollButton() {
+  const InputEvent event = pollInput();
+  return event.type == InputType::Button ? event.button : Button::None;
 }
 
 Button pollButtonBlocking() {

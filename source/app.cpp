@@ -1487,9 +1487,9 @@ int App::run() {
     }
 
     if (splashVisible_) {
-      Button button = pollButton();
+      InputEvent input = pollInput();
 
-      if (button == Button::Quit) {
+      if (input.type == InputType::Button && input.button == Button::Quit) {
         state_.running = false;
         break;
       }
@@ -1500,9 +1500,9 @@ int App::run() {
     }
 
     if (playlistLoadActive()) {
-      Button button = pollButton();
+      InputEvent input = pollInput();
 
-      if (button == Button::Quit) {
+      if (input.type == InputType::Button && input.button == Button::Quit) {
         state_.running = false;
         break;
       }
@@ -1513,10 +1513,10 @@ int App::run() {
     }
 
     if (state_.screen == ScreenId::Player) {
-      Button button = pollButton();
+      InputEvent input = pollInput();
 
-      if (button != Button::None) {
-        handle(button);
+      if (input.type != InputType::None) {
+        handleInput(input);
       }
 
       applyPlaybackSleepPolicy();
@@ -1525,9 +1525,9 @@ int App::run() {
       continue;
     }
 
-    Button button = pollButton();
-    if (button != Button::None) {
-      handle(button);
+    InputEvent input = pollInput();
+    if (input.type != InputType::None) {
+      handleInput(input);
     }
     render();
     sleepMs(16);
@@ -1535,6 +1535,462 @@ int App::run() {
 
   setMediaPlaybackActive(false);
   return 0;
+}
+
+void App::handleInput(const InputEvent &event) {
+  if (event.type == InputType::Button) {
+    handle(event.button);
+    return;
+  }
+
+  if (event.type == InputType::TouchDown) {
+    touchActive_ = true;
+    touchDragging_ = false;
+    touchFingerId_ = event.fingerId;
+    touchStartX_ = event.x;
+    touchStartY_ = event.y;
+    touchLastY_ = event.y;
+    if (state_.screen == ScreenId::Player) {
+      const long long now = nowMs();
+      playerTouchOverlayWasVisible_ =
+        !state_.playerFrameSeen ||
+        now < state_.playerOverlayUntilMs ||
+        (player_ && player_->isPaused()) ||
+        !player_ ||
+        !player_->isOpen();
+      state_.playerOverlayUntilMs = now + 5000;
+      state_.lastPlaybackInputMs = now;
+      playerTouchLastSeekMs_ = 0;
+    }
+    return;
+  }
+
+  if (!touchActive_ || event.fingerId != touchFingerId_) {
+    return;
+  }
+
+  if (event.type == InputType::TouchMove) {
+    const int dx = event.x - touchStartX_;
+    const int dy = event.y - touchStartY_;
+    if (dx * dx + dy * dy > 12 * 12) {
+      touchDragging_ = true;
+    }
+    if (state_.screen == ScreenId::Player &&
+        touchStartX_ <= 160 &&
+        dx >= 120 &&
+        std::abs(dy) <= 90) {
+      touchDragging_ = true;
+      handle(Button::Back);
+      touchActive_ = false;
+      touchFingerId_ = -1;
+      return;
+    }
+    if (touchDragging_ && state_.screen == ScreenId::Dashboard) {
+      handleDashboardTouchDrag(event.x, event.y);
+    } else if (touchDragging_ && state_.screen == ScreenId::Player) {
+      handlePlayerTouchDrag(event.x, event.y);
+    } else if (touchDragging_) {
+      handleSecondaryTouchDrag(event.x, event.y);
+    }
+    return;
+  }
+
+  if (event.type == InputType::TouchUp) {
+    const bool activate = !touchDragging_;
+    if (touchDragging_ && state_.screen == ScreenId::Player) {
+      playerTouchLastSeekMs_ = 0;
+      handlePlayerTouchDrag(event.x, event.y);
+    }
+    touchActive_ = false;
+    touchFingerId_ = -1;
+    if (activate) {
+      handleTouchTap(event.x, event.y);
+    }
+  }
+}
+
+void App::handleTouchTap(int x, int y) {
+  if (splashVisible_ || playlistLoadActive() || state_.loading) {
+    return;
+  }
+
+  switch (state_.screen) {
+    case ScreenId::Dashboard:
+      handleDashboardTouchTap(x, y);
+      break;
+    case ScreenId::AddPlaylist:
+    case ScreenId::Playlists:
+      handleAddPlaylistTouchTap(x, y);
+      break;
+    case ScreenId::Settings:
+      handleSettingsTouchTap(x, y);
+      break;
+    case ScreenId::Parental:
+      handleParentalTouchTap(x, y);
+      break;
+    case ScreenId::Player:
+      handlePlayerTouchTap(x, y);
+      break;
+    default:
+      break;
+  }
+}
+
+void App::handleDashboardTouchTap(int x, int y) {
+  auto contains = [&](int left, int top, int width, int height) {
+    return x >= left && x < left + width && y >= top && y < top + height;
+  };
+
+  if (contains(312, 12, 270, 62)) {
+    state_.focus = FocusColumn::Playlist;
+    handleDashboard(Button::Select);
+    return;
+  }
+  if (contains(1204, 10, 66, 66)) {
+    state_.screen = ScreenId::Settings;
+    state_.selectedSettingsOption = 0;
+    state_.settingsScroll = 0;
+    return;
+  }
+
+  const int typeCount = static_cast<int>(visibleTypes().size());
+  const int typeStart = windowStart(state_.selectedType, typeCount, 4);
+  for (int row = 0; row < 4; ++row) {
+    const int index = typeStart + row;
+    if (index < typeCount && contains(32, 160 + row * 74, 272, 64)) {
+      state_.selectedType = index;
+      state_.focus = FocusColumn::Types;
+      handleDashboard(Button::Select);
+      return;
+    }
+  }
+
+  const int categoryCount = usingNodeTree()
+    ? (currentNodeChildrenAreItems() ? 1 : static_cast<int>(currentNodeChildren().size()))
+    : static_cast<int>(visibleCategoriesForSelectedType().size());
+  const int categoryStart = windowStart(state_.selectedCategory, categoryCount, 9);
+  for (int row = 0; row < 9; ++row) {
+    const int index = categoryStart + row;
+    if (index < categoryCount && contains(338, 154 + row * 42, 318, 42)) {
+      state_.selectedCategory = index;
+      state_.selectedChannel = 0;
+      state_.focus = FocusColumn::Categories;
+      handleDashboard(Button::Select);
+      return;
+    }
+  }
+
+  const int channelCount = usingNodeTree()
+    ? static_cast<int>(previewNodeChildren().size())
+    : static_cast<int>(state_.loadedChannels.size());
+  if (state_.channelGridView) {
+    const int start = gridWindowStart(state_.selectedChannel, channelCount, 2, 3);
+    const int cardW = (587 - 32 - 12) / 2;
+    for (int row = 0; row < 3; ++row) {
+      for (int col = 0; col < 2; ++col) {
+        const int index = start + row * 2 + col;
+        if (index < channelCount && contains(690 + col * (cardW + 12), 156 + row * 120, cardW, 108)) {
+          state_.selectedChannel = index;
+          state_.focus = FocusColumn::Channels;
+          if (x >= 690 + col * (cardW + 12) + cardW - 58) {
+            handleDashboard(Button::FavoriteToggle);
+            return;
+          }
+          handleDashboard(Button::Select);
+          return;
+        }
+      }
+    }
+  } else {
+    const int start = windowStart(state_.selectedChannel, channelCount, 7);
+    for (int row = 0; row < 7; ++row) {
+      const int index = start + row;
+      if (index < channelCount && contains(690, 156 + row * 55, 555, 49)) {
+        state_.selectedChannel = index;
+        state_.focus = FocusColumn::Channels;
+        if (x >= 1195) {
+          handleDashboard(Button::FavoriteToggle);
+          return;
+        }
+        handleDashboard(Button::Select);
+        return;
+      }
+    }
+  }
+}
+
+void App::handleDashboardTouchDrag(int x, int y) {
+  if (touchStartY_ < 90 || touchStartY_ >= 560) {
+    return;
+  }
+
+  int rowHeight = 0;
+  int *selected = nullptr;
+  int count = 0;
+  FocusColumn column = FocusColumn::Types;
+
+  if (touchStartX_ >= 18 && touchStartX_ < 318) {
+    rowHeight = 74;
+    selected = &state_.selectedType;
+    count = static_cast<int>(visibleTypes().size());
+    column = FocusColumn::Types;
+  } else if (touchStartX_ >= 332 && touchStartX_ < 662) {
+    rowHeight = 42;
+    selected = &state_.selectedCategory;
+    count = usingNodeTree()
+      ? (currentNodeChildrenAreItems() ? 1 : static_cast<int>(currentNodeChildren().size()))
+      : static_cast<int>(visibleCategoriesForSelectedType().size());
+    column = FocusColumn::Categories;
+  } else if (touchStartX_ >= 676 && touchStartX_ < 1263) {
+    rowHeight = state_.channelGridView ? 120 : 55;
+    selected = &state_.selectedChannel;
+    count = usingNodeTree()
+      ? static_cast<int>(previewNodeChildren().size())
+      : static_cast<int>(state_.loadedChannels.size());
+    column = FocusColumn::Channels;
+  } else {
+    return;
+  }
+
+  const int deltaY = y - touchLastY_;
+  if (rowHeight <= 0 || std::abs(deltaY) < rowHeight / 2 || !selected || count <= 0) {
+    return;
+  }
+
+  const int direction = deltaY < 0 ? 1 : -1;
+  const int itemStep = column == FocusColumn::Channels && state_.channelGridView ? 2 : 1;
+  const int oldSelection = *selected;
+  *selected = std::clamp(*selected + direction * itemStep, 0, count - 1);
+  touchLastY_ = y;
+
+  if (*selected == oldSelection) {
+    return;
+  }
+
+  state_.focus = column;
+  if (column == FocusColumn::Types) {
+    state_.nodePath.clear();
+    state_.selectedCategory = 0;
+    state_.selectedChannel = 0;
+    if (!usingNodeTree()) {
+      resetLoadedChannels();
+    }
+  } else if (column == FocusColumn::Categories) {
+    state_.selectedChannel = 0;
+    if (!usingNodeTree()) {
+      resetLoadedChannels();
+    }
+  } else if (!usingNodeTree()) {
+    maybePreloadNextPage();
+  }
+
+  normalizeIndexes();
+  loadVisibleEpgForChannelList();
+  loadSelectedEpg(false, false);
+  (void)x;
+}
+
+void App::handleAddPlaylistTouchTap(int x, int y) {
+  if (x < 80 || x >= 1012) {
+    return;
+  }
+
+  const int playlistCount = static_cast<int>(state_.config.playlists.size());
+  const int totalOptions = playlistCount + 4;
+  const int start = windowStart(state_.selectedAddOption, totalOptions, 6);
+  for (int row = 0; row < 6; ++row) {
+    const int top = 202 + row * 66;
+    const int index = start + row;
+    if (index < totalOptions && y >= top && y < top + 62) {
+      state_.selectedAddOption = index;
+      handleAddPlaylist(Button::Select);
+      return;
+    }
+  }
+
+  if (y >= 620 && y < 710) {
+    handleAddPlaylist(Button::Back);
+  }
+}
+
+void App::handleSettingsTouchTap(int x, int y) {
+  if (y >= 640) {
+    handle(Button::Back);
+    return;
+  }
+  if (x < 50 || x >= 1230 || y < 180 || y >= 632) {
+    return;
+  }
+
+  const int contentY = y + std::max(0, state_.settingsScroll);
+  if (contentY < 198) {
+    return;
+  }
+  const int index = (contentY - 198) / 78;
+  if (index < 0 || index >= 9) {
+    return;
+  }
+
+  state_.selectedSettingsOption = index;
+  if (index == 5) {
+    handle(Button::Select);
+  } else {
+    handle(x < Graphics::Width / 2 ? Button::Left : Button::Right);
+  }
+}
+
+void App::handleParentalTouchTap(int x, int y) {
+  if (y >= 640) {
+    if (x >= 850) {
+      handleParental(Button::FavoriteToggle);
+    } else {
+      handleParental(Button::Back);
+    }
+    return;
+  }
+
+  const int tabTop = 204;
+  if (y >= tabTop && y < tabTop + 52) {
+    for (int index = 0; index < 4; ++index) {
+      const int tabX = 92 + index * 184;
+      if (x >= tabX && x < tabX + 170) {
+        state_.selectedParentalType = index;
+        state_.selectedParentalCategory = 0;
+        return;
+      }
+    }
+  }
+
+  const std::vector<StreamType> streamTypes{
+    StreamType::Live,
+    StreamType::Movies,
+    StreamType::Series,
+    StreamType::Radio
+  };
+  const int typeIndex = std::clamp(state_.selectedParentalType, 0, 3);
+  const int categoryCount = static_cast<int>(parentalCategoriesForType(
+    streamTypes[static_cast<std::size_t>(typeIndex)]
+  ).size());
+  const int start = windowStart(state_.selectedParentalCategory, categoryCount, 8);
+  for (int row = 0; row < 8; ++row) {
+    const int top = 268 + row * 42;
+    const int index = start + row;
+    if (index < categoryCount && x >= 80 && x < 1200 && y >= top && y < top + 42) {
+      state_.selectedParentalCategory = index;
+      handleParental(Button::Select);
+      return;
+    }
+  }
+}
+
+void App::handleSecondaryTouchDrag(int x, int y) {
+  const int deltaY = y - touchLastY_;
+  if (std::abs(deltaY) < 18) {
+    return;
+  }
+
+  if (state_.screen == ScreenId::Settings) {
+    constexpr int maxSettingsScroll = 970 - 412;
+    state_.settingsScroll = std::clamp(state_.settingsScroll - deltaY, 0, maxSettingsScroll);
+    touchLastY_ = y;
+    return;
+  }
+
+  const int direction = deltaY < 0 ? 1 : -1;
+  if (state_.screen == ScreenId::AddPlaylist || state_.screen == ScreenId::Playlists) {
+    const int count = static_cast<int>(state_.config.playlists.size()) + 4;
+    state_.selectedAddOption = std::clamp(state_.selectedAddOption + direction, 0, std::max(0, count - 1));
+    touchLastY_ = y;
+  } else if (state_.screen == ScreenId::Parental) {
+    const std::vector<StreamType> streamTypes{
+      StreamType::Live,
+      StreamType::Movies,
+      StreamType::Series,
+      StreamType::Radio
+    };
+    const int typeIndex = std::clamp(state_.selectedParentalType, 0, 3);
+    const int count = static_cast<int>(parentalCategoriesForType(
+      streamTypes[static_cast<std::size_t>(typeIndex)]
+    ).size());
+    state_.selectedParentalCategory = std::clamp(
+      state_.selectedParentalCategory + direction,
+      0,
+      std::max(0, count - 1)
+    );
+    touchLastY_ = y;
+  }
+  (void)x;
+}
+
+void App::handlePlayerTouchTap(int x, int y) {
+  const long long now = nowMs();
+  state_.playerOverlayUntilMs = now + 5000;
+  state_.lastPlaybackInputMs = now;
+  if (platformIsDockedMode() && state_.config.dockedSleepTimerMinutes > 0) {
+    state_.playbackStartedAtMs = now;
+  }
+
+  if (!playerTouchOverlayWasVisible_) {
+    return;
+  }
+  if (x < 150 && (y < 100 || y >= 550)) {
+    handle(Button::Back);
+    return;
+  }
+  if (!player_ || !player_->isOpen()) {
+    return;
+  }
+
+  const bool vod = state_.hasPlaybackChannel &&
+    isVodType(state_.playbackChannel.type) &&
+    player_->canSeek();
+  if (vod && y >= 670 && x >= 188 && x <= 1092 && player_->durationMs() > 0) {
+    const int64_t target = (static_cast<int64_t>(x - 188) * player_->durationMs()) / (1092 - 188);
+    if (player_->seekToMs(target)) {
+      state_.message = "Playback position changed";
+    }
+    return;
+  }
+
+  if (y >= 540) {
+    if (vod && x >= 260 && x < 430) {
+      handle(Button::ShoulderLeft);
+    } else if (vod && x >= 430 && x < 560) {
+      handle(Button::Left);
+    } else if (x >= 560 && x < 720) {
+      handle(Button::Select);
+    } else if (vod && x >= 720 && x < 850) {
+      handle(Button::Right);
+    } else if (vod && x >= 850 && x < 1020) {
+      handle(Button::ShoulderRight);
+    } else if (!vod) {
+      handle(Button::Select);
+    }
+    return;
+  }
+
+  if (x >= 440 && x <= 840 && y >= 180 && y <= 540) {
+    handle(Button::Select);
+  }
+}
+
+void App::handlePlayerTouchDrag(int x, int y) {
+  if (!playerTouchOverlayWasVisible_ || touchStartY_ < 650 || !player_ ||
+      !player_->isOpen() || !player_->canSeek() || player_->durationMs() <= 0) {
+    return;
+  }
+  const long long now = nowMs();
+  if (playerTouchLastSeekMs_ > 0 && now - playerTouchLastSeekMs_ < 120) {
+    return;
+  }
+  const int clampedX = std::clamp(x, 188, 1092);
+  const int64_t target =
+    (static_cast<int64_t>(clampedX - 188) * player_->durationMs()) / (1092 - 188);
+  if (player_->seekToMs(target)) {
+    playerTouchLastSeekMs_ = now;
+  }
+  state_.playerOverlayUntilMs = now + 5000;
+  touchLastY_ = y;
 }
 
 void App::handle(Button button) {
@@ -5927,7 +6383,7 @@ void App::renderAddPlaylistGraphic() {
     gfx_.drawText(Graphics::fitText(subtitle, 60), 134, y + 34, 1, selected ? text : muted, false);
   }
 
-  gfx_.drawText("A SELECT    X DELETE SELECTED    B BACK", 96, 632, 2, muted, true);
+  gfx_.drawText("TOUCH A ROW TO OPEN    DRAG TO SCROLL    X DELETE    B BACK", 96, 632, 2, muted, true);
   gfx_.drawText(Graphics::fitText(state_.message, 86), 96, 666, 2, rgb(0, 145, 255), false);
 
   if (state_.loading) {
@@ -5970,8 +6426,8 @@ void App::renderPlayerGraphic() {
       ? ("  " + formatPlaybackTime(vodPositionMs))
       : "";
     std::string controls = vodPlayback
-      ? "A PAUSE/RESUME   L -30s   < -10s   > +10s   R +30s   B BACK"
-      : "A PAUSE/RESUME   B BACK";
+      ? "SWIPE RIGHT FROM LEFT EDGE: EXIT | -30 -10 PAUSE +10 +30 | DRAG TIMELINE"
+      : "SWIPE RIGHT FROM LEFT EDGE: EXIT | TAP CENTER: PAUSE";
     const std::string sleepWarningCompact = playbackSleepWarningText(true);
     if (!sleepWarningCompact.empty()) {
       controls = Graphics::fitText(sleepWarningCompact, 92);
@@ -6116,7 +6572,7 @@ void App::renderPlayerGraphic() {
       );
 
       gfx_.drawText(
-        "Press B to return",
+        "Touch BACK or press B to return",
         boxX + 164,
         boxY + 104,
         1,
@@ -6160,8 +6616,26 @@ void App::renderPlayerGraphic() {
     const int64_t vodDurationMs = vodPlayback ? player_->durationMs() : 0;
     const int64_t vodPositionMs = vodPlayback ? player_->positionMs() : 0;
     std::string controls = vodPlayback
-      ? "A PAUSE/RESUME   L -30s   < -10s   > +10s   R +30s   B BACK"
-      : "A PAUSE/RESUME   B BACK";
+      ? "SWIPE RIGHT FROM LEFT EDGE: EXIT | -30 -10 PAUSE +10 +30 | DRAG TIMELINE"
+      : "SWIPE RIGHT FROM LEFT EDGE: EXIT | TAP CENTER: PAUSE";
+
+    auto drawTouchButton = [&](const std::string &label, int x, int width, Color color) {
+      gfx_.fillRoundRect(x, 548, width, 48, 13, rgba(8, 15, 30, 220));
+      gfx_.strokeRoundRect(x, 548, width, 48, 13, color, 2);
+      const int labelWidth = gfx_.textWidth(label, 2);
+      gfx_.drawText(label, x + std::max(10, (width - labelWidth) / 2), 565, 2, rgb(248, 250, 252), true);
+    };
+
+    drawTouchButton("BACK", 24, 126, rgb(248, 113, 113));
+    if (vodPlayback) {
+      drawTouchButton("-30", 278, 136, rgb(0, 191, 255));
+      drawTouchButton("-10", 430, 114, rgb(0, 191, 255));
+      drawTouchButton(isPaused ? "PLAY" : "PAUSE", 560, 144, rgb(57, 220, 35));
+      drawTouchButton("+10", 720, 114, rgb(0, 191, 255));
+      drawTouchButton("+30", 850, 154, rgb(0, 191, 255));
+    } else {
+      drawTouchButton(isPaused ? "PLAY" : "PAUSE", 560, 160, rgb(57, 220, 35));
+    }
 
     gfx_.fillHorizontalGradient(
       0,
@@ -6375,7 +6849,7 @@ void App::renderParentalGraphic() {
     }
   }
 
-  gfx_.drawText("LEFT/RIGHT TYPE    UP/DOWN CATEGORY    A CHANGE HIDE/LOCK/UNLOCK    Y CHANGE PIN    B BACK", 64, 660, 2, muted, true);
+  gfx_.drawText("TOUCH TAB/ROW TO CHANGE    DRAG TO SCROLL    LEFT: BACK    RIGHT: CHANGE PIN", 64, 660, 2, muted, true);
 }
 
 void App::renderSettingsGraphic() {
@@ -6422,6 +6896,12 @@ void App::renderSettingsGraphic() {
       gfx_.drawText((selected ? "> " : "  ") + title, contentX, rowY, 3, selected ? blue : text, true);
       gfx_.drawText(Graphics::fitText(value, 72), contentX + 30, rowY + 28, 2, text, true);
       gfx_.drawText(Graphics::fitText(hint, 88), contentX + 30, rowY + 52, 1, muted, false);
+      if (index == 5) {
+        gfx_.drawTextRight("OPEN >", panel.x + panel.w - 34, rowY + 24, 2, blue, true);
+      } else {
+        gfx_.drawText("-", contentX + 760, rowY + 22, 3, muted, true);
+        gfx_.drawTextRight("+", panel.x + panel.w - 38, rowY + 22, 3, blue, true);
+      }
     }
 
     y += 78;
@@ -6515,7 +6995,7 @@ void App::renderSettingsGraphic() {
     gfx_.drawText("v MORE", panel.x + panel.w - 120, panel.y + panel.h - 32, 2, blue, true);
   }
 
-  gfx_.drawText("UP/DOWN SELECT    LEFT/RIGHT CHANGE    L/R FAST CHANGE    Y RESET    A OPEN    B BACK", 64, 660, 2, muted, true);
+  gfx_.drawText("TOUCH LEFT/RIGHT TO CHANGE    DRAG TO SCROLL    TOUCH FOOTER TO BACK", 64, 660, 2, muted, true);
 }
 
 
