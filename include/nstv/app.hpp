@@ -181,9 +181,28 @@ private:
   void renderPlayer();
   void renderSettings();
   void handle(Button button);
+  void handleInput(const InputEvent &event);
+  void handleTouchTap(int x, int y);
+  void handleDashboardTouchTap(int x, int y);
+  void handleDashboardTouchDrag(int x, int y);
+  void handleAddPlaylistTouchTap(int x, int y);
+  void handleSettingsTouchTap(int x, int y);
+  void handleParentalTouchTap(int x, int y);
+  void handleSecondaryTouchDrag(int x, int y);
+  void handlePlayerTouchTap(int x, int y);
+  void handlePlayerTouchDrag(int x, int y);
   void handleDashboard(Button button);
   void handleAddPlaylist(Button button);
   void handleParental(Button button);
+
+  bool touchActive_ = false;
+  bool touchDragging_ = false;
+  int touchFingerId_ = -1;
+  int touchStartX_ = 0;
+  int touchStartY_ = 0;
+  int touchLastY_ = 0;
+  bool playerTouchOverlayWasVisible_ = false;
+  long long playerTouchLastSeekMs_ = 0;
 
   const PlaylistConfig *activePlaylist() const;
   std::string activePlaylistName() const;

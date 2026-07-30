@@ -33,10 +33,27 @@ enum class Button {
   Quit
 };
 
+enum class InputType {
+  None,
+  Button,
+  TouchDown,
+  TouchMove,
+  TouchUp
+};
+
+struct InputEvent {
+  InputType type = InputType::None;
+  Button button = Button::None;
+  int x = 0;
+  int y = 0;
+  int fingerId = -1;
+};
+
 void platformInit();
 void platformExit();
 Button pollButton();
 Button pollButtonBlocking();
+InputEvent pollInput();
 void clearScreen();
 void presentScreen();
 void sleepMs(int ms);
