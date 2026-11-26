@@ -332,6 +332,7 @@ private:
   std::vector<ChannelLoadResult> channelFinished_;
   std::atomic<bool> channelStop_{false};
   std::thread epgWorker_;
+  std::thread epgWorker2_;
   std::mutex epgMutex_;
   std::condition_variable epgCv_;
   std::vector<EpgJob> epgQueue_;

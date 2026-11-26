@@ -261,13 +261,22 @@ const char *firstExistingFont() {
 #endif
   };
 
+  // Probed once: this runs for every text draw, and used to open the font file (and log) each time.
+  static bool probed = false;
+  static const char *found = nullptr;
+  if (probed) {
+    return found;
+  }
+  probed = true;
+
   for (const auto &path : paths) {
     FILE *fp = std::fopen(path.c_str(), "rb");
 
     if (fp) {
       std::fclose(fp);
       std::printf("[NSTV] Found font: %s\n", path.c_str());
-      return path.c_str();
+      found = path.c_str();
+      return found;
     }
   }
 

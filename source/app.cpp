@@ -1,6 +1,7 @@
 #include "nstv/app.hpp"
 #include "nstv/log.hpp"
 #include <algorithm>
+#include <set>
 #include <cctype>
 #include <functional>
 #include <iostream>
@@ -499,20 +500,27 @@ std::vector<std::size_t> epgCandidateIndicesForChannel(const EpgPage &page, cons
   // that page. If multiple programme channel ids are present, keep protection
   // against borrowing another channel's current programme.
   if (pageHasIdentifiedPrograms) {
+    // Called while rendering every frame: log each channel's decision once, not per frame.
+    static std::set<std::string> loggedChannels;
+    const bool firstTime = loggedChannels.size() < 4096 && loggedChannels.insert(channel->name).second;
     if (distinctPageIds.size() <= 1) {
-      std::printf(
-        "[KBORE][EPG][MATCH] no direct channel id match for '%s', but EPG page is single-channel id='%s'; trusting parser-scoped page\n",
-        channel->name.c_str(),
-        distinctPageIds.empty() ? "" : distinctPageIds.front().c_str()
-      );
+      if (firstTime) {
+        std::printf(
+          "[KBORE][EPG][MATCH] no direct channel id match for '%s', but EPG page is single-channel id='%s'; trusting parser-scoped page\n",
+          channel->name.c_str(),
+          distinctPageIds.empty() ? "" : distinctPageIds.front().c_str()
+        );
+      }
       return all;
     }
 
-    std::printf(
-      "[KBORE][EPG][MATCH] no direct channel id match for '%s' and EPG page has %zu channel ids; refusing mixed-page fallback\n",
-      channel->name.c_str(),
-      distinctPageIds.size()
-    );
+    if (firstTime) {
+      std::printf(
+        "[KBORE][EPG][MATCH] no direct channel id match for '%s' and EPG page has %zu channel ids; refusing mixed-page fallback\n",
+        channel->name.c_str(),
+        distinctPageIds.size()
+      );
+    }
     return {};
   }
 
@@ -4039,7 +4047,10 @@ void App::loadVisibleEpgForChannelList() {
 
 void App::startEpgWorker() {
   epgStop_ = false;
+  // Two workers: one slow EPG request (the parser can take >10 s on a cold XMLTV) no longer
+  // holds every other visible channel behind it.
   epgWorker_ = std::thread(&App::epgWorkerLoop, this);
+  epgWorker2_ = std::thread(&App::epgWorkerLoop, this);
 }
 
 void App::stopEpgWorker() {
@@ -4048,6 +4059,9 @@ void App::stopEpgWorker() {
 
   if (epgWorker_.joinable()) {
     epgWorker_.join();
+  }
+  if (epgWorker2_.joinable()) {
+    epgWorker2_.join();
   }
 }
 
