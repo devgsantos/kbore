@@ -59,16 +59,72 @@ ImageCache::~ImageCache() {
   stop_ = true;
   cv_.notify_all();
 
-  if (worker_.joinable()) {
-    worker_.join();
+  for (std::thread &worker : workers_) {
+    if (worker.joinable()) {
+      worker.join();
+    }
   }
 }
 
 void ImageCache::ensureWorkerLocked() {
-  if (!worker_.joinable()) {
+  if (workers_.empty()) {
     stop_ = false;
-    worker_ = std::thread(&ImageCache::workerLoop, this);
+    for (int i = 0; i < kWorkerCount; ++i) {
+      workers_.emplace_back(&ImageCache::workerLoop, this);
+    }
   }
+}
+
+namespace {
+// Logos are drawn at most a few hundred pixels wide; decoding them at source resolution wasted
+// memory and GPU upload time.
+constexpr int kMaxBitmapDimension = 320;
+
+void downscaleBitmap(Bitmap &bitmap) {
+  const int srcW = bitmap.width;
+  const int srcH = bitmap.height;
+  const int largest = std::max(srcW, srcH);
+  if (largest <= kMaxBitmapDimension) {
+    return;
+  }
+
+  const int dstW = std::max(1, srcW * kMaxBitmapDimension / largest);
+  const int dstH = std::max(1, srcH * kMaxBitmapDimension / largest);
+  std::vector<uint8_t> out(static_cast<std::size_t>(dstW) * dstH * 4);
+
+  // Box filter: average every source pixel that maps onto each destination pixel.
+  for (int dy = 0; dy < dstH; ++dy) {
+    const int sy0 = dy * srcH / dstH;
+    const int sy1 = std::max(sy0 + 1, (dy + 1) * srcH / dstH);
+    for (int dx = 0; dx < dstW; ++dx) {
+      const int sx0 = dx * srcW / dstW;
+      const int sx1 = std::max(sx0 + 1, (dx + 1) * srcW / dstW);
+      uint32_t sum[4] = {0, 0, 0, 0};
+      uint32_t count = 0;
+      for (int sy = sy0; sy < sy1; ++sy) {
+        const uint8_t *row = bitmap.rgba.data() + (static_cast<std::size_t>(sy) * srcW + sx0) * 4;
+        for (int sx = sx0; sx < sx1; ++sx, row += 4) {
+          sum[0] += row[0];
+          sum[1] += row[1];
+          sum[2] += row[2];
+          sum[3] += row[3];
+          ++count;
+        }
+      }
+      uint8_t *dst = out.data() + (static_cast<std::size_t>(dy) * dstW + dx) * 4;
+      for (int c = 0; c < 4; ++c) dst[c] = static_cast<uint8_t>(sum[c] / count);
+    }
+  }
+
+  bitmap.width = dstW;
+  bitmap.height = dstH;
+  bitmap.rgba.swap(out);
+}
+} // namespace
+
+void ImageCache::finalizeBitmap(Bitmap &bitmap) {
+  downscaleBitmap(bitmap);
+  bitmap.id = Graphics::nextBitmapId();
 }
 
 void ImageCache::workerLoop() {
@@ -81,12 +137,13 @@ void ImageCache::workerLoop() {
         return stop_ || !queue_.empty();
       });
 
-      if (stop_ && queue_.empty()) {
+      if (stop_) {
         break;
       }
 
-      url = queue_.front();
-      queue_.erase(queue_.begin());
+      // Newest request first: it is what is on screen right now.
+      url = queue_.back();
+      queue_.pop_back();
       queued_.erase(url);
     }
 
@@ -95,6 +152,7 @@ void ImageCache::workerLoop() {
 
     if (download(url, bytes) &&
         (decodeSdlImage(bytes, entry.bitmap) || decodePng(bytes, entry.bitmap) || decodePpm(bytes, entry.bitmap))) {
+      finalizeBitmap(entry.bitmap);
       entry.status = Status::Loaded;
     } else {
       entry.status = Status::Failed;
@@ -102,8 +160,37 @@ void ImageCache::workerLoop() {
 
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      entries_[url] = std::move(entry);
+      auto found = entries_.find(url);
+      // Only fill entries still waiting for this download (clear()/trim() may have dropped it).
+      if (found != entries_.end() && found->second.status == Status::Loading) {
+        found->second.status = entry.status;
+        found->second.bitmap = std::move(entry.bitmap);
+        found->second.lastAccess = ++accessCounter_;
+      }
     }
+  }
+}
+
+void ImageCache::trim(std::size_t maxEntries) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (entries_.size() <= maxEntries) {
+    return;
+  }
+
+  std::vector<std::pair<uint64_t, std::string>> candidates;
+  candidates.reserve(entries_.size());
+  for (const auto &item : entries_) {
+    if (item.second.status != Status::Loading) {
+      candidates.emplace_back(item.second.lastAccess, item.first);
+    }
+  }
+  std::sort(candidates.begin(), candidates.end());
+
+  std::size_t excess = entries_.size() - maxEntries;
+  for (const auto &candidate : candidates) {
+    if (excess == 0) break;
+    entries_.erase(candidate.second);
+    --excess;
   }
 }
 
@@ -119,6 +206,7 @@ const Bitmap *ImageCache::peek(const std::string &url) const {
     return nullptr;
   }
 
+  found->second.lastAccess = ++accessCounter_;
   return &found->second.bitmap;
 }
 
@@ -152,6 +240,17 @@ void ImageCache::request(const std::string &url) {
     entries_[url].status = Status::Loading;
     queue_.push_back(url);
     queued_.insert(url);
+
+    while (queue_.size() > kMaxQueued) {
+      const std::string stale = queue_.front();
+      queue_.erase(queue_.begin());
+      queued_.erase(stale);
+      auto staleEntry = entries_.find(stale);
+      if (staleEntry != entries_.end() && staleEntry->second.status == Status::Loading) {
+        entries_.erase(staleEntry);  // Missing again: re-requested if it scrolls back into view.
+      }
+    }
+
     ensureWorkerLocked();
   }
 
@@ -177,6 +276,7 @@ const Bitmap *ImageCache::get(const std::string &url) {
 
   if (download(url, bytes) &&
       (decodeSdlImage(bytes, entry.bitmap) || decodePng(bytes, entry.bitmap) || decodePpm(bytes, entry.bitmap))) {
+    finalizeBitmap(entry.bitmap);
     entry.status = Status::Loaded;
   } else {
     entry.status = Status::Failed;

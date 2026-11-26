@@ -1472,8 +1472,42 @@ App::~App() {
   }
 }
 
+// Sleeps only for what is left of a ~60 fps frame (the work already spent counts), instead of a
+// fixed 16 ms after rendering, and logs frame work time every few seconds for profiling.
+void App::paceFrame() {
+  constexpr long long kFrameBudgetMs = 16;
+  constexpr int kPerfWindow = 180;
+  const long long workMs = nowMs() - frameStartMs_;
+
+  frameWorkSamples_.push_back(static_cast<int>(workMs));
+  if (static_cast<int>(frameWorkSamples_.size()) >= kPerfWindow) {
+    std::vector<int> sorted = frameWorkSamples_;
+    std::sort(sorted.begin(), sorted.end());
+    long long total = 0;
+    for (int value : sorted) total += value;
+    const int p50 = sorted[sorted.size() / 2];
+    const int p95 = sorted[(sorted.size() * 95) / 100];
+    std::printf(
+      "[KBORE][PERF] frames=%zu work_ms avg=%.1f p50=%d p95=%d max=%d over_budget=%zu\n",
+      sorted.size(),
+      double(total) / double(sorted.size()),
+      p50,
+      p95,
+      sorted.back(),
+      static_cast<std::size_t>(std::count_if(sorted.begin(), sorted.end(), [](int v) { return v > 16; }))
+    );
+    frameWorkSamples_.clear();
+  }
+
+  if (workMs < kFrameBudgetMs) {
+    sleepMs(static_cast<int>(kFrameBudgetMs - workMs));
+  }
+  frameStartMs_ = nowMs();
+}
+
 int App::run() {
   render();
+  frameStartMs_ = nowMs();
 
   while (state_.running) {
     const bool hadPlaylistLoad = playlistLoadActive();
@@ -1482,7 +1516,7 @@ int App::run() {
 
     if (hadPlaylistLoad && !playlistLoadActive()) {
       render();
-      sleepMs(16);
+      paceFrame();
       continue;
     }
 
@@ -1495,7 +1529,7 @@ int App::run() {
       }
 
       render();
-      sleepMs(16);
+      paceFrame();
       continue;
     }
 
@@ -1508,7 +1542,7 @@ int App::run() {
       }
 
       render();
-      sleepMs(16);
+      paceFrame();
       continue;
     }
 
@@ -1521,7 +1555,7 @@ int App::run() {
 
       applyPlaybackSleepPolicy();
       render();
-      sleepMs(16);
+      paceFrame();
       continue;
     }
 
@@ -1530,7 +1564,7 @@ int App::run() {
       handleInput(input);
     }
     render();
-    sleepMs(16);
+    paceFrame();
   }
 
   setMediaPlaybackActive(false);
@@ -3809,6 +3843,14 @@ void App::loadSelectedEpg(bool force, bool fetchRemote) {
     }
   }
 
+  if (!force && !fetchRemote) {
+    // Focus moves: hand the disk/network lookup to the EPG worker instead of reading the SD
+    // card on the UI thread. drainFinishedEpg() updates currentEpgAvailable when it lands.
+    state_.currentEpgAvailable = false;
+    loadEpgForChannels({*channel});
+    return;
+  }
+
   EpgPage cached;
   const bool epgCacheFresh = cacheFileFresh(epgCachePath(state_.manifest.id, *channel), state_.config.epgRefreshHours);
   if (!force && epgCacheFresh && loadEpgPage(state_.manifest.id, *channel, cached)) {
@@ -3864,16 +3906,15 @@ void App::loadEpgForChannels(const std::vector<Channel> &channels) {
       continue;
     }
 
-    EpgPage cached;
-    const bool epgCacheFresh = cacheFileFresh(epgCachePath(state_.manifest.id, channel), state_.config.epgRefreshHours);
-    if (epgCacheFresh && loadEpgPage(state_.manifest.id, channel, cached)) {
-      for (const std::string &alias : channelEpgKeys(channel)) {
-        state_.epgByChannel[alias] = cached;
-      }
-      if (currentProgramIndex(cached, &channel) >= 0 && epgPageHasDatedTimes(cached)) {
-        continue;
-      }
+    // Runs on every D-pad move: never touch the SD card here (the EPG worker reads the disk
+    // cache first), and don't retry a channel that recently came back without a current
+    // programme, otherwise it is re-queued on every single key press.
+    const std::string attemptKey = state_.manifest.id + ":" + key;
+    const auto attempted = epgAttemptedAtMs_.find(attemptKey);
+    if (attempted != epgAttemptedAtMs_.end() && nowMs() - attempted->second < kEpgRetryIntervalMs) {
+      continue;
     }
+    epgAttemptedAtMs_[attemptKey] = nowMs();
 
     missing.push_back(channel);
   }
@@ -3930,6 +3971,8 @@ void App::loadEpgForChannels(const std::vector<Channel> &channels) {
     while (epgQueue_.size() > maxPendingEpgJobs) {
       const EpgJob &stale = epgQueue_.back();
       epgQueuedKeys_.erase(stale.manifestId + ":" + stale.key);
+      // Dropped before running: allow it to be queued again as soon as it is visible.
+      epgAttemptedAtMs_.erase(stale.manifestId + ":" + stale.key);
       epgQueue_.pop_back();
     }
   }
@@ -4029,6 +4072,19 @@ void App::epgWorkerLoop() {
     const std::string queuedKey = job.manifestId + ":" + job.key;
 
     try {
+      // Disk cache first (moved off the UI thread): only go to the network when the cached page
+      // is stale or has no programme airing now.
+      EpgPage cached;
+      if (cacheFileFresh(epgCachePath(job.manifestId, job.channel), job.config.epgRefreshHours) &&
+          loadEpgPage(job.manifestId, job.channel, cached) &&
+          currentProgramIndex(cached, &job.channel) >= 0 &&
+          epgPageHasDatedTimes(cached)) {
+        std::lock_guard<std::mutex> lock(epgMutex_);
+        epgFinished_.push_back(EpgResult{job.manifestId, job.key, job.channel, cached});
+        epgQueuedKeys_.erase(queuedKey);
+        continue;
+      }
+
       std::printf("[KBORE] loading EPG for channel='%s' provider='%s' key='%s'\n", job.channel.name.c_str(), toString(job.provider).c_str(), job.key.c_str());
       ParserApiClient epgApi(job.config);
       EpgPage epg = epgApi.loadEpgPrograms(
@@ -5623,6 +5679,8 @@ static int gridWindowStart(int selected, int size, int columns, int rows) {
 }
 
 void App::render() {
+  // Bound decoded logo memory; safe here because no peek() pointer is held across frames.
+  imageCache_.trim(240);
   drainFinishedChannelLoads();
   drainFinishedEpg();
   updateVodDetailsLoad();

@@ -169,6 +169,7 @@ private:
   };
 
   void render();
+  void paceFrame();
   void renderSplashGraphic();
   void renderDashboard();
   void renderDashboardGraphic();
@@ -367,6 +368,11 @@ private:
 
   bool splashVisible_ = true;
   long long splashStartedAtMs_ = 0;
+  long long frameStartMs_ = 0;
+  // UI thread only: last time each EPG key was queued, to throttle retries (see loadEpgForChannels).
+  std::map<std::string, long long> epgAttemptedAtMs_;
+  static constexpr long long kEpgRetryIntervalMs = 5 * 60 * 1000;
+  std::vector<int> frameWorkSamples_;
   long long splashDurationMs_ = 1800;
 };
 
