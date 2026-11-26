@@ -1,4 +1,5 @@
 #include "nstv/platform.hpp"
+#include <sys/stat.h>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -38,6 +39,15 @@ void platformInit() {
   padInitializeDefault(&pad);
   hidInitializeTouchScreen();
   socketInitializeDefault();
+#ifndef NSTV_PRODUCTION_BUILD
+  // Development builds: keep the console (EPG, perf, playback diagnostics printed with printf)
+  // in a file on the SD card, recreated on every launch; it can be fetched over FTP.
+  mkdir("sdmc:/switch", 0777);
+  mkdir("sdmc:/switch/kbore", 0777);
+  if (std::freopen("sdmc:/switch/kbore/kbore-stdout.log", "w", stdout)) {
+    std::setvbuf(stdout, nullptr, _IOLBF, 4096);
+  }
+#endif
   curl_global_init(CURL_GLOBAL_DEFAULT);
 #else
   curl_global_init(CURL_GLOBAL_DEFAULT);
