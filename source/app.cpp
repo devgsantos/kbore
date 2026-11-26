@@ -4105,6 +4105,9 @@ void App::epgWorkerLoop() {
     } catch (const std::exception &ex) {
       std::printf("[KBORE] background EPG failed for %s: %s\n", job.channel.name.c_str(), ex.what());
       std::lock_guard<std::mutex> lock(epgMutex_);
+      EpgResult failure{job.manifestId, job.key, job.channel, EpgPage{}};
+      failure.failed = true;
+      epgFinished_.push_back(failure);
       epgQueuedKeys_.erase(queuedKey);
     }
   }
@@ -4119,6 +4122,12 @@ void App::drainFinishedEpg() {
   }
 
   for (const EpgResult &result : finished) {
+    if (result.failed) {
+      // Let the next focus/visibility pass retry after a short backoff.
+      epgAttemptedAtMs_[result.manifestId + ":" + result.key] = nowMs() - kEpgRetryIntervalMs + kEpgFailureRetryMs;
+      continue;
+    }
+
     if (!state_.hasManifest || result.manifestId != state_.manifest.id) {
       continue;
     }

@@ -9,7 +9,12 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <cstdio>
+#include <ctime>
+#include <mutex>
 #include <utility>
+#include <dirent.h>
+#include <sys/stat.h>
 #include <curl/curl.h>
 #include <zlib.h>
 #ifdef NSTV_USE_SDL_IMAGE
@@ -122,12 +127,99 @@ void downscaleBitmap(Bitmap &bitmap) {
 }
 } // namespace
 
+namespace {
+// Persistent logo cache: the raw downloaded bytes, so the next launch skips the network.
+#ifdef __SWITCH__
+constexpr const char *kDiskCacheDir = "sdmc:/switch/kbore/cache/logos";
+#else
+constexpr const char *kDiskCacheDir = "cache/logos";
+#endif
+constexpr std::size_t kDiskCacheMaxFiles = 2000;
+constexpr std::size_t kDiskCacheKeepFiles = 1500;
+
+std::string diskCachePath(const std::string &url) {
+  uint64_t hash = 1469598103934665603ULL;  // FNV-1a 64
+  for (unsigned char c : url) {
+    hash ^= c;
+    hash *= 1099511628211ULL;
+  }
+  char name[32];
+  std::snprintf(name, sizeof(name), "%016llx.img", static_cast<unsigned long long>(hash));
+  return std::string(kDiskCacheDir) + "/" + name;
+}
+
+void ensureDiskCacheDir() {
+#ifdef __SWITCH__
+  mkdir("sdmc:/switch", 0777);
+  mkdir("sdmc:/switch/kbore", 0777);
+  mkdir("sdmc:/switch/kbore/cache", 0777);
+#else
+  mkdir("cache", 0777);
+#endif
+  mkdir(kDiskCacheDir, 0777);
+}
+
+bool readDiskCache(const std::string &url, std::vector<uint8_t> &data) {
+  FILE *file = std::fopen(diskCachePath(url).c_str(), "rb");
+  if (!file) return false;
+  std::fseek(file, 0, SEEK_END);
+  const long size = std::ftell(file);
+  std::fseek(file, 0, SEEK_SET);
+  bool ok = size > 0 && size <= 2 * 1024 * 1024;
+  if (ok) {
+    data.resize(static_cast<std::size_t>(size));
+    ok = std::fread(data.data(), 1, data.size(), file) == data.size();
+  }
+  std::fclose(file);
+  return ok;
+}
+
+void writeDiskCache(const std::string &url, const std::vector<uint8_t> &data) {
+  const std::string path = diskCachePath(url);
+  const std::string tmp = path + ".tmp";
+  FILE *file = std::fopen(tmp.c_str(), "wb");
+  if (!file) return;
+  const bool ok = std::fwrite(data.data(), 1, data.size(), file) == data.size();
+  std::fclose(file);
+  if (ok) {
+    std::rename(tmp.c_str(), path.c_str());
+  } else {
+    std::remove(tmp.c_str());
+  }
+}
+
+// Keeps the logo folder bounded: when over kDiskCacheMaxFiles, delete the oldest files.
+void pruneDiskCache() {
+  DIR *dir = opendir(kDiskCacheDir);
+  if (!dir) return;
+  std::vector<std::pair<time_t, std::string>> files;
+  while (dirent *item = readdir(dir)) {
+    const std::string name = item->d_name;
+    if (name == "." || name == "..") continue;
+    const std::string path = std::string(kDiskCacheDir) + "/" + name;
+    struct stat info {};
+    if (stat(path.c_str(), &info) == 0) files.emplace_back(info.st_mtime, path);
+  }
+  closedir(dir);
+  if (files.size() <= kDiskCacheMaxFiles) return;
+  std::sort(files.begin(), files.end());
+  const std::size_t removeCount = files.size() - kDiskCacheKeepFiles;
+  for (std::size_t i = 0; i < removeCount; ++i) std::remove(files[i].second.c_str());
+}
+} // namespace
+
 void ImageCache::finalizeBitmap(Bitmap &bitmap) {
   downscaleBitmap(bitmap);
   bitmap.id = Graphics::nextBitmapId();
 }
 
 void ImageCache::workerLoop() {
+  static std::once_flag diskCacheInit;
+  std::call_once(diskCacheInit, []() {
+    ensureDiskCacheDir();
+    pruneDiskCache();
+  });
+
   while (true) {
     std::string url;
 
@@ -149,9 +241,17 @@ void ImageCache::workerLoop() {
 
     Entry entry;
     std::vector<uint8_t> bytes;
+    auto decode = [&]() {
+      return decodeSdlImage(bytes, entry.bitmap) || decodePng(bytes, entry.bitmap) || decodePpm(bytes, entry.bitmap);
+    };
 
-    if (download(url, bytes) &&
-        (decodeSdlImage(bytes, entry.bitmap) || decodePng(bytes, entry.bitmap) || decodePpm(bytes, entry.bitmap))) {
+    bool loaded = readDiskCache(url, bytes) && decode();
+    if (!loaded && download(url, bytes) && decode()) {
+      loaded = true;
+      writeDiskCache(url, bytes);
+    }
+
+    if (loaded) {
       finalizeBitmap(entry.bitmap);
       entry.status = Status::Loaded;
     } else {
@@ -296,7 +396,14 @@ void ImageCache::clear() {
 }
 
 bool ImageCache::download(const std::string &url, std::vector<uint8_t> &data) {
-  CURL *curl = curl_easy_init();
+  // One handle per thread, reset between requests: keeps libcurl's connection cache, so logos
+  // from the same CDN reuse the TCP/TLS connection instead of a full handshake every time.
+  thread_local CURL *curl = nullptr;
+  if (!curl) {
+    curl = curl_easy_init();
+  } else {
+    curl_easy_reset(curl);
+  }
 
   if (!curl) {
     return false;
@@ -315,13 +422,13 @@ bool ImageCache::download(const std::string &url, std::vector<uint8_t> &data) {
   curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
   curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 8L);
   curl_easy_setopt(curl, CURLOPT_TIMEOUT, 12L);
+  curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
 
   CURLcode code = curl_easy_perform(curl);
   long status = 0;
   curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
 
   curl_slist_free_all(headers);
-  curl_easy_cleanup(curl);
 
   return code == CURLE_OK && status >= 200 && status < 300 && !data.empty();
 }

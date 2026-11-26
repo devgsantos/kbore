@@ -115,6 +115,7 @@ private:
     std::string key;
     Channel channel;
     EpgPage page;
+    bool failed = false;  // request failed: no page, retry soon instead of after kEpgRetryIntervalMs
   };
 
   struct ChannelLoadJob {
@@ -372,6 +373,7 @@ private:
   // UI thread only: last time each EPG key was queued, to throttle retries (see loadEpgForChannels).
   std::map<std::string, long long> epgAttemptedAtMs_;
   static constexpr long long kEpgRetryIntervalMs = 5 * 60 * 1000;
+  static constexpr long long kEpgFailureRetryMs = 20 * 1000;
   std::vector<int> frameWorkSamples_;
   long long splashDurationMs_ = 1800;
 };
