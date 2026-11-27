@@ -4072,10 +4072,9 @@ void App::loadVisibleEpgForChannelList() {
 
 void App::startEpgWorker() {
   epgStop_ = false;
-  // Two workers: one slow EPG request (the parser can take >10 s on a cold XMLTV) no longer
-  // holds every other visible channel behind it.
+  // One worker: the Switch has few network sessions and extra workers competed with stream
+  // connections; the parser's per-channel EPG index made requests fast enough.
   epgWorker_ = std::thread(&App::epgWorkerLoop, this);
-  epgWorker2_ = std::thread(&App::epgWorkerLoop, this);
 }
 
 void App::stopEpgWorker() {
@@ -4426,7 +4425,8 @@ void App::openChannel(const Channel &channel) {
   state_.hasPlaybackChannel = true;
   state_.playbackChannel = channel;
 
-  loadSelectedEpg(false, true);
+  // EPG for the channel loads in the background; it used to be fetched synchronously here, which
+  // blocked the UI and competed with the stream connection.
   loadEpgForChannels(std::vector<Channel>{channel});
 
   state_.screen = ScreenId::Player;
@@ -4500,6 +4500,7 @@ void App::startStreamProbe(const Channel &channel, int attempt) {
   pendingPlayer_->setNativeVideoAllowed(true);
   pendingPlayer_->setOverlayVisible(true);
   streamProbeState_ = StreamProbeState::Running;
+  imageCache_.setPaused(true);  // Leave the network to the stream while it connects.
   state_.message = attempt > 1 ? "Retrying connection" : "Connecting";
   logLinef("[KBORE][PLAYBACK][CONNECT] connecting name='%s' attempt=%d", channel.name.c_str(), attempt);
   streamProbeThread_ = std::thread(&App::streamProbeLoop, this, channel.url);
@@ -4531,6 +4532,7 @@ void App::updateStreamProbe() {
     streamProbeThread_.join();
   }
   streamProbeState_ = StreamProbeState::Idle;
+  imageCache_.setPaused(false);
   std::unique_ptr<IPlayerBackend> connected = std::move(pendingPlayer_);
 
   if (streamProbeCancel_) {

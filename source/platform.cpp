@@ -38,14 +38,9 @@ void platformInit() {
   padConfigureInput(1, HidNpadStyleSet_NpadStandard);
   padInitializeDefault(&pad);
   hidInitializeTouchScreen();
-  // The default config allows only 3 concurrent BSD sessions. Logo workers, EPG workers, the
-  // channel worker and playback all do blocking network calls, so with 3 sessions a slow request
-  // could leave others waiting (seen as EPG requests timing out). Give each worker its own.
-  SocketInitConfig socketConfig = *socketGetDefaultInitConfig();
-  socketConfig.num_bsd_sessions = 8;
-  if (R_FAILED(socketInitialize(&socketConfig))) {
-    socketInitializeDefault();
-  }
+  // Default socket config (3 BSD sessions). Raising it to 8 coincided with stream connections
+  // timing out on device while other devices on the same network played them fine; reverted.
+  socketInitializeDefault();
 #ifndef NSTV_PRODUCTION_BUILD
   // Development builds: keep the console (EPG, perf, playback diagnostics printed with printf)
   // in a file on the SD card, recreated on every launch; it can be fetched over FTP.

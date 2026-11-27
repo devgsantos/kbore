@@ -34,6 +34,10 @@ public:
   // (e.g. once per frame before drawing): pointers returned by peek() stay valid until then.
   void trim(std::size_t maxEntries);
 
+  // While paused, workers finish their current download but start no new one. Used while a stream
+  // connects so logo downloads do not compete with it for the Switch's few network sessions.
+  void setPaused(bool paused);
+
 private:
   enum class Status { Missing, Loading, Loaded, Failed };
 
@@ -43,7 +47,7 @@ private:
     mutable uint64_t lastAccess = 0;
   };
 
-  static constexpr int kWorkerCount = 3;
+  static constexpr int kWorkerCount = 2;
   // Pending downloads beyond this are dropped (oldest first): they belong to rows already
   // scrolled away and will be requested again if they come back on screen.
   static constexpr std::size_t kMaxQueued = 48;
@@ -55,6 +59,7 @@ private:
   std::set<std::string> queued_;
   std::vector<std::thread> workers_;
   std::atomic<bool> stop_{false};
+  bool paused_ = false;  // guarded by mutex_
   mutable uint64_t accessCounter_ = 0;
 
   void ensureWorkerLocked();

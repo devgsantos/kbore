@@ -226,7 +226,7 @@ void ImageCache::workerLoop() {
     {
       std::unique_lock<std::mutex> lock(mutex_);
       cv_.wait(lock, [this]() {
-        return stop_ || !queue_.empty();
+        return stop_ || (!paused_ && !queue_.empty());
       });
 
       if (stop_) {
@@ -268,6 +268,16 @@ void ImageCache::workerLoop() {
         found->second.lastAccess = ++accessCounter_;
       }
     }
+  }
+}
+
+void ImageCache::setPaused(bool paused) {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    paused_ = paused;
+  }
+  if (!paused) {
+    cv_.notify_all();
   }
 }
 
@@ -396,14 +406,10 @@ void ImageCache::clear() {
 }
 
 bool ImageCache::download(const std::string &url, std::vector<uint8_t> &data) {
-  // One handle per thread, reset between requests: keeps libcurl's connection cache, so logos
-  // from the same CDN reuse the TCP/TLS connection instead of a full handshake every time.
-  thread_local CURL *curl = nullptr;
-  if (!curl) {
-    curl = curl_easy_init();
-  } else {
-    curl_easy_reset(curl);
-  }
+  // A fresh handle per download, closed right after. Keeping idle keep-alive connections open per
+  // worker held sockets (and the Switch's fixed socket buffer pool), and new connections such as
+  // the stream's own started timing out after browsing. The SD logo cache covers repeat loads.
+  CURL *curl = curl_easy_init();
 
   if (!curl) {
     return false;
@@ -429,6 +435,7 @@ bool ImageCache::download(const std::string &url, std::vector<uint8_t> &data) {
   curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
 
   curl_slist_free_all(headers);
+  curl_easy_cleanup(curl);
 
   return code == CURLE_OK && status >= 200 && status < 300 && !data.empty();
 }
