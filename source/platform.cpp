@@ -1,4 +1,5 @@
 #include "nstv/platform.hpp"
+#include <sys/stat.h>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -37,7 +38,18 @@ void platformInit() {
   padConfigureInput(1, HidNpadStyleSet_NpadStandard);
   padInitializeDefault(&pad);
   hidInitializeTouchScreen();
+  // Default socket config (3 BSD sessions). Raising it to 8 coincided with stream connections
+  // timing out on device while other devices on the same network played them fine; reverted.
   socketInitializeDefault();
+#ifndef NSTV_PRODUCTION_BUILD
+  // Development builds: keep the console (EPG, perf, playback diagnostics printed with printf)
+  // in a file on the SD card, recreated on every launch; it can be fetched over FTP.
+  mkdir("sdmc:/switch", 0777);
+  mkdir("sdmc:/switch/kbore", 0777);
+  if (std::freopen("sdmc:/switch/kbore/kbore-stdout.log", "w", stdout)) {
+    std::setvbuf(stdout, nullptr, _IOLBF, 4096);
+  }
+#endif
   curl_global_init(CURL_GLOBAL_DEFAULT);
 #else
   curl_global_init(CURL_GLOBAL_DEFAULT);
@@ -176,10 +188,25 @@ InputEvent pollInput() {
   padUpdate(&pad);
   u64 down = padGetButtonsDown(&pad);
 
-  if (down & HidNpadButton_Up) return {InputType::Button, Button::Up};
-  if (down & HidNpadButton_Down) return {InputType::Button, Button::Down};
-  if (down & HidNpadButton_Left) return {InputType::Button, Button::Left};
-  if (down & HidNpadButton_Right) return {InputType::Button, Button::Right};
+  // Hold-to-repeat for the D-pad, like a TV remote: a held direction fires again after
+  // kRepeatDelayMs and then every kRepeatIntervalMs until released.
+  constexpr u64 kRepeatDelayMs = 350;
+  constexpr u64 kRepeatIntervalMs = 90;
+  static u64 repeatBit = 0;
+  static Button repeatButton = Button::None;
+  static u64 repeatNextMs = 0;
+  const u64 nowTickMs = armTicksToNs(armGetSystemTick()) / 1000000ULL;
+  auto pressDirection = [&](u64 bit, Button button) -> InputEvent {
+    repeatBit = bit;
+    repeatButton = button;
+    repeatNextMs = nowTickMs + kRepeatDelayMs;
+    return {InputType::Button, button};
+  };
+
+  if (down & HidNpadButton_Up) return pressDirection(HidNpadButton_Up, Button::Up);
+  if (down & HidNpadButton_Down) return pressDirection(HidNpadButton_Down, Button::Down);
+  if (down & HidNpadButton_Left) return pressDirection(HidNpadButton_Left, Button::Left);
+  if (down & HidNpadButton_Right) return pressDirection(HidNpadButton_Right, Button::Right);
   if (down & HidNpadButton_A) return {InputType::Button, Button::Select};
   if (down & HidNpadButton_B) return {InputType::Button, Button::Back};
   if (down & HidNpadButton_L) return {InputType::Button, Button::ShoulderLeft};
@@ -188,6 +215,18 @@ InputEvent pollInput() {
   if (down & HidNpadButton_Y) return {InputType::Button, Button::FavoriteToggle};
   if (down & HidNpadButton_Plus) return {InputType::Button, Button::Menu};
   if (down & HidNpadButton_Minus) return {InputType::Button, Button::Quit};
+
+  if (repeatBit != 0) {
+    if (padGetButtons(&pad) & repeatBit) {
+      if (nowTickMs >= repeatNextMs) {
+        repeatNextMs = nowTickMs + kRepeatIntervalMs;
+        return {InputType::Button, repeatButton};
+      }
+    } else {
+      repeatBit = 0;
+      repeatButton = Button::None;
+    }
+  }
 
   HidTouchScreenState state{};
   const bool hasTouch = hidGetTouchScreenStates(&state, 1) > 0 && state.count > 0;

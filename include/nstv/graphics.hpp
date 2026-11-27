@@ -58,6 +58,10 @@ struct Bitmap {
   int width = 0;
   int height = 0;
   std::vector<uint8_t> rgba;
+  // Stable identity for GPU texture caching. A non-zero id promises the pixels never change, so
+  // the texture is uploaded once and reused every frame. 0 keeps the legacy behaviour of
+  // re-uploading on every draw.
+  uint64_t id = 0;
 
   bool valid() const {
     return width > 0 && height > 0 && rgba.size() >= static_cast<std::size_t>(width * height * 4);
@@ -68,6 +72,9 @@ class Graphics {
 public:
   static constexpr int Width = 1280;
   static constexpr int Height = 720;
+
+  // Thread-safe source of Bitmap::id values.
+  static uint64_t nextBitmapId();
 
   Graphics();
   void beginFrame(Color color = {8, 11, 18, 255});

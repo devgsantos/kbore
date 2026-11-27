@@ -9,7 +9,12 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <cstdio>
+#include <ctime>
+#include <mutex>
 #include <utility>
+#include <dirent.h>
+#include <sys/stat.h>
 #include <curl/curl.h>
 #include <zlib.h>
 #ifdef NSTV_USE_SDL_IMAGE
@@ -59,42 +64,195 @@ ImageCache::~ImageCache() {
   stop_ = true;
   cv_.notify_all();
 
-  if (worker_.joinable()) {
-    worker_.join();
+  for (std::thread &worker : workers_) {
+    if (worker.joinable()) {
+      worker.join();
+    }
   }
 }
 
 void ImageCache::ensureWorkerLocked() {
-  if (!worker_.joinable()) {
+  if (workers_.empty()) {
     stop_ = false;
-    worker_ = std::thread(&ImageCache::workerLoop, this);
+    for (int i = 0; i < kWorkerCount; ++i) {
+      workers_.emplace_back(&ImageCache::workerLoop, this);
+    }
   }
 }
 
+namespace {
+// Logos are drawn at most a few hundred pixels wide; decoding them at source resolution wasted
+// memory and GPU upload time.
+constexpr int kMaxBitmapDimension = 320;
+
+void downscaleBitmap(Bitmap &bitmap) {
+  const int srcW = bitmap.width;
+  const int srcH = bitmap.height;
+  const int largest = std::max(srcW, srcH);
+  if (largest <= kMaxBitmapDimension) {
+    return;
+  }
+
+  const int dstW = std::max(1, srcW * kMaxBitmapDimension / largest);
+  const int dstH = std::max(1, srcH * kMaxBitmapDimension / largest);
+  std::vector<uint8_t> out(static_cast<std::size_t>(dstW) * dstH * 4);
+
+  // Box filter: average every source pixel that maps onto each destination pixel.
+  for (int dy = 0; dy < dstH; ++dy) {
+    const int sy0 = dy * srcH / dstH;
+    const int sy1 = std::max(sy0 + 1, (dy + 1) * srcH / dstH);
+    for (int dx = 0; dx < dstW; ++dx) {
+      const int sx0 = dx * srcW / dstW;
+      const int sx1 = std::max(sx0 + 1, (dx + 1) * srcW / dstW);
+      uint32_t sum[4] = {0, 0, 0, 0};
+      uint32_t count = 0;
+      for (int sy = sy0; sy < sy1; ++sy) {
+        const uint8_t *row = bitmap.rgba.data() + (static_cast<std::size_t>(sy) * srcW + sx0) * 4;
+        for (int sx = sx0; sx < sx1; ++sx, row += 4) {
+          sum[0] += row[0];
+          sum[1] += row[1];
+          sum[2] += row[2];
+          sum[3] += row[3];
+          ++count;
+        }
+      }
+      uint8_t *dst = out.data() + (static_cast<std::size_t>(dy) * dstW + dx) * 4;
+      for (int c = 0; c < 4; ++c) dst[c] = static_cast<uint8_t>(sum[c] / count);
+    }
+  }
+
+  bitmap.width = dstW;
+  bitmap.height = dstH;
+  bitmap.rgba.swap(out);
+}
+} // namespace
+
+namespace {
+// Persistent logo cache: the raw downloaded bytes, so the next launch skips the network.
+#ifdef __SWITCH__
+constexpr const char *kDiskCacheDir = "sdmc:/switch/kbore/cache/logos";
+#else
+constexpr const char *kDiskCacheDir = "cache/logos";
+#endif
+constexpr std::size_t kDiskCacheMaxFiles = 2000;
+constexpr std::size_t kDiskCacheKeepFiles = 1500;
+
+std::string diskCachePath(const std::string &url) {
+  uint64_t hash = 1469598103934665603ULL;  // FNV-1a 64
+  for (unsigned char c : url) {
+    hash ^= c;
+    hash *= 1099511628211ULL;
+  }
+  char name[32];
+  std::snprintf(name, sizeof(name), "%016llx.img", static_cast<unsigned long long>(hash));
+  return std::string(kDiskCacheDir) + "/" + name;
+}
+
+void ensureDiskCacheDir() {
+#ifdef __SWITCH__
+  mkdir("sdmc:/switch", 0777);
+  mkdir("sdmc:/switch/kbore", 0777);
+  mkdir("sdmc:/switch/kbore/cache", 0777);
+#else
+  mkdir("cache", 0777);
+#endif
+  mkdir(kDiskCacheDir, 0777);
+}
+
+bool readDiskCache(const std::string &url, std::vector<uint8_t> &data) {
+  FILE *file = std::fopen(diskCachePath(url).c_str(), "rb");
+  if (!file) return false;
+  std::fseek(file, 0, SEEK_END);
+  const long size = std::ftell(file);
+  std::fseek(file, 0, SEEK_SET);
+  bool ok = size > 0 && size <= 2 * 1024 * 1024;
+  if (ok) {
+    data.resize(static_cast<std::size_t>(size));
+    ok = std::fread(data.data(), 1, data.size(), file) == data.size();
+  }
+  std::fclose(file);
+  return ok;
+}
+
+void writeDiskCache(const std::string &url, const std::vector<uint8_t> &data) {
+  const std::string path = diskCachePath(url);
+  const std::string tmp = path + ".tmp";
+  FILE *file = std::fopen(tmp.c_str(), "wb");
+  if (!file) return;
+  const bool ok = std::fwrite(data.data(), 1, data.size(), file) == data.size();
+  std::fclose(file);
+  if (ok) {
+    std::rename(tmp.c_str(), path.c_str());
+  } else {
+    std::remove(tmp.c_str());
+  }
+}
+
+// Keeps the logo folder bounded: when over kDiskCacheMaxFiles, delete the oldest files.
+void pruneDiskCache() {
+  DIR *dir = opendir(kDiskCacheDir);
+  if (!dir) return;
+  std::vector<std::pair<time_t, std::string>> files;
+  while (dirent *item = readdir(dir)) {
+    const std::string name = item->d_name;
+    if (name == "." || name == "..") continue;
+    const std::string path = std::string(kDiskCacheDir) + "/" + name;
+    struct stat info {};
+    if (stat(path.c_str(), &info) == 0) files.emplace_back(info.st_mtime, path);
+  }
+  closedir(dir);
+  if (files.size() <= kDiskCacheMaxFiles) return;
+  std::sort(files.begin(), files.end());
+  const std::size_t removeCount = files.size() - kDiskCacheKeepFiles;
+  for (std::size_t i = 0; i < removeCount; ++i) std::remove(files[i].second.c_str());
+}
+} // namespace
+
+void ImageCache::finalizeBitmap(Bitmap &bitmap) {
+  downscaleBitmap(bitmap);
+  bitmap.id = Graphics::nextBitmapId();
+}
+
 void ImageCache::workerLoop() {
+  static std::once_flag diskCacheInit;
+  std::call_once(diskCacheInit, []() {
+    ensureDiskCacheDir();
+    pruneDiskCache();
+  });
+
   while (true) {
     std::string url;
 
     {
       std::unique_lock<std::mutex> lock(mutex_);
       cv_.wait(lock, [this]() {
-        return stop_ || !queue_.empty();
+        return stop_ || (!paused_ && !queue_.empty());
       });
 
-      if (stop_ && queue_.empty()) {
+      if (stop_) {
         break;
       }
 
-      url = queue_.front();
-      queue_.erase(queue_.begin());
+      // Newest request first: it is what is on screen right now.
+      url = queue_.back();
+      queue_.pop_back();
       queued_.erase(url);
     }
 
     Entry entry;
     std::vector<uint8_t> bytes;
+    auto decode = [&]() {
+      return decodeSdlImage(bytes, entry.bitmap) || decodePng(bytes, entry.bitmap) || decodePpm(bytes, entry.bitmap);
+    };
 
-    if (download(url, bytes) &&
-        (decodeSdlImage(bytes, entry.bitmap) || decodePng(bytes, entry.bitmap) || decodePpm(bytes, entry.bitmap))) {
+    bool loaded = readDiskCache(url, bytes) && decode();
+    if (!loaded && download(url, bytes) && decode()) {
+      loaded = true;
+      writeDiskCache(url, bytes);
+    }
+
+    if (loaded) {
+      finalizeBitmap(entry.bitmap);
       entry.status = Status::Loaded;
     } else {
       entry.status = Status::Failed;
@@ -102,8 +260,47 @@ void ImageCache::workerLoop() {
 
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      entries_[url] = std::move(entry);
+      auto found = entries_.find(url);
+      // Only fill entries still waiting for this download (clear()/trim() may have dropped it).
+      if (found != entries_.end() && found->second.status == Status::Loading) {
+        found->second.status = entry.status;
+        found->second.bitmap = std::move(entry.bitmap);
+        found->second.lastAccess = ++accessCounter_;
+      }
     }
+  }
+}
+
+void ImageCache::setPaused(bool paused) {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    paused_ = paused;
+  }
+  if (!paused) {
+    cv_.notify_all();
+  }
+}
+
+void ImageCache::trim(std::size_t maxEntries) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (entries_.size() <= maxEntries) {
+    return;
+  }
+
+  std::vector<std::pair<uint64_t, std::string>> candidates;
+  candidates.reserve(entries_.size());
+  for (const auto &item : entries_) {
+    if (item.second.status != Status::Loading) {
+      candidates.emplace_back(item.second.lastAccess, item.first);
+    }
+  }
+  std::sort(candidates.begin(), candidates.end());
+
+  std::size_t excess = entries_.size() - maxEntries;
+  for (const auto &candidate : candidates) {
+    if (excess == 0) break;
+    entries_.erase(candidate.second);
+    --excess;
   }
 }
 
@@ -119,6 +316,7 @@ const Bitmap *ImageCache::peek(const std::string &url) const {
     return nullptr;
   }
 
+  found->second.lastAccess = ++accessCounter_;
   return &found->second.bitmap;
 }
 
@@ -152,6 +350,17 @@ void ImageCache::request(const std::string &url) {
     entries_[url].status = Status::Loading;
     queue_.push_back(url);
     queued_.insert(url);
+
+    while (queue_.size() > kMaxQueued) {
+      const std::string stale = queue_.front();
+      queue_.erase(queue_.begin());
+      queued_.erase(stale);
+      auto staleEntry = entries_.find(stale);
+      if (staleEntry != entries_.end() && staleEntry->second.status == Status::Loading) {
+        entries_.erase(staleEntry);  // Missing again: re-requested if it scrolls back into view.
+      }
+    }
+
     ensureWorkerLocked();
   }
 
@@ -177,6 +386,7 @@ const Bitmap *ImageCache::get(const std::string &url) {
 
   if (download(url, bytes) &&
       (decodeSdlImage(bytes, entry.bitmap) || decodePng(bytes, entry.bitmap) || decodePpm(bytes, entry.bitmap))) {
+    finalizeBitmap(entry.bitmap);
     entry.status = Status::Loaded;
   } else {
     entry.status = Status::Failed;
@@ -196,6 +406,9 @@ void ImageCache::clear() {
 }
 
 bool ImageCache::download(const std::string &url, std::vector<uint8_t> &data) {
+  // A fresh handle per download, closed right after. Keeping idle keep-alive connections open per
+  // worker held sockets (and the Switch's fixed socket buffer pool), and new connections such as
+  // the stream's own started timing out after browsing. The SD logo cache covers repeat loads.
   CURL *curl = curl_easy_init();
 
   if (!curl) {
@@ -215,6 +428,7 @@ bool ImageCache::download(const std::string &url, std::vector<uint8_t> &data) {
   curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
   curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 8L);
   curl_easy_setopt(curl, CURLOPT_TIMEOUT, 12L);
+  curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
 
   CURLcode code = curl_easy_perform(curl);
   long status = 0;

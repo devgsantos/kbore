@@ -11,6 +11,16 @@ public:
   virtual ~IPlayerBackend() = default;
 
   virtual bool open(const std::string &url) = 0;
+
+  // Two-step open so the network part can run off the UI thread:
+  // openInput() only connects and reads the stream header (safe on a worker thread, no GPU/SDL
+  // work); finishOpen() then sets up decoding/rendering on the main thread. Backends that cannot
+  // split simply connect in finishOpen().
+  virtual bool openInput(const std::string &url) {
+    pendingInputUrl_ = url;
+    return true;
+  }
+  virtual bool finishOpen() { return open(pendingInputUrl_); }
   virtual void close() = 0;
   virtual bool update() = 0;
   virtual void togglePause() = 0;
@@ -70,6 +80,9 @@ public:
   virtual const std::string &url() const = 0;
 
   virtual const char *name() const = 0;
+
+protected:
+  std::string pendingInputUrl_;
 };
 
 } // namespace nstv

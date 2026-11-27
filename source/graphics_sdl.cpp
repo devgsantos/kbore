@@ -4,10 +4,13 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
 #include <map>
+#include <unordered_map>
 #include <string>
 #include <vector>
 
@@ -258,13 +261,22 @@ const char *firstExistingFont() {
 #endif
   };
 
+  // Probed once: this runs for every text draw, and used to open the font file (and log) each time.
+  static bool probed = false;
+  static const char *found = nullptr;
+  if (probed) {
+    return found;
+  }
+  probed = true;
+
   for (const auto &path : paths) {
     FILE *fp = std::fopen(path.c_str(), "rb");
 
     if (fp) {
       std::fclose(fp);
       std::printf("[NSTV] Found font: %s\n", path.c_str());
-      return path.c_str();
+      found = path.c_str();
+      return found;
     }
   }
 
@@ -330,7 +342,146 @@ struct CachedTexture {
 std::map<const uint8_t *, CachedTexture> g_textureCache;
 std::map<std::string, CachedTexture> g_fileTextureCache;
 
+// ---------------------------------------------------------------------------------------------
+// Frame-scoped GPU caches.
+//
+// The UI redraws everything every frame. Rasterising text with SDL_ttf, re-uploading logo
+// pixels and drawing rounded shapes/gradients line by line used to dominate frame time on the
+// Switch. These caches keep the resulting textures and evict entries that have not been drawn
+// recently, so memory stays bounded while the visible frame is served almost entirely from GPU.
+// ---------------------------------------------------------------------------------------------
+uint64_t g_frameIndex = 0;
+
+struct LruTexture {
+  SDL_Texture *texture = nullptr;
+  int width = 0;
+  int height = 0;
+  uint64_t lastUsedFrame = 0;
+};
+
+using LruTextureMap = std::unordered_map<std::string, LruTexture>;
+
+LruTextureMap g_textTextureCache;   // key: font pointer + raw text; white glyphs, tinted per draw
+LruTextureMap g_shapeTextureCache;  // key: shape kind + geometry + colour
+std::unordered_map<uint64_t, LruTexture> g_bitmapTextureCache;  // key: Bitmap::id
+std::unordered_map<std::string, int> g_textWidthCache;
+
+constexpr std::size_t kMaxTextTextures = 600;
+constexpr std::size_t kMaxShapeTextures = 400;
+constexpr std::size_t kMaxBitmapTextures = 160;
+constexpr std::size_t kMaxTextWidths = 4096;
+// Entries untouched for this many frames (~2 s at 60 fps) are evicted first when over budget.
+constexpr uint64_t kStaleFrames = 120;
+
+template <typename Map>
+void destroyAllTextures(Map &map) {
+  for (auto &item : map) {
+    if (item.second.texture) {
+      SDL_DestroyTexture(item.second.texture);
+    }
+  }
+  map.clear();
+}
+
+template <typename Map>
+void evictTextures(Map &map, std::size_t maxEntries) {
+  if (map.size() <= maxEntries) {
+    return;
+  }
+
+  const uint64_t keepFrom = g_frameIndex > kStaleFrames ? g_frameIndex - kStaleFrames : 0;
+  for (auto it = map.begin(); it != map.end();) {
+    if (it->second.lastUsedFrame < keepFrom) {
+      if (it->second.texture) SDL_DestroyTexture(it->second.texture);
+      it = map.erase(it);
+    } else {
+      ++it;
+    }
+  }
+
+  // Everything is recent (a very busy screen): drop least recently used until within budget.
+  while (map.size() > maxEntries) {
+    auto oldest = map.begin();
+    for (auto it = map.begin(); it != map.end(); ++it) {
+      if (it->second.lastUsedFrame < oldest->second.lastUsedFrame) oldest = it;
+    }
+    if (oldest->second.texture) SDL_DestroyTexture(oldest->second.texture);
+    map.erase(oldest);
+  }
+}
+
+void clearFrameCaches() {
+  destroyAllTextures(g_textTextureCache);
+  destroyAllTextures(g_shapeTextureCache);
+  destroyAllTextures(g_bitmapTextureCache);
+  g_textWidthCache.clear();
+}
+
+// Creates a static RGBA texture from CPU pixels (non-premultiplied, blended like draw calls).
+SDL_Texture *createStaticTexture(int w, int h, const std::vector<uint8_t> &rgbaPixels) {
+  SDL_Texture *texture = SDL_CreateTexture(g_renderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STATIC, w, h);
+  if (!texture) {
+    return nullptr;
+  }
+  SDL_UpdateTexture(texture, nullptr, rgbaPixels.data(), w * 4);
+  SDL_SetTextureBlendMode(texture, SDL_BLENDMODE_BLEND);
+  return texture;
+}
+
+std::string colorKey(Color c) {
+  char buffer[16];
+  std::snprintf(buffer, sizeof(buffer), "%02x%02x%02x%02x", c.r, c.g, c.b, c.a);
+  return buffer;
+}
+
+void putRgba(std::vector<uint8_t> &pixels, int index, Color c) {
+  pixels[static_cast<std::size_t>(index) * 4 + 0] = c.r;
+  pixels[static_cast<std::size_t>(index) * 4 + 1] = c.g;
+  pixels[static_cast<std::size_t>(index) * 4 + 2] = c.b;
+  pixels[static_cast<std::size_t>(index) * 4 + 3] = c.a;
+}
+
+// Inside test for a rounded rectangle matching the previous scanline-based drawing.
+bool insideRoundRect(int px, int py, int w, int h, int radius) {
+  if (px < 0 || py < 0 || px >= w || py >= h) return false;
+  if (radius <= 0) return true;
+  int cy;
+  if (py < radius) {
+    cy = radius;
+  } else if (py >= h - radius) {
+    cy = h - radius - 1;
+  } else {
+    return true;
+  }
+  const int dy = py - cy;
+  const int dx = static_cast<int>(std::sqrt(std::max(0, radius * radius - dy * dy)));
+  return px >= radius - dx && px < w - radius + dx;
+}
+
+// Looks up or builds a cached shape texture, then draws it at (x, y) with size (w, h).
+template <typename Builder>
+void drawCachedShape(const std::string &key, int x, int y, int w, int h, Builder build) {
+  if (!g_renderer || w <= 0 || h <= 0) return;
+  auto found = g_shapeTextureCache.find(key);
+  if (found == g_shapeTextureCache.end()) {
+    int texW = 0;
+    int texH = 0;
+    std::vector<uint8_t> pixels;
+    build(texW, texH, pixels);
+    LruTexture entry;
+    entry.texture = texW > 0 && texH > 0 ? createStaticTexture(texW, texH, pixels) : nullptr;
+    entry.width = texW;
+    entry.height = texH;
+    found = g_shapeTextureCache.emplace(key, entry).first;
+  }
+  found->second.lastUsedFrame = g_frameIndex;
+  if (!found->second.texture) return;
+  SDL_Rect dst{x, y, w, h};
+  SDL_RenderCopy(g_renderer, found->second.texture, nullptr, &dst);
+}
+
 void clearTextureCaches() {
+  clearFrameCaches();
   for (auto &item : g_textureCache) {
     if (item.second.texture) {
       SDL_DestroyTexture(item.second.texture);
@@ -507,8 +658,18 @@ bool Graphics::isSuspendedForNativeVideo() const {
   return g_nativeVideoSuspended;
 }
 
+uint64_t Graphics::nextBitmapId() {
+  static std::atomic<uint64_t> next{1};
+  return next.fetch_add(1, std::memory_order_relaxed);
+}
+
 void Graphics::beginFrame(Color color) {
   if (!g_renderer) return;
+  ++g_frameIndex;
+  evictTextures(g_textTextureCache, kMaxTextTextures);
+  evictTextures(g_shapeTextureCache, kMaxShapeTextures);
+  evictTextures(g_bitmapTextureCache, kMaxBitmapTextures);
+  if (g_textWidthCache.size() > kMaxTextWidths) g_textWidthCache.clear();
   setDraw(color);
   SDL_RenderClear(g_renderer);
   fillVerticalGradient(0, 0, Width, Height, rgb(6, 9, 18), rgb(2, 5, 11));
@@ -557,76 +718,104 @@ void Graphics::strokeRect(int x, int y, int w, int h, Color color, int thickness
 void Graphics::fillRoundRect(int x, int y, int w, int h, int radius, Color color) {
   if (!g_renderer || w <= 0 || h <= 0 || color.a == 0) return;
   radius = std::max(0, std::min(radius, std::min(w,h)/2));
-  fillRect(x + radius, y, w - 2 * radius, h, color);
-  fillRect(x, y + radius, w, h - 2 * radius, color);
-  setDraw(color);
-  for (int yy = -radius; yy <= radius; ++yy) {
-    int dx = static_cast<int>(std::sqrt(std::max(0, radius*radius - yy*yy)));
-    SDL_RenderDrawLine(g_renderer, x + radius - dx, y + radius + yy, x + radius, y + radius + yy);
-    SDL_RenderDrawLine(g_renderer, x + w - radius, y + radius + yy, x + w - radius + dx, y + radius + yy);
-    SDL_RenderDrawLine(g_renderer, x + radius - dx, y + h - radius + yy - 1, x + radius, y + h - radius + yy - 1);
-    SDL_RenderDrawLine(g_renderer, x + w - radius, y + h - radius + yy - 1, x + w - radius + dx, y + h - radius + yy - 1);
+  if (radius == 0) {
+    fillRect(x, y, w, h, color);
+    return;
   }
+  const std::string key = "frr|" + std::to_string(w) + "x" + std::to_string(h) + "|" + std::to_string(radius) + "|" + colorKey(color);
+  drawCachedShape(key, x, y, w, h, [&](int &tw, int &th, std::vector<uint8_t> &pixels) {
+    tw = w;
+    th = h;
+    pixels.assign(static_cast<std::size_t>(w) * h * 4, 0);
+    for (int py = 0; py < h; ++py) {
+      for (int px = 0; px < w; ++px) {
+        if (insideRoundRect(px, py, w, h, radius)) putRgba(pixels, py * w + px, color);
+      }
+    }
+  });
 }
 
 void Graphics::strokeRoundRect(int x, int y, int w, int h, int radius, Color color, int thickness) {
-  if (!g_renderer || w <= 0 || h <= 0) return;
+  if (!g_renderer || w <= 0 || h <= 0 || color.a == 0 || thickness <= 0) return;
   radius = std::max(0, std::min(radius, std::min(w,h)/2));
-  setDraw(color);
-  for (int t = 0; t < thickness; ++t) {
-    int ix = x + t;
-    int iy = y + t;
-    int iw = w - 2*t;
-    int ih = h - 2*t;
-    int r = std::max(0, radius - t);
-    SDL_RenderDrawLine(g_renderer, ix+r, iy, ix+iw-r, iy);
-    SDL_RenderDrawLine(g_renderer, ix+r, iy+ih-1, ix+iw-r, iy+ih-1);
-    SDL_RenderDrawLine(g_renderer, ix, iy+r, ix, iy+ih-r);
-    SDL_RenderDrawLine(g_renderer, ix+iw-1, iy+r, ix+iw-1, iy+ih-r);
-    for (int a = 0; a <= 90; ++a) {
-      float rad = a * 3.1415926f / 180.0f;
-      int dx = static_cast<int>(std::cos(rad) * r);
-      int dy = static_cast<int>(std::sin(rad) * r);
-      SDL_RenderDrawPoint(g_renderer, ix+r-dx, iy+r-dy);
-      SDL_RenderDrawPoint(g_renderer, ix+iw-r+dx-1, iy+r-dy);
-      SDL_RenderDrawPoint(g_renderer, ix+r-dx, iy+ih-r+dy-1);
-      SDL_RenderDrawPoint(g_renderer, ix+iw-r+dx-1, iy+ih-r+dy-1);
+  const std::string key = "srr|" + std::to_string(w) + "x" + std::to_string(h) + "|" + std::to_string(radius) + "|" +
+    std::to_string(thickness) + "|" + colorKey(color);
+  drawCachedShape(key, x, y, w, h, [&](int &tw, int &th, std::vector<uint8_t> &pixels) {
+    tw = w;
+    th = h;
+    pixels.assign(static_cast<std::size_t>(w) * h * 4, 0);
+    const int innerRadius = std::max(0, radius - thickness);
+    for (int py = 0; py < h; ++py) {
+      for (int px = 0; px < w; ++px) {
+        if (insideRoundRect(px, py, w, h, radius) &&
+            !insideRoundRect(px - thickness, py - thickness, w - 2 * thickness, h - 2 * thickness, innerRadius)) {
+          putRgba(pixels, py * w + px, color);
+        }
+      }
     }
-  }
+  });
 }
 
+// Gradients are cached as 1-pixel strips and stretched along the constant axis.
 void Graphics::fillVerticalGradient(int x, int y, int w, int h, Color top, Color bottom) {
-  if (h <= 0) return;
-  for (int yy=0; yy<h; ++yy) {
-    fillRect(x, y+yy, w, 1, mix(top, bottom, float(yy) / float(std::max(1, h-1))));
-  }
+  if (h <= 0 || w <= 0) return;
+  const std::string key = "vg|" + std::to_string(h) + "|" + colorKey(top) + colorKey(bottom);
+  drawCachedShape(key, x, y, w, h, [&](int &tw, int &th, std::vector<uint8_t> &pixels) {
+    tw = 1;
+    th = h;
+    pixels.assign(static_cast<std::size_t>(h) * 4, 0);
+    for (int yy = 0; yy < h; ++yy) {
+      putRgba(pixels, yy, mix(top, bottom, float(yy) / float(std::max(1, h-1))));
+    }
+  });
 }
 
 void Graphics::fillHorizontalGradient(int x, int y, int w, int h, Color left, Color right) {
-  if (w <= 0) return;
-  for (int xx=0; xx<w; ++xx) {
-    fillRect(x+xx, y, 1, h, mix(left, right, float(xx) / float(std::max(1, w-1))));
-  }
+  if (w <= 0 || h <= 0) return;
+  const std::string key = "hg|" + std::to_string(w) + "|" + colorKey(left) + colorKey(right);
+  drawCachedShape(key, x, y, w, h, [&](int &tw, int &th, std::vector<uint8_t> &pixels) {
+    tw = w;
+    th = 1;
+    pixels.assign(static_cast<std::size_t>(w) * 4, 0);
+    for (int xx = 0; xx < w; ++xx) {
+      putRgba(pixels, xx, mix(left, right, float(xx) / float(std::max(1, w-1))));
+    }
+  });
 }
 
 void Graphics::fillCircle(int cx, int cy, int radius, Color color) {
-  if (radius <= 0) return;
-  setDraw(color);
-  for (int y=-radius; y<=radius; ++y) {
-    int dx = static_cast<int>(std::sqrt(std::max(0, radius*radius - y*y)));
-    SDL_RenderDrawLine(g_renderer, cx-dx, cy+y, cx+dx, cy+y);
-  }
+  if (radius <= 0 || color.a == 0) return;
+  const int size = radius * 2 + 1;
+  const std::string key = "fc|" + std::to_string(radius) + "|" + colorKey(color);
+  drawCachedShape(key, cx - radius, cy - radius, size, size, [&](int &tw, int &th, std::vector<uint8_t> &pixels) {
+    tw = size;
+    th = size;
+    pixels.assign(static_cast<std::size_t>(size) * size * 4, 0);
+    for (int yy = -radius; yy <= radius; ++yy) {
+      const int dx = static_cast<int>(std::sqrt(std::max(0, radius*radius - yy*yy)));
+      for (int xx = -dx; xx <= dx; ++xx) putRgba(pixels, (yy + radius) * size + (xx + radius), color);
+    }
+  });
 }
 
 void Graphics::strokeCircle(int cx, int cy, int radius, Color color, int thickness) {
-  setDraw(color);
-  for (int t=0; t<thickness; ++t) {
-    int r = radius - t;
-    for (int a=0; a<360; ++a) {
-      float rad=a*3.1415926f/180.0f;
-      SDL_RenderDrawPoint(g_renderer, cx+int(std::cos(rad)*r), cy+int(std::sin(rad)*r));
+  if (radius <= 0 || color.a == 0 || thickness <= 0) return;
+  const int size = radius * 2 + 1;
+  const std::string key = "sc|" + std::to_string(radius) + "|" + std::to_string(thickness) + "|" + colorKey(color);
+  drawCachedShape(key, cx - radius, cy - radius, size, size, [&](int &tw, int &th, std::vector<uint8_t> &pixels) {
+    tw = size;
+    th = size;
+    pixels.assign(static_cast<std::size_t>(size) * size * 4, 0);
+    for (int t = 0; t < thickness; ++t) {
+      const int r = radius - t;
+      for (int a = 0; a < 360; ++a) {
+        const float rad = a * 3.1415926f / 180.0f;
+        const int px = int(std::cos(rad) * r) + radius;
+        const int py = int(std::sin(rad) * r) + radius;
+        if (px >= 0 && py >= 0 && px < size && py < size) putRgba(pixels, py * size + px, color);
+      }
     }
-  }
+  });
 }
 
 void Graphics::drawLine(int x0, int y0, int x1, int y1, Color color, int thickness) {
@@ -636,21 +825,40 @@ void Graphics::drawLine(int x0, int y0, int x1, int y1, Color color, int thickne
 
 void Graphics::drawText(const std::string &text, int x, int y, int scale, Color color, bool bold) {
   if (!g_renderer) return;
-  std::string s = normalizeAscii(text);
 #ifdef NSTV_USE_SDL_TTF
   TTF_Font *font = fontForScale(scale, bold);
   if (font) {
-    SDL_Surface *surface = TTF_RenderUTF8_Blended(font, s.c_str(), toSDL(color));
-    if (surface) {
-      SDL_Texture *texture = SDL_CreateTextureFromSurface(g_renderer, surface);
-      SDL_Rect dst{x, y, surface->w, surface->h};
-      SDL_RenderCopy(g_renderer, texture, nullptr, &dst);
-      SDL_DestroyTexture(texture);
-      SDL_FreeSurface(surface);
+    if (text.empty() || color.a == 0) return;
+    // Glyphs are rasterised once in white and tinted per draw, so a label keeps one texture
+    // regardless of focus/selection colour changes.
+    std::string key = std::to_string(reinterpret_cast<std::uintptr_t>(font));
+    key.push_back('\x1f');
+    key += text;
+    auto found = g_textTextureCache.find(key);
+    if (found == g_textTextureCache.end()) {
+      LruTexture entry;
+      const std::string s = normalizeAscii(text);
+      SDL_Surface *surface = s.empty() ? nullptr : TTF_RenderUTF8_Blended(font, s.c_str(), SDL_Color{255, 255, 255, 255});
+      if (surface) {
+        entry.texture = SDL_CreateTextureFromSurface(g_renderer, surface);
+        entry.width = surface->w;
+        entry.height = surface->h;
+        if (entry.texture) SDL_SetTextureBlendMode(entry.texture, SDL_BLENDMODE_BLEND);
+        SDL_FreeSurface(surface);
+      }
+      found = g_textTextureCache.emplace(std::move(key), entry).first;
     }
+    LruTexture &entry = found->second;
+    entry.lastUsedFrame = g_frameIndex;
+    if (!entry.texture) return;
+    SDL_SetTextureColorMod(entry.texture, color.r, color.g, color.b);
+    SDL_SetTextureAlphaMod(entry.texture, color.a);
+    SDL_Rect dst{x, y, entry.width, entry.height};
+    SDL_RenderCopy(g_renderer, entry.texture, nullptr, &dst);
     return;
   }
 #endif
+  const std::string s = normalizeAscii(text);
   // Built-in bitmap fallback. This prevents the UI from disappearing if SDL_ttf
   // cannot load the TTF font on the Switch SD card.
   int cx = x;
@@ -680,15 +888,24 @@ void Graphics::drawTextRight(const std::string &text, int rightX, int y, int sca
 }
 
 int Graphics::textWidth(const std::string &text, int scale) const {
-  std::string s = normalizeAscii(text);
 #ifdef NSTV_USE_SDL_TTF
   TTF_Font *font = fontForScale(scale, false);
   if (font) {
+    std::string key = std::to_string(reinterpret_cast<std::uintptr_t>(font));
+    key.push_back('\x1f');
+    key += text;
+    auto textFound = g_textTextureCache.find(key);
+    if (textFound != g_textTextureCache.end()) return textFound->second.width;
+    auto found = g_textWidthCache.find(key);
+    if (found != g_textWidthCache.end()) return found->second;
+    const std::string s = normalizeAscii(text);
     int w=0,h=0;
     TTF_SizeUTF8(font, s.c_str(), &w, &h);
+    g_textWidthCache.emplace(std::move(key), w);
     return w;
   }
 #endif
+  const std::string s = normalizeAscii(text);
   return int(s.size()) * (6*scale);
 }
 
@@ -762,6 +979,30 @@ void Graphics::drawLogoFallback(const std::string &name, int x, int y, int w, in
 
 void Graphics::drawImage(const Bitmap &bitmap, int x, int y, int w, int h) {
   if (!bitmap.valid() || !g_renderer || w <= 0 || h <= 0) return;
+
+  if (bitmap.id != 0) {
+    // Immutable bitmap: upload once, then reuse the texture on every frame.
+    LruTexture &entry = g_bitmapTextureCache[bitmap.id];
+    if (!entry.texture) {
+      entry.texture = createStaticTexture(bitmap.width, bitmap.height, bitmap.rgba);
+      entry.width = bitmap.width;
+      entry.height = bitmap.height;
+    }
+    entry.lastUsedFrame = g_frameIndex;
+    if (!entry.texture) return;
+    const float srcRatio = float(bitmap.width) / float(bitmap.height);
+    const float dstRatio = float(w) / float(h);
+    int drawW = w;
+    int drawH = h;
+    if (srcRatio > dstRatio) {
+      drawH = std::max(1, int(w / srcRatio));
+    } else {
+      drawW = std::max(1, int(h * srcRatio));
+    }
+    SDL_Rect dst{x + (w - drawW) / 2, y + (h - drawH) / 2, drawW, drawH};
+    SDL_RenderCopy(g_renderer, entry.texture, nullptr, &dst);
+    return;
+  }
 
   const uint8_t *key = bitmap.rgba.data();
   CachedTexture &cached = g_textureCache[key];

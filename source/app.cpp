@@ -1,6 +1,7 @@
 #include "nstv/app.hpp"
 #include "nstv/log.hpp"
 #include <algorithm>
+#include <set>
 #include <cctype>
 #include <functional>
 #include <iostream>
@@ -11,10 +12,12 @@
 #include <cstdio>
 #include <ctime>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <thread>
 #include <limits>
 #include <sys/stat.h>
+#include <curl/curl.h>
 
 namespace nstv {
 
@@ -149,6 +152,18 @@ std::string formatHoursOption(int hours) {
   }
 
   return std::to_string(hours) + " hours";
+}
+
+bool isNetworkStreamUrl(const std::string &url) {
+  auto startsWith = [&](const char *prefix) {
+    const std::size_t n = std::strlen(prefix);
+    if (url.size() < n) return false;
+    for (std::size_t i = 0; i < n; ++i) {
+      if (std::tolower(static_cast<unsigned char>(url[i])) != prefix[i]) return false;
+    }
+    return true;
+  };
+  return startsWith("http://") || startsWith("https://");
 }
 
 bool cacheFileFresh(const std::string &path, int refreshHours) {
@@ -499,20 +514,27 @@ std::vector<std::size_t> epgCandidateIndicesForChannel(const EpgPage &page, cons
   // that page. If multiple programme channel ids are present, keep protection
   // against borrowing another channel's current programme.
   if (pageHasIdentifiedPrograms) {
+    // Called while rendering every frame: log each channel's decision once, not per frame.
+    static std::set<std::string> loggedChannels;
+    const bool firstTime = loggedChannels.size() < 4096 && loggedChannels.insert(channel->name).second;
     if (distinctPageIds.size() <= 1) {
-      std::printf(
-        "[KBORE][EPG][MATCH] no direct channel id match for '%s', but EPG page is single-channel id='%s'; trusting parser-scoped page\n",
-        channel->name.c_str(),
-        distinctPageIds.empty() ? "" : distinctPageIds.front().c_str()
-      );
+      if (firstTime) {
+        std::printf(
+          "[KBORE][EPG][MATCH] no direct channel id match for '%s', but EPG page is single-channel id='%s'; trusting parser-scoped page\n",
+          channel->name.c_str(),
+          distinctPageIds.empty() ? "" : distinctPageIds.front().c_str()
+        );
+      }
       return all;
     }
 
-    std::printf(
-      "[KBORE][EPG][MATCH] no direct channel id match for '%s' and EPG page has %zu channel ids; refusing mixed-page fallback\n",
-      channel->name.c_str(),
-      distinctPageIds.size()
-    );
+    if (firstTime) {
+      std::printf(
+        "[KBORE][EPG][MATCH] no direct channel id match for '%s' and EPG page has %zu channel ids; refusing mixed-page fallback\n",
+        channel->name.c_str(),
+        distinctPageIds.size()
+      );
+    }
     return {};
   }
 
@@ -1455,6 +1477,7 @@ App::App() : api_(loadConfig()), player_(createPlayerBackend()) {
 
   startChannelWorker();
   startEpgWorker();
+  startNodeLoadWorker();
 }
 
 App::~App() {
@@ -1467,13 +1490,53 @@ App::~App() {
 
   stopChannelWorker();
   stopEpgWorker();
+  stopNodeLoadWorker();
+  cancelStreamProbe();
+  if (streamProbeThread_.joinable()) {
+    streamProbeThread_.join();
+  }
+  pendingPlayer_.reset();
   if (vodDetailsThread_.joinable()) {
     vodDetailsThread_.join();
   }
 }
 
+// Sleeps only for what is left of a ~60 fps frame (the work already spent counts), instead of a
+// fixed 16 ms after rendering, and logs frame work time every few seconds for profiling.
+void App::paceFrame() {
+  constexpr long long kFrameBudgetMs = 16;
+  constexpr int kPerfWindow = 180;
+  const long long workMs = nowMs() - frameStartMs_;
+
+  frameWorkSamples_.push_back(static_cast<int>(workMs));
+  if (static_cast<int>(frameWorkSamples_.size()) >= kPerfWindow) {
+    std::vector<int> sorted = frameWorkSamples_;
+    std::sort(sorted.begin(), sorted.end());
+    long long total = 0;
+    for (int value : sorted) total += value;
+    const int p50 = sorted[sorted.size() / 2];
+    const int p95 = sorted[(sorted.size() * 95) / 100];
+    std::printf(
+      "[KBORE][PERF] frames=%zu work_ms avg=%.1f p50=%d p95=%d max=%d over_budget=%zu\n",
+      sorted.size(),
+      double(total) / double(sorted.size()),
+      p50,
+      p95,
+      sorted.back(),
+      static_cast<std::size_t>(std::count_if(sorted.begin(), sorted.end(), [](int v) { return v > 16; }))
+    );
+    frameWorkSamples_.clear();
+  }
+
+  if (workMs < kFrameBudgetMs) {
+    sleepMs(static_cast<int>(kFrameBudgetMs - workMs));
+  }
+  frameStartMs_ = nowMs();
+}
+
 int App::run() {
   render();
+  frameStartMs_ = nowMs();
 
   while (state_.running) {
     const bool hadPlaylistLoad = playlistLoadActive();
@@ -1482,7 +1545,7 @@ int App::run() {
 
     if (hadPlaylistLoad && !playlistLoadActive()) {
       render();
-      sleepMs(16);
+      paceFrame();
       continue;
     }
 
@@ -1495,7 +1558,7 @@ int App::run() {
       }
 
       render();
-      sleepMs(16);
+      paceFrame();
       continue;
     }
 
@@ -1508,7 +1571,7 @@ int App::run() {
       }
 
       render();
-      sleepMs(16);
+      paceFrame();
       continue;
     }
 
@@ -1521,7 +1584,7 @@ int App::run() {
 
       applyPlaybackSleepPolicy();
       render();
-      sleepMs(16);
+      paceFrame();
       continue;
     }
 
@@ -1530,7 +1593,7 @@ int App::run() {
       handleInput(input);
     }
     render();
-    sleepMs(16);
+    paceFrame();
   }
 
   setMediaPlaybackActive(false);
@@ -1538,6 +1601,9 @@ int App::run() {
 }
 
 void App::handleInput(const InputEvent &event) {
+  if (event.type == InputType::Button || event.type == InputType::TouchDown) {
+    ++inputCount_;  // Any user action cancels a pending folder auto-open (see drainFinishedNodeLoads).
+  }
   if (event.type == InputType::Button) {
     handle(event.button);
     return;
@@ -2024,6 +2090,7 @@ void App::handle(Button button) {
 
       if (button == Button::Back) {
         setMediaPlaybackActive(false);
+        cancelStreamProbe();  // B while connecting cancels the connection check.
 
         if (player_) {
           logLine("[KBORE][PLAYBACK][LIFECYCLE] closing player on Back");
@@ -3809,6 +3876,14 @@ void App::loadSelectedEpg(bool force, bool fetchRemote) {
     }
   }
 
+  if (!force && !fetchRemote) {
+    // Focus moves: hand the disk/network lookup to the EPG worker instead of reading the SD
+    // card on the UI thread. drainFinishedEpg() updates currentEpgAvailable when it lands.
+    state_.currentEpgAvailable = false;
+    loadEpgForChannels({*channel});
+    return;
+  }
+
   EpgPage cached;
   const bool epgCacheFresh = cacheFileFresh(epgCachePath(state_.manifest.id, *channel), state_.config.epgRefreshHours);
   if (!force && epgCacheFresh && loadEpgPage(state_.manifest.id, *channel, cached)) {
@@ -3864,16 +3939,15 @@ void App::loadEpgForChannels(const std::vector<Channel> &channels) {
       continue;
     }
 
-    EpgPage cached;
-    const bool epgCacheFresh = cacheFileFresh(epgCachePath(state_.manifest.id, channel), state_.config.epgRefreshHours);
-    if (epgCacheFresh && loadEpgPage(state_.manifest.id, channel, cached)) {
-      for (const std::string &alias : channelEpgKeys(channel)) {
-        state_.epgByChannel[alias] = cached;
-      }
-      if (currentProgramIndex(cached, &channel) >= 0 && epgPageHasDatedTimes(cached)) {
-        continue;
-      }
+    // Runs on every D-pad move: never touch the SD card here (the EPG worker reads the disk
+    // cache first), and don't retry a channel that recently came back without a current
+    // programme, otherwise it is re-queued on every single key press.
+    const std::string attemptKey = state_.manifest.id + ":" + key;
+    const auto attempted = epgAttemptedAtMs_.find(attemptKey);
+    if (attempted != epgAttemptedAtMs_.end() && nowMs() - attempted->second < kEpgRetryIntervalMs) {
+      continue;
     }
+    epgAttemptedAtMs_[attemptKey] = nowMs();
 
     missing.push_back(channel);
   }
@@ -3930,6 +4004,8 @@ void App::loadEpgForChannels(const std::vector<Channel> &channels) {
     while (epgQueue_.size() > maxPendingEpgJobs) {
       const EpgJob &stale = epgQueue_.back();
       epgQueuedKeys_.erase(stale.manifestId + ":" + stale.key);
+      // Dropped before running: allow it to be queued again as soon as it is visible.
+      epgAttemptedAtMs_.erase(stale.manifestId + ":" + stale.key);
       epgQueue_.pop_back();
     }
   }
@@ -3996,6 +4072,8 @@ void App::loadVisibleEpgForChannelList() {
 
 void App::startEpgWorker() {
   epgStop_ = false;
+  // One worker: the Switch has few network sessions and extra workers competed with stream
+  // connections; the parser's per-channel EPG index made requests fast enough.
   epgWorker_ = std::thread(&App::epgWorkerLoop, this);
 }
 
@@ -4005,6 +4083,9 @@ void App::stopEpgWorker() {
 
   if (epgWorker_.joinable()) {
     epgWorker_.join();
+  }
+  if (epgWorker2_.joinable()) {
+    epgWorker2_.join();
   }
 }
 
@@ -4029,6 +4110,19 @@ void App::epgWorkerLoop() {
     const std::string queuedKey = job.manifestId + ":" + job.key;
 
     try {
+      // Disk cache first (moved off the UI thread): only go to the network when the cached page
+      // is stale or has no programme airing now.
+      EpgPage cached;
+      if (cacheFileFresh(epgCachePath(job.manifestId, job.channel), job.config.epgRefreshHours) &&
+          loadEpgPage(job.manifestId, job.channel, cached) &&
+          currentProgramIndex(cached, &job.channel) >= 0 &&
+          epgPageHasDatedTimes(cached)) {
+        std::lock_guard<std::mutex> lock(epgMutex_);
+        epgFinished_.push_back(EpgResult{job.manifestId, job.key, job.channel, cached});
+        epgQueuedKeys_.erase(queuedKey);
+        continue;
+      }
+
       std::printf("[KBORE] loading EPG for channel='%s' provider='%s' key='%s'\n", job.channel.name.c_str(), toString(job.provider).c_str(), job.key.c_str());
       ParserApiClient epgApi(job.config);
       EpgPage epg = epgApi.loadEpgPrograms(
@@ -4049,6 +4143,9 @@ void App::epgWorkerLoop() {
     } catch (const std::exception &ex) {
       std::printf("[KBORE] background EPG failed for %s: %s\n", job.channel.name.c_str(), ex.what());
       std::lock_guard<std::mutex> lock(epgMutex_);
+      EpgResult failure{job.manifestId, job.key, job.channel, EpgPage{}};
+      failure.failed = true;
+      epgFinished_.push_back(failure);
       epgQueuedKeys_.erase(queuedKey);
     }
   }
@@ -4063,6 +4160,12 @@ void App::drainFinishedEpg() {
   }
 
   for (const EpgResult &result : finished) {
+    if (result.failed) {
+      // Let the next focus/visibility pass retry after a short backoff.
+      epgAttemptedAtMs_[result.manifestId + ":" + result.key] = nowMs() - kEpgRetryIntervalMs + kEpgFailureRetryMs;
+      continue;
+    }
+
     if (!state_.hasManifest || result.manifestId != state_.manifest.id) {
       continue;
     }
@@ -4303,6 +4406,8 @@ void App::playSelectedChannel() {
 }
 
 void App::openChannel(const Channel &channel) {
+  cancelStreamProbe();
+
   /*
     Troca de stream no Switch precisa ser tratada como troca de sessão.
     Reutilizar o mesmo backend depois de Deko3D/NVTEGRA ativo pode deixar
@@ -4320,7 +4425,8 @@ void App::openChannel(const Channel &channel) {
   state_.hasPlaybackChannel = true;
   state_.playbackChannel = channel;
 
-  loadSelectedEpg(false, true);
+  // EPG for the channel loads in the background; it used to be fetched synchronously here, which
+  // blocked the UI and competed with the stream connection.
   loadEpgForChannels(std::vector<Channel>{channel});
 
   state_.screen = ScreenId::Player;
@@ -4332,15 +4438,197 @@ void App::openChannel(const Channel &channel) {
   state_.playerErrorMessage.clear();
   state_.playerOverlayUntilMs = nowMs() + 5000;
 
+  // Network streams: check the server answers on a background thread first, while the UI stays
+  // alive (loading box, attempt counter, B to cancel). The native player tears down the SDL UI and
+  // blocks until it connects, which froze the screen for up to 30 s with no feedback when the
+  // provider did not respond.
+  if (isNetworkStreamUrl(channel.url)) {
+    startStreamProbe(channel, 1);
+    return;
+  }
+
+  startNativePlayback(channel);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Background stream connection. The player's network step (openInput: connect + read the stream
+// header) runs on a worker thread while the UI keeps rendering the loading box; only once it has
+// connected does the main thread hand the screen to the native player (finishOpen). A single
+// connection is used: providers were seen dropping a second connection opened right after a first.
+// ---------------------------------------------------------------------------------------------
+void App::streamProbeLoop(std::string url) {
+  // pendingPlayer_ is owned by this thread until streamProbeState_ leaves Running.
+  const bool connected = pendingPlayer_ && pendingPlayer_->openInput(url);
+  if (!connected) {
+    std::string error = pendingPlayer_ ? pendingPlayer_->error() : "Player backend not available";
+    const bool timeout = error.find("timed out") != std::string::npos || error.find("Timeout") != std::string::npos;
+    const bool refused = error.find("refused") != std::string::npos || error.find("unreachable") != std::string::npos;
+    const bool httpClientError = error.find("4XX") != std::string::npos || error.find("403") != std::string::npos ||
+      error.find("404") != std::string::npos || error.find("401") != std::string::npos;
+    std::string friendly = timeout ? "Server did not respond (timeout)"
+      : refused ? "Could not connect to the server"
+      : httpClientError ? "Access denied or stream not found"
+      : error;
+    {
+      std::lock_guard<std::mutex> lock(streamProbeMutex_);
+      streamProbeError_ = friendly;
+      streamProbeDetail_ = error;
+      streamProbeRetryable_ = !httpClientError;
+    }
+    streamProbeState_ = StreamProbeState::Failed;
+    return;
+  }
+  streamProbeState_ = StreamProbeState::Reachable;
+}
+
+void App::startStreamProbe(const Channel &channel, int attempt) {
+  streamProbeChannel_ = channel;
+  streamProbeAttempt_ = attempt;
+  streamProbeRetryAtMs_ = 0;
+  streamProbeCancel_ = false;
+
+  if (streamProbeThread_.joinable()) {
+    // A cancelled connection is still finishing (it cannot be interrupted); start this one as soon
+    // as it returns, from updateStreamProbe(). The UI stays responsive meanwhile.
+    streamProbeQueued_ = true;
+    state_.message = "Connecting";
+    return;
+  }
+
+  streamProbeQueued_ = false;
+  pendingPlayer_ = createPlayerBackend();
+  pendingPlayer_->setNativeVideoAllowed(true);
+  pendingPlayer_->setOverlayVisible(true);
+  streamProbeState_ = StreamProbeState::Running;
+  imageCache_.setPaused(true);  // Leave the network to the stream while it connects.
+  state_.message = attempt > 1 ? "Retrying connection" : "Connecting";
+  logLinef("[KBORE][PLAYBACK][CONNECT] connecting name='%s' attempt=%d", channel.name.c_str(), attempt);
+  streamProbeThread_ = std::thread(&App::streamProbeLoop, this, channel.url);
+}
+
+// Abandons the connection in progress without blocking: its result is discarded when it returns.
+void App::cancelStreamProbe() {
+  streamProbeCancel_ = true;
+  streamProbeQueued_ = false;
+  streamProbeRetryAtMs_ = 0;
+  streamProbeAttempt_ = 0;
+}
+
+// Called every frame (from render()).
+void App::updateStreamProbe() {
+  if (streamProbeRetryAtMs_ > 0) {
+    if (nowMs() >= streamProbeRetryAtMs_ && !streamProbeCancel_) {
+      startStreamProbe(streamProbeChannel_, streamProbeAttempt_ + 1);
+    }
+    return;
+  }
+
+  const StreamProbeState probeState = streamProbeState_.load();
+  if (probeState == StreamProbeState::Idle || probeState == StreamProbeState::Running) {
+    return;
+  }
+
+  if (streamProbeThread_.joinable()) {
+    streamProbeThread_.join();
+  }
+  streamProbeState_ = StreamProbeState::Idle;
+  imageCache_.setPaused(false);
+  std::unique_ptr<IPlayerBackend> connected = std::move(pendingPlayer_);
+
+  if (streamProbeCancel_) {
+    // User left (B) while connecting: drop this connection.
+    if (connected) connected->close();
+    logLine("[KBORE][PLAYBACK][CONNECT] connection finished after cancel; discarded");
+    if (streamProbeQueued_) {
+      streamProbeCancel_ = false;
+      startStreamProbe(streamProbeChannel_, 1);
+    }
+    return;
+  }
+
+  if (streamProbeQueued_) {
+    // Another channel was requested while this one was connecting: start it instead.
+    if (connected) connected->close();
+    startStreamProbe(streamProbeChannel_, 1);
+    return;
+  }
+
+  if (probeState == StreamProbeState::Reachable) {
+    streamProbeAttempt_ = 0;
+    if (state_.screen != ScreenId::Player) {
+      if (connected) connected->close();  // The user is no longer on the player screen.
+      return;
+    }
+    const Channel channel = streamProbeChannel_;
+    finishNativePlayback(channel, std::move(connected));
+    return;
+  }
+
+  if (state_.screen != ScreenId::Player) {
+    if (connected) connected->close();
+    streamProbeAttempt_ = 0;
+    return;
+  }
+
+  std::string error;
+  std::string detail;
+  bool retryable = false;
+  {
+    std::lock_guard<std::mutex> lock(streamProbeMutex_);
+    error = streamProbeError_;
+    detail = streamProbeDetail_;
+    retryable = streamProbeRetryable_;
+  }
+  if (connected) connected->close();
+
+  if (retryable && streamProbeAttempt_ < kStreamProbeMaxAttempts) {
+    // One automatic retry. Wait a few seconds: the provider dropped connections opened in a rush.
+    streamProbeRetryAtMs_ = nowMs() + 3000;
+    state_.message = "Retrying connection";
+    logLinef("[KBORE][PLAYBACK][CONNECT] attempt %d failed ('%s'); retrying in 3 s", streamProbeAttempt_, detail.c_str());
+    return;
+  }
+
+  logLinef(
+    "[KBORE][PLAYBACK] failed to load %s stream name='%s' error='%s'",
+    toString(streamProbeChannel_.type).c_str(),
+    streamProbeChannel_.name.c_str(),
+    detail.c_str()
+  );
+  streamProbeAttempt_ = 0;
+  state_.message = "Failed to load stream";
+  state_.playerStarted = false;
+  state_.playerLoading = false;
+  state_.playerLoadFailed = true;
+  state_.playerErrorMessage = error;
+  setMediaPlaybackActive(false);
+  resetPlaybackSleepTimers();
+}
+
+void App::startNativePlayback(const Channel &channel) {
   render();
 
-  player_ = createPlayerBackend();
+  std::unique_ptr<IPlayerBackend> player = createPlayerBackend();
+  player->setNativeVideoAllowed(true);
+  player->setOverlayVisible(true);
+  if (!player->openInput(channel.url)) {
+    player_ = std::move(player);
+    gfx_.suspendForNativeVideo();
+    finishNativePlaybackResult(channel, false);
+    return;
+  }
+  finishNativePlayback(channel, std::move(player));
+}
 
+// Main thread: the input is connected; hand the screen to the native player and start decoding.
+void App::finishNativePlayback(const Channel &channel, std::unique_ptr<IPlayerBackend> player) {
+  player_ = std::move(player);
   gfx_.suspendForNativeVideo();
-  player_->setNativeVideoAllowed(true);
-  player_->setOverlayVisible(true);
+  finishNativePlaybackResult(channel, player_ && player_->finishOpen());
+}
 
-  if (player_->open(channel.url)) {
+void App::finishNativePlaybackResult(const Channel &channel, bool opened) {
+  if (opened) {
     resetPlaybackSleepTimers();
     state_.playbackStartedAtMs = nowMs();
     state_.lastPlaybackInputMs = state_.playbackStartedAtMs;
@@ -5026,8 +5314,13 @@ std::vector<Category> App::parentalCategoriesForType(StreamType type) const {
   return categories;
 }
 
+// Returns true when the folder's children are already available. Otherwise starts loading them on
+// the node-load worker and returns false right away, so the UI never freezes while pages download.
+// When the first page arrives, drainFinishedNodeLoads() replays the A press if the user is still on
+// the same item; later pages are appended in the background.
 bool App::ensureNodeChildrenLoaded(MediaNode &node) {
-  if (!node.children.empty()) {
+  const std::string loadedKey = state_.manifest.id + ":" + node.id;
+  if (!node.children.empty() || nodeChildrenLoaded_.count(loadedKey)) {
     return true;
   }
 
@@ -5042,111 +5335,228 @@ bool App::ensureNodeChildrenLoaded(MediaNode &node) {
     return false;
   }
 
-  NodeChildrenPage firstPage;
-  std::vector<MediaNode> items;
-  bool usedOnlyCache = true;
-
-  const std::string loadingKey = "node:" + node.id;
-
-  try {
-    state_.loading = false;
-    state_.loadingMessage.clear();
-    state_.channelListLoading = true;
-    state_.channelListLoadingKey = loadingKey;
-    state_.message = "Loading " + (node.title.empty() ? node.name : node.title) + "...";
-    render();
-
-    api_ = ParserApiClient(state_.config);
-
-    const std::string sourceUrl = state_.manifest.source.empty()
-      ? playlist->sourceUrl()
-      : state_.manifest.source;
-    const StreamType streamType = streamTypeFromString(node.type);
-    const int pageSize = 250;
-    int pageNumber = 1;
-    int totalItems = 0;
-    int totalPages = 1;
-
-    while (pageNumber <= totalPages && pageNumber <= 200) {
-      NodeChildrenPage page;
-      const bool fromCache = loadNodeChildrenPage(playlist->id, node.id, pageNumber, page);
-
-      if (!fromCache) {
-        usedOnlyCache = false;
-        page = api_.loadNodeChildren(
-          sourceUrl,
-          state_.manifest.provider,
-          streamType,
-          node.id,
-          pageNumber,
-          pageSize
-        );
-
-        saveNodeChildrenPage(playlist->id, node.id, page);
-      }
-
-      if (pageNumber == 1) {
-        firstPage = page;
-      }
-
-      if (page.totalItems > totalItems) {
-        totalItems = page.totalItems;
-      }
-
-      totalPages = std::max(1, page.totalPages);
-
-      items.insert(
-        items.end(),
-        std::make_move_iterator(page.items.begin()),
-        std::make_move_iterator(page.items.end())
-      );
-
-      if (!page.hasNextPage) {
-        break;
-      }
-
-      ++pageNumber;
-    }
-  } catch (const std::exception &ex) {
-    state_.loading = false;
-    state_.loadingMessage.clear();
-    if (state_.channelListLoadingKey == loadingKey) {
-      state_.channelListLoading = false;
-      state_.channelListLoadingKey.clear();
-    }
-    state_.message = "Failed to load folder items.";
-    std::printf("[KBORE] node children load failed: %s\n", ex.what());
-    return false;
-  }
-
+  // Remember this A press: if nothing else is pressed before the first page arrives, it is replayed
+  // to open the folder. Any other input in between only lets the load finish in the background.
+  nodeLoadReplayKey_ = loadedKey;
+  nodeLoadSnapshot_ = navigationSnapshot();
+  nodeLoadReplayInputCount_ = inputCount_;
   state_.loading = false;
   state_.loadingMessage.clear();
-  if (state_.channelListLoadingKey == loadingKey) {
-    state_.channelListLoading = false;
-    state_.channelListLoadingKey.clear();
+  state_.channelListLoading = true;
+  state_.channelListLoadingKey = "node:" + node.id;
+  state_.message = "Loading " + (node.title.empty() ? node.name : node.title) + "...";
+
+  if (nodeLoadInFlight_.count(loadedKey)) {
+    return false;  // Already paging this folder.
+  }
+  nodeLoadInFlight_.insert(loadedKey);
+
+  NodeLoadJob job;
+  job.config = state_.config;
+  job.playlistId = playlist->id;
+  job.manifestId = state_.manifest.id;
+  job.nodeId = node.id;
+  job.sourceUrl = state_.manifest.source.empty() ? playlist->sourceUrl() : state_.manifest.source;
+  job.provider = state_.manifest.provider;
+  job.type = streamTypeFromString(node.type);
+
+  {
+    std::lock_guard<std::mutex> lock(nodeLoadMutex_);
+    // Jobs from another playlist are obsolete.
+    for (auto it = nodeLoadQueue_.begin(); it != nodeLoadQueue_.end();) {
+      it = it->manifestId != job.manifestId ? nodeLoadQueue_.erase(it) : std::next(it);
+    }
+    nodeLoadQueue_.push_front(job);  // The folder the user just opened goes first.
+  }
+  nodeLoadCv_.notify_one();
+  return false;
+}
+
+App::NavigationSnapshot App::navigationSnapshot() const {
+  NavigationSnapshot snapshot;
+  snapshot.screen = state_.screen;
+  snapshot.selectedType = state_.selectedType;
+  snapshot.nodePath = state_.nodePath;
+  snapshot.selectedCategory = state_.selectedCategory;
+  snapshot.selectedChannel = state_.selectedChannel;
+  snapshot.focus = state_.focus;
+  return snapshot;
+}
+
+MediaNode *App::findNodeById(const std::string &nodeId) {
+  // When the user has not moved, the requested folder is the selected one: prefer it, since the
+  // same id can also exist as a copy under Favorites.
+  if (navigationSnapshot() == nodeLoadSnapshot_) {
+    if (MediaNode *current = selectedCurrentNode(); current && current->id == nodeId) return current;
+    if (MediaNode *preview = selectedPreviewNode(); preview && preview->id == nodeId) return preview;
   }
 
-  node.children = std::move(items);
-  node.childCount = std::max(node.childCount, static_cast<int>(node.children.size()));
-  if (firstPage.totalItems > 0) {
-    node.totalItems = firstPage.totalItems;
-    if (node.totalChannels <= 0) {
-      node.totalChannels = firstPage.totalItems;
+  // Otherwise search the playlist tree first (popped first from the stack), then Favorites.
+  std::vector<MediaNode *> stack;
+  stack.push_back(&state_.favoritesRootNode);
+  for (auto it = state_.manifest.nodes.rbegin(); it != state_.manifest.nodes.rend(); ++it) {
+    stack.push_back(&*it);
+  }
+
+  while (!stack.empty()) {
+    MediaNode *node = stack.back();
+    stack.pop_back();
+    if (node->id == nodeId) {
+      return node;
+    }
+    for (MediaNode &child : node->children) {
+      stack.push_back(&child);
     }
   }
-  // Mark the node as loaded even when the API legitimately returns an empty
-  // list. The dashboard must be able to enter/render this empty child list
-  // based on the parent currently in focus instead of treating the A press as
-  // a failed load.
-  node.hasChildren = !node.children.empty() || node.childCount > 0;
+  return nullptr;
+}
 
-  if (node.children.empty()) {
-    state_.message = usedOnlyCache ? "Folder cache is empty" : "Folder has no items";
-    return true;
+void App::startNodeLoadWorker() {
+  nodeLoadStop_ = false;
+  nodeLoadWorker_ = std::thread(&App::nodeLoadWorkerLoop, this);
+}
+
+void App::stopNodeLoadWorker() {
+  nodeLoadStop_ = true;
+  nodeLoadCv_.notify_all();
+  if (nodeLoadWorker_.joinable()) {
+    nodeLoadWorker_.join();
+  }
+}
+
+void App::nodeLoadWorkerLoop() {
+  constexpr int kPageSize = 250;
+  constexpr int kMaxPages = 200;
+
+  while (!nodeLoadStop_) {
+    NodeLoadJob job;
+    {
+      std::unique_lock<std::mutex> lock(nodeLoadMutex_);
+      nodeLoadCv_.wait(lock, [this]() { return nodeLoadStop_ || !nodeLoadQueue_.empty(); });
+      if (nodeLoadStop_) {
+        break;
+      }
+      job = nodeLoadQueue_.front();
+      nodeLoadQueue_.pop_front();
+    }
+
+    // One page per turn, so a newly opened folder never waits for another folder's remaining pages.
+    NodeLoadPage result;
+    result.manifestId = job.manifestId;
+    result.nodeId = job.nodeId;
+    result.pageNumber = job.nextPage;
+
+    NodeChildrenPage page;
+    bool hasMore = false;
+    try {
+      result.fromCache = loadNodeChildrenPage(job.playlistId, job.nodeId, job.nextPage, page);
+      if (!result.fromCache) {
+        ParserApiClient api(job.config);
+        page = api.loadNodeChildren(job.sourceUrl, job.provider, job.type, job.nodeId, job.nextPage, kPageSize);
+        saveNodeChildrenPage(job.playlistId, job.nodeId, page);
+      }
+      const int totalPages = std::max(1, page.totalPages);
+      hasMore = page.hasNextPage && job.nextPage < totalPages && job.nextPage < kMaxPages;
+      result.totalItems = page.totalItems;
+      result.items = std::move(page.items);
+      result.last = !hasMore;
+    } catch (const std::exception &ex) {
+      std::printf("[KBORE] node children load failed (page %d): %s\n", job.nextPage, ex.what());
+      result.failed = true;
+      result.last = true;
+      result.error = ex.what();
+    }
+
+    std::lock_guard<std::mutex> lock(nodeLoadMutex_);
+    nodeLoadFinished_.push_back(std::move(result));
+    if (hasMore) {
+      ++job.nextPage;
+      nodeLoadQueue_.push_back(job);
+    }
+  }
+}
+
+void App::drainFinishedNodeLoads() {
+  std::vector<NodeLoadPage> finished;
+  {
+    std::lock_guard<std::mutex> lock(nodeLoadMutex_);
+    finished.swap(nodeLoadFinished_);
   }
 
-  state_.message = usedOnlyCache ? "Loaded folder from cache" : "Loaded folder from API";
-  return true;
+  for (NodeLoadPage &page : finished) {
+    const std::string loadedKey = page.manifestId + ":" + page.nodeId;
+    if (page.last) {
+      nodeLoadInFlight_.erase(loadedKey);
+    }
+    if (page.manifestId != state_.manifest.id) {
+      continue;  // From a playlist that is no longer active.
+    }
+
+    const bool firstPage = page.pageNumber == 1;
+    auto finishLoadingIndicator = [&]() {
+      if (state_.channelListLoadingKey == "node:" + page.nodeId) {
+        state_.channelListLoading = false;
+        state_.channelListLoadingKey.clear();
+      }
+    };
+
+    if (page.failed) {
+      finishLoadingIndicator();
+      if (nodeLoadReplayKey_ == loadedKey) nodeLoadReplayKey_.clear();
+      state_.message = "Failed to load folder items.";
+      continue;
+    }
+
+    MediaNode *node = findNodeById(page.nodeId);
+    if (!node) {
+      finishLoadingIndicator();
+      if (nodeLoadReplayKey_ == loadedKey) nodeLoadReplayKey_.clear();
+      continue;
+    }
+
+    if (firstPage) {
+      node->children.clear();
+    }
+    node->children.insert(
+      node->children.end(),
+      std::make_move_iterator(page.items.begin()),
+      std::make_move_iterator(page.items.end())
+    );
+    node->childCount = std::max(node->childCount, static_cast<int>(node->children.size()));
+    if (page.totalItems > 0) {
+      node->totalItems = page.totalItems;
+      if (node->totalChannels <= 0) {
+        node->totalChannels = page.totalItems;
+      }
+    }
+    // Loaded even when empty, so entering an empty folder does not reload it forever.
+    node->hasChildren = !node->children.empty() || node->childCount > 0;
+
+    if (page.last && state_.channelListLoadingKey.empty()) {
+      state_.message = node->children.empty()
+        ? (page.fromCache ? "Folder cache is empty" : "Folder has no items")
+        : (page.fromCache ? "Loaded folder from cache" : "Loaded folder from API");
+    }
+
+    if (firstPage) {
+      nodeChildrenLoaded_.insert(loadedKey);
+      finishLoadingIndicator();
+      // Replay the A press only when it was the latest folder request and nothing was pressed
+      // since: if the user moved on (even back to the same spot), just finish loading quietly.
+      const bool replay = nodeLoadReplayKey_ == loadedKey &&
+        inputCount_ == nodeLoadReplayInputCount_ &&
+        state_.screen == ScreenId::Dashboard &&
+        navigationSnapshot() == nodeLoadSnapshot_;
+      if (nodeLoadReplayKey_ == loadedKey) nodeLoadReplayKey_.clear();
+      if (replay) {
+        handleDashboard(Button::Select);
+      } else {
+        loadVisibleEpgForChannelList();
+      }
+    } else {
+      loadVisibleEpgForChannelList();
+    }
+  }
 }
 
 Channel App::channelFromNode(const MediaNode &node) const {
@@ -5623,7 +6033,11 @@ static int gridWindowStart(int selected, int size, int columns, int rows) {
 }
 
 void App::render() {
+  // Bound decoded logo memory; safe here because no peek() pointer is held across frames.
+  imageCache_.trim(240);
+  updateStreamProbe();
   drainFinishedChannelLoads();
+  drainFinishedNodeLoads();
   drainFinishedEpg();
   updateVodDetailsLoad();
   gfx_.beginFrame();
@@ -6579,6 +6993,12 @@ void App::renderPlayerGraphic() {
         rgb(203, 213, 225),
         false
       );
+
+      if (!state_.playerErrorMessage.empty()) {
+        // Tell the user why, in short form (full detail stays in the log).
+        const std::string reason = Graphics::fitText(state_.playerErrorMessage, 60);
+        gfx_.drawText(reason, boxX + (boxW - gfx_.textWidth(reason, 1)) / 2, boxY + 140, 1, rgb(252, 165, 165), false);
+      }
     } else {
       const char spinnerChars[4] = {'|', '/', '-', '\\'};
       const int index = static_cast<int>((nowMs() / 140) % 4);
@@ -6601,6 +7021,19 @@ void App::renderPlayerGraphic() {
         rgb(248, 250, 252),
         true
       );
+
+      // Who is loading, retry progress and how to leave: the screen used to freeze silently.
+      auto drawCentered = [&](const std::string &text, int y, Color color) {
+        gfx_.drawText(text, boxX + (boxW - gfx_.textWidth(text, 1)) / 2, y, 1, color, false);
+      };
+      if (channel) {
+        drawCentered(Graphics::fitText(channel->name, 48), boxY + 144, rgb(148, 163, 184));
+      }
+      const std::string hint = streamProbeAttempt_ > 1
+        ? "No answer yet, retrying (attempt " + std::to_string(streamProbeAttempt_) + " of " +
+            std::to_string(kStreamProbeMaxAttempts) + ")  |  B: cancel"
+        : (streamProbeRetryAtMs_ > 0 ? "No answer, retrying...  |  B: cancel" : "B: cancel");
+      drawCentered(hint, boxY + 164, rgb(203, 213, 225));
     }
   }
 

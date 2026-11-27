@@ -12,6 +12,7 @@
 #include "nstv/video_player.hpp"
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <cstddef>
@@ -110,11 +111,51 @@ private:
     int epgOffsetMinutes = 0;
   };
 
+  // Background folder (node children) loading; see ensureNodeChildrenLoaded().
+  struct NodeLoadJob {
+    Config config;
+    std::string playlistId;
+    std::string manifestId;
+    std::string nodeId;
+    std::string sourceUrl;
+    Provider provider = Provider::M3u;
+    StreamType type = StreamType::Live;
+    int nextPage = 1;
+  };
+
+  struct NodeLoadPage {
+    std::string manifestId;
+    std::string nodeId;
+    int pageNumber = 1;
+    std::vector<MediaNode> items;
+    int totalItems = 0;
+    bool fromCache = false;
+    bool last = false;
+    bool failed = false;
+    std::string error;
+  };
+
+  // Where the user was when a folder load started; the pending action is replayed only if they
+  // are still there when the first page arrives.
+  struct NavigationSnapshot {
+    ScreenId screen = ScreenId::Dashboard;
+    int selectedType = 0;
+    std::vector<int> nodePath;
+    int selectedCategory = 0;
+    int selectedChannel = 0;
+    FocusColumn focus = FocusColumn::Categories;
+    bool operator==(const NavigationSnapshot &other) const {
+      return screen == other.screen && selectedType == other.selectedType && nodePath == other.nodePath &&
+        selectedCategory == other.selectedCategory && selectedChannel == other.selectedChannel && focus == other.focus;
+    }
+  };
+
   struct EpgResult {
     std::string manifestId;
     std::string key;
     Channel channel;
     EpgPage page;
+    bool failed = false;  // request failed: no page, retry soon instead of after kEpgRetryIntervalMs
   };
 
   struct ChannelLoadJob {
@@ -169,6 +210,14 @@ private:
   };
 
   void render();
+  void paceFrame();
+  void startNativePlayback(const Channel &channel);
+  void finishNativePlayback(const Channel &channel, std::unique_ptr<IPlayerBackend> player);
+  void finishNativePlaybackResult(const Channel &channel, bool opened);
+  void startStreamProbe(const Channel &channel, int attempt);
+  void cancelStreamProbe();
+  void updateStreamProbe();
+  void streamProbeLoop(std::string url);
   void renderSplashGraphic();
   void renderDashboard();
   void renderDashboardGraphic();
@@ -238,6 +287,12 @@ private:
   void startEpgWorker();
   void stopEpgWorker();
   void epgWorkerLoop();
+  void startNodeLoadWorker();
+  void stopNodeLoadWorker();
+  void nodeLoadWorkerLoop();
+  void drainFinishedNodeLoads();
+  MediaNode *findNodeById(const std::string &nodeId);
+  NavigationSnapshot navigationSnapshot() const;
   void drainFinishedEpg();
   std::string vodDetailsKeyForChannel(const Channel &channel) const;
   const VodDetails *cachedVodDetailsForChannel(const Channel &channel) const;
@@ -330,12 +385,45 @@ private:
   std::vector<ChannelLoadResult> channelFinished_;
   std::atomic<bool> channelStop_{false};
   std::thread epgWorker_;
+  std::thread epgWorker2_;
   std::mutex epgMutex_;
   std::condition_variable epgCv_;
   std::vector<EpgJob> epgQueue_;
   std::set<std::string> epgQueuedKeys_;
   std::vector<EpgResult> epgFinished_;
   std::atomic<bool> epgStop_{false};
+  // Stream connection check before native playback (see openChannel).
+  enum class StreamProbeState { Idle, Running, Reachable, Failed };
+  std::thread streamProbeThread_;
+  std::atomic<bool> streamProbeCancel_{false};
+  std::atomic<StreamProbeState> streamProbeState_{StreamProbeState::Idle};
+  std::mutex streamProbeMutex_;
+  std::string streamProbeError_;       // guarded by streamProbeMutex_ (short, shown to the user)
+  std::string streamProbeDetail_;      // guarded by streamProbeMutex_ (full error, for the log)
+  bool streamProbeRetryable_ = false;  // guarded by streamProbeMutex_
+  std::unique_ptr<IPlayerBackend> pendingPlayer_;  // owned by the connect thread while Running
+  bool streamProbeQueued_ = false;     // UI thread: a channel waits for a cancelled connect to end
+  // UI thread only.
+  Channel streamProbeChannel_;
+  int streamProbeAttempt_ = 0;
+  long long streamProbeRetryAtMs_ = 0;
+  static constexpr int kStreamProbeMaxAttempts = 2;
+
+  std::thread nodeLoadWorker_;
+  std::mutex nodeLoadMutex_;
+  std::condition_variable nodeLoadCv_;
+  // Folders being paged in. Newest request first; a folder with more pages goes back to the end,
+  // so opening another folder takes priority without abandoning the previous one.
+  std::deque<NodeLoadJob> nodeLoadQueue_;
+  std::vector<NodeLoadPage> nodeLoadFinished_;
+  std::atomic<bool> nodeLoadStop_{false};
+  // UI thread only.
+  std::set<std::string> nodeLoadInFlight_;   // manifestId + ":" + nodeId still paging
+  std::string nodeLoadReplayKey_;            // folder whose first page should replay the A press
+  NavigationSnapshot nodeLoadSnapshot_;      // context of that A press
+  uint64_t nodeLoadReplayInputCount_ = 0;    // inputCount_ at that A press
+  uint64_t inputCount_ = 0;                  // every handled button/touch-down
+  std::set<std::string> nodeChildrenLoaded_; // manifestId + ":" + nodeId, including empty folders
 
   std::thread vodDetailsThread_;
   mutable std::mutex vodDetailsMutex_;
@@ -367,6 +455,12 @@ private:
 
   bool splashVisible_ = true;
   long long splashStartedAtMs_ = 0;
+  long long frameStartMs_ = 0;
+  // UI thread only: last time each EPG key was queued, to throttle retries (see loadEpgForChannels).
+  std::map<std::string, long long> epgAttemptedAtMs_;
+  static constexpr long long kEpgRetryIntervalMs = 5 * 60 * 1000;
+  static constexpr long long kEpgFailureRetryMs = 20 * 1000;
+  std::vector<int> frameWorkSamples_;
   long long splashDurationMs_ = 1800;
 };
 
