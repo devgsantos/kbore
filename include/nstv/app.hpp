@@ -110,6 +110,46 @@ private:
     int epgOffsetMinutes = 0;
   };
 
+  // Background folder (node children) loading; see ensureNodeChildrenLoaded().
+  struct NodeLoadJob {
+    Config config;
+    std::string playlistId;
+    std::string manifestId;
+    std::string nodeId;
+    std::string sourceUrl;
+    Provider provider = Provider::M3u;
+    StreamType type = StreamType::Live;
+    uint64_t generation = 0;
+  };
+
+  struct NodeLoadPage {
+    std::string manifestId;
+    std::string nodeId;
+    uint64_t generation = 0;
+    int pageNumber = 1;
+    std::vector<MediaNode> items;
+    int totalItems = 0;
+    bool fromCache = false;
+    bool last = false;
+    bool failed = false;
+    std::string error;
+  };
+
+  // Where the user was when a folder load started; the pending action is replayed only if they
+  // are still there when the first page arrives.
+  struct NavigationSnapshot {
+    ScreenId screen = ScreenId::Dashboard;
+    int selectedType = 0;
+    std::vector<int> nodePath;
+    int selectedCategory = 0;
+    int selectedChannel = 0;
+    FocusColumn focus = FocusColumn::Categories;
+    bool operator==(const NavigationSnapshot &other) const {
+      return screen == other.screen && selectedType == other.selectedType && nodePath == other.nodePath &&
+        selectedCategory == other.selectedCategory && selectedChannel == other.selectedChannel && focus == other.focus;
+    }
+  };
+
   struct EpgResult {
     std::string manifestId;
     std::string key;
@@ -240,6 +280,12 @@ private:
   void startEpgWorker();
   void stopEpgWorker();
   void epgWorkerLoop();
+  void startNodeLoadWorker();
+  void stopNodeLoadWorker();
+  void nodeLoadWorkerLoop();
+  void drainFinishedNodeLoads();
+  MediaNode *findNodeById(const std::string &nodeId);
+  NavigationSnapshot navigationSnapshot() const;
   void drainFinishedEpg();
   std::string vodDetailsKeyForChannel(const Channel &channel) const;
   const VodDetails *cachedVodDetailsForChannel(const Channel &channel) const;
@@ -339,6 +385,18 @@ private:
   std::set<std::string> epgQueuedKeys_;
   std::vector<EpgResult> epgFinished_;
   std::atomic<bool> epgStop_{false};
+  std::thread nodeLoadWorker_;
+  std::mutex nodeLoadMutex_;
+  std::condition_variable nodeLoadCv_;
+  bool nodeLoadHasJob_ = false;
+  NodeLoadJob nodeLoadJob_;
+  std::vector<NodeLoadPage> nodeLoadFinished_;
+  std::atomic<bool> nodeLoadStop_{false};
+  std::atomic<uint64_t> nodeLoadGeneration_{0};
+  // UI thread only.
+  std::string nodeLoadActiveKey_;            // manifestId + ":" + nodeId being loaded
+  NavigationSnapshot nodeLoadSnapshot_;      // context of the A press that started the load
+  std::set<std::string> nodeChildrenLoaded_; // manifestId + ":" + nodeId, including empty folders
 
   std::thread vodDetailsThread_;
   mutable std::mutex vodDetailsMutex_;

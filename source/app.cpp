@@ -1463,6 +1463,7 @@ App::App() : api_(loadConfig()), player_(createPlayerBackend()) {
 
   startChannelWorker();
   startEpgWorker();
+  startNodeLoadWorker();
 }
 
 App::~App() {
@@ -1475,6 +1476,7 @@ App::~App() {
 
   stopChannelWorker();
   stopEpgWorker();
+  stopNodeLoadWorker();
   if (vodDetailsThread_.joinable()) {
     vodDetailsThread_.join();
   }
@@ -5105,8 +5107,13 @@ std::vector<Category> App::parentalCategoriesForType(StreamType type) const {
   return categories;
 }
 
+// Returns true when the folder's children are already available. Otherwise starts loading them on
+// the node-load worker and returns false right away, so the UI never freezes while pages download.
+// When the first page arrives, drainFinishedNodeLoads() replays the A press if the user is still on
+// the same item; later pages are appended in the background.
 bool App::ensureNodeChildrenLoaded(MediaNode &node) {
-  if (!node.children.empty()) {
+  const std::string loadedKey = state_.manifest.id + ":" + node.id;
+  if (!node.children.empty() || nodeChildrenLoaded_.count(loadedKey)) {
     return true;
   }
 
@@ -5121,111 +5128,224 @@ bool App::ensureNodeChildrenLoaded(MediaNode &node) {
     return false;
   }
 
-  NodeChildrenPage firstPage;
-  std::vector<MediaNode> items;
-  bool usedOnlyCache = true;
+  nodeLoadSnapshot_ = navigationSnapshot();
+  if (nodeLoadActiveKey_ == loadedKey) {
+    return false;  // Already loading this folder; the latest A press context is kept above.
+  }
 
-  const std::string loadingKey = "node:" + node.id;
+  nodeLoadActiveKey_ = loadedKey;
+  state_.loading = false;
+  state_.loadingMessage.clear();
+  state_.channelListLoading = true;
+  state_.channelListLoadingKey = "node:" + node.id;
+  state_.message = "Loading " + (node.title.empty() ? node.name : node.title) + "...";
 
-  try {
-    state_.loading = false;
-    state_.loadingMessage.clear();
-    state_.channelListLoading = true;
-    state_.channelListLoadingKey = loadingKey;
-    state_.message = "Loading " + (node.title.empty() ? node.name : node.title) + "...";
-    render();
+  NodeLoadJob job;
+  job.config = state_.config;
+  job.playlistId = playlist->id;
+  job.manifestId = state_.manifest.id;
+  job.nodeId = node.id;
+  job.sourceUrl = state_.manifest.source.empty() ? playlist->sourceUrl() : state_.manifest.source;
+  job.provider = state_.manifest.provider;
+  job.type = streamTypeFromString(node.type);
+  job.generation = ++nodeLoadGeneration_;  // Supersedes any folder still loading.
 
-    api_ = ParserApiClient(state_.config);
+  {
+    std::lock_guard<std::mutex> lock(nodeLoadMutex_);
+    nodeLoadJob_ = job;
+    nodeLoadHasJob_ = true;
+  }
+  nodeLoadCv_.notify_one();
+  return false;
+}
 
-    const std::string sourceUrl = state_.manifest.source.empty()
-      ? playlist->sourceUrl()
-      : state_.manifest.source;
-    const StreamType streamType = streamTypeFromString(node.type);
-    const int pageSize = 250;
+App::NavigationSnapshot App::navigationSnapshot() const {
+  NavigationSnapshot snapshot;
+  snapshot.screen = state_.screen;
+  snapshot.selectedType = state_.selectedType;
+  snapshot.nodePath = state_.nodePath;
+  snapshot.selectedCategory = state_.selectedCategory;
+  snapshot.selectedChannel = state_.selectedChannel;
+  snapshot.focus = state_.focus;
+  return snapshot;
+}
+
+MediaNode *App::findNodeById(const std::string &nodeId) {
+  // When the user has not moved, the requested folder is the selected one: prefer it, since the
+  // same id can also exist as a copy under Favorites.
+  if (navigationSnapshot() == nodeLoadSnapshot_) {
+    if (MediaNode *current = selectedCurrentNode(); current && current->id == nodeId) return current;
+    if (MediaNode *preview = selectedPreviewNode(); preview && preview->id == nodeId) return preview;
+  }
+
+  // Otherwise search the playlist tree first (popped first from the stack), then Favorites.
+  std::vector<MediaNode *> stack;
+  stack.push_back(&state_.favoritesRootNode);
+  for (auto it = state_.manifest.nodes.rbegin(); it != state_.manifest.nodes.rend(); ++it) {
+    stack.push_back(&*it);
+  }
+
+  while (!stack.empty()) {
+    MediaNode *node = stack.back();
+    stack.pop_back();
+    if (node->id == nodeId) {
+      return node;
+    }
+    for (MediaNode &child : node->children) {
+      stack.push_back(&child);
+    }
+  }
+  return nullptr;
+}
+
+void App::startNodeLoadWorker() {
+  nodeLoadStop_ = false;
+  nodeLoadWorker_ = std::thread(&App::nodeLoadWorkerLoop, this);
+}
+
+void App::stopNodeLoadWorker() {
+  nodeLoadStop_ = true;
+  nodeLoadCv_.notify_all();
+  if (nodeLoadWorker_.joinable()) {
+    nodeLoadWorker_.join();
+  }
+}
+
+void App::nodeLoadWorkerLoop() {
+  while (!nodeLoadStop_) {
+    NodeLoadJob job;
+    {
+      std::unique_lock<std::mutex> lock(nodeLoadMutex_);
+      nodeLoadCv_.wait(lock, [this]() { return nodeLoadStop_ || nodeLoadHasJob_; });
+      if (nodeLoadStop_) {
+        break;
+      }
+      job = nodeLoadJob_;
+      nodeLoadHasJob_ = false;
+    }
+
+    ParserApiClient api(job.config);
+    constexpr int kPageSize = 250;
     int pageNumber = 1;
-    int totalItems = 0;
     int totalPages = 1;
 
     while (pageNumber <= totalPages && pageNumber <= 200) {
+      if (nodeLoadStop_ || job.generation != nodeLoadGeneration_.load()) {
+        break;  // A newer folder was requested: stop paging this one.
+      }
+
+      NodeLoadPage result;
+      result.manifestId = job.manifestId;
+      result.nodeId = job.nodeId;
+      result.generation = job.generation;
+      result.pageNumber = pageNumber;
+
       NodeChildrenPage page;
-      const bool fromCache = loadNodeChildrenPage(playlist->id, node.id, pageNumber, page);
-
-      if (!fromCache) {
-        usedOnlyCache = false;
-        page = api_.loadNodeChildren(
-          sourceUrl,
-          state_.manifest.provider,
-          streamType,
-          node.id,
-          pageNumber,
-          pageSize
-        );
-
-        saveNodeChildrenPage(playlist->id, node.id, page);
-      }
-
-      if (pageNumber == 1) {
-        firstPage = page;
-      }
-
-      if (page.totalItems > totalItems) {
-        totalItems = page.totalItems;
-      }
-
-      totalPages = std::max(1, page.totalPages);
-
-      items.insert(
-        items.end(),
-        std::make_move_iterator(page.items.begin()),
-        std::make_move_iterator(page.items.end())
-      );
-
-      if (!page.hasNextPage) {
+      try {
+        result.fromCache = loadNodeChildrenPage(job.playlistId, job.nodeId, pageNumber, page);
+        if (!result.fromCache) {
+          page = api.loadNodeChildren(job.sourceUrl, job.provider, job.type, job.nodeId, pageNumber, kPageSize);
+          saveNodeChildrenPage(job.playlistId, job.nodeId, page);
+        }
+      } catch (const std::exception &ex) {
+        std::printf("[KBORE] node children load failed (page %d): %s\n", pageNumber, ex.what());
+        result.failed = true;
+        result.last = true;
+        result.error = ex.what();
+        std::lock_guard<std::mutex> lock(nodeLoadMutex_);
+        nodeLoadFinished_.push_back(std::move(result));
         break;
       }
 
+      totalPages = std::max(1, page.totalPages);
+      result.totalItems = page.totalItems;
+      result.items = std::move(page.items);
+      result.last = !page.hasNextPage || pageNumber >= totalPages || pageNumber >= 200;
+      {
+        std::lock_guard<std::mutex> lock(nodeLoadMutex_);
+        nodeLoadFinished_.push_back(std::move(result));
+      }
+      if (!page.hasNextPage) {
+        break;
+      }
       ++pageNumber;
     }
-  } catch (const std::exception &ex) {
-    state_.loading = false;
-    state_.loadingMessage.clear();
-    if (state_.channelListLoadingKey == loadingKey) {
-      state_.channelListLoading = false;
-      state_.channelListLoadingKey.clear();
+  }
+}
+
+void App::drainFinishedNodeLoads() {
+  std::vector<NodeLoadPage> finished;
+  {
+    std::lock_guard<std::mutex> lock(nodeLoadMutex_);
+    finished.swap(nodeLoadFinished_);
+  }
+
+  for (NodeLoadPage &page : finished) {
+    if (page.generation != nodeLoadGeneration_.load() || page.manifestId != state_.manifest.id) {
+      continue;  // Superseded by a newer folder or another playlist.
     }
-    state_.message = "Failed to load folder items.";
-    std::printf("[KBORE] node children load failed: %s\n", ex.what());
-    return false;
-  }
 
-  state_.loading = false;
-  state_.loadingMessage.clear();
-  if (state_.channelListLoadingKey == loadingKey) {
-    state_.channelListLoading = false;
-    state_.channelListLoadingKey.clear();
-  }
+    const std::string loadedKey = page.manifestId + ":" + page.nodeId;
+    const bool firstPage = page.pageNumber == 1;
+    auto finishLoadingIndicator = [&]() {
+      if (state_.channelListLoadingKey == "node:" + page.nodeId) {
+        state_.channelListLoading = false;
+        state_.channelListLoadingKey.clear();
+      }
+    };
 
-  node.children = std::move(items);
-  node.childCount = std::max(node.childCount, static_cast<int>(node.children.size()));
-  if (firstPage.totalItems > 0) {
-    node.totalItems = firstPage.totalItems;
-    if (node.totalChannels <= 0) {
-      node.totalChannels = firstPage.totalItems;
+    if (page.failed) {
+      finishLoadingIndicator();
+      nodeLoadActiveKey_.clear();
+      state_.message = "Failed to load folder items.";
+      continue;
+    }
+
+    MediaNode *node = findNodeById(page.nodeId);
+    if (!node) {
+      finishLoadingIndicator();
+      nodeLoadActiveKey_.clear();
+      continue;
+    }
+
+    if (firstPage) {
+      node->children.clear();
+    }
+    node->children.insert(
+      node->children.end(),
+      std::make_move_iterator(page.items.begin()),
+      std::make_move_iterator(page.items.end())
+    );
+    node->childCount = std::max(node->childCount, static_cast<int>(node->children.size()));
+    if (page.totalItems > 0) {
+      node->totalItems = page.totalItems;
+      if (node->totalChannels <= 0) {
+        node->totalChannels = page.totalItems;
+      }
+    }
+    // Loaded even when empty, so entering an empty folder does not reload it forever.
+    node->hasChildren = !node->children.empty() || node->childCount > 0;
+
+    if (page.last) {
+      nodeLoadActiveKey_.clear();
+      state_.message = node->children.empty()
+        ? (page.fromCache ? "Folder cache is empty" : "Folder has no items")
+        : (page.fromCache ? "Loaded folder from cache" : "Loaded folder from API");
+    }
+
+    if (firstPage) {
+      nodeChildrenLoaded_.insert(loadedKey);
+      finishLoadingIndicator();
+      // Replay the A press that requested this folder, if the user has not moved since.
+      if (state_.screen == ScreenId::Dashboard && navigationSnapshot() == nodeLoadSnapshot_) {
+        handleDashboard(Button::Select);
+      } else {
+        loadVisibleEpgForChannelList();
+      }
+    } else {
+      loadVisibleEpgForChannelList();
     }
   }
-  // Mark the node as loaded even when the API legitimately returns an empty
-  // list. The dashboard must be able to enter/render this empty child list
-  // based on the parent currently in focus instead of treating the A press as
-  // a failed load.
-  node.hasChildren = !node.children.empty() || node.childCount > 0;
-
-  if (node.children.empty()) {
-    state_.message = usedOnlyCache ? "Folder cache is empty" : "Folder has no items";
-    return true;
-  }
-
-  state_.message = usedOnlyCache ? "Loaded folder from cache" : "Loaded folder from API";
-  return true;
 }
 
 Channel App::channelFromNode(const MediaNode &node) const {
@@ -5705,6 +5825,7 @@ void App::render() {
   // Bound decoded logo memory; safe here because no peek() pointer is held across frames.
   imageCache_.trim(240);
   drainFinishedChannelLoads();
+  drainFinishedNodeLoads();
   drainFinishedEpg();
   updateVodDetailsLoad();
   gfx_.beginFrame();
