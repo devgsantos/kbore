@@ -259,7 +259,15 @@ void setLiveInputOptions(
     o demuxer esperava dados. Timeouts menores fazem o player congelar menos
     e permitem o resync de live latency agir.
   */
-  av_dict_set(options, "timeout", "3000000", 0);
+  /*
+    "timeout" is both the TCP connect timeout and the socket wait limit (libavformat/tcp.c). Reads
+    during playback are bounded separately by the 900 ms IO guard around every av_read_frame (see
+    NativeDecoder), which also aborts reconnects, so a longer value only affects opening. Opening
+    runs on a background thread (App::streamProbeLoop) with the UI responsive, and the Switch's
+    network stack plus some providers take several seconds to accept a connection: 3 s rejected
+    connections that would have succeeded.
+  */
+  av_dict_set(options, "timeout", "10000000", 0);
   av_dict_set(options, "rw_timeout", "2000000", 0);
   av_dict_set(options, "fflags", "nobuffer", 0);
   av_dict_set(options, "flags", "low_delay", 0);
@@ -590,7 +598,8 @@ bool NativeDemuxer::open(const std::string &url) {
 
   installInterruptCallback(impl_);
 
-  beginIoGuard(2500);
+  // Slower on the Switch's FFmpeg than on a PC; runs in the background connect step.
+  beginIoGuard(5000);
   ret = avformat_find_stream_info(impl_->format, nullptr);
   const bool streamInfoInterrupted = wasIoInterrupted();
   endIoGuard();
