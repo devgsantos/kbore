@@ -12,6 +12,7 @@
 #include "nstv/video_player.hpp"
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <cstddef>
@@ -119,13 +120,12 @@ private:
     std::string sourceUrl;
     Provider provider = Provider::M3u;
     StreamType type = StreamType::Live;
-    uint64_t generation = 0;
+    int nextPage = 1;
   };
 
   struct NodeLoadPage {
     std::string manifestId;
     std::string nodeId;
-    uint64_t generation = 0;
     int pageNumber = 1;
     std::vector<MediaNode> items;
     int totalItems = 0;
@@ -388,14 +388,17 @@ private:
   std::thread nodeLoadWorker_;
   std::mutex nodeLoadMutex_;
   std::condition_variable nodeLoadCv_;
-  bool nodeLoadHasJob_ = false;
-  NodeLoadJob nodeLoadJob_;
+  // Folders being paged in. Newest request first; a folder with more pages goes back to the end,
+  // so opening another folder takes priority without abandoning the previous one.
+  std::deque<NodeLoadJob> nodeLoadQueue_;
   std::vector<NodeLoadPage> nodeLoadFinished_;
   std::atomic<bool> nodeLoadStop_{false};
-  std::atomic<uint64_t> nodeLoadGeneration_{0};
   // UI thread only.
-  std::string nodeLoadActiveKey_;            // manifestId + ":" + nodeId being loaded
-  NavigationSnapshot nodeLoadSnapshot_;      // context of the A press that started the load
+  std::set<std::string> nodeLoadInFlight_;   // manifestId + ":" + nodeId still paging
+  std::string nodeLoadReplayKey_;            // folder whose first page should replay the A press
+  NavigationSnapshot nodeLoadSnapshot_;      // context of that A press
+  uint64_t nodeLoadReplayInputCount_ = 0;    // inputCount_ at that A press
+  uint64_t inputCount_ = 0;                  // every handled button/touch-down
   std::set<std::string> nodeChildrenLoaded_; // manifestId + ":" + nodeId, including empty folders
 
   std::thread vodDetailsThread_;

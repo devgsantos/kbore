@@ -1582,6 +1582,9 @@ int App::run() {
 }
 
 void App::handleInput(const InputEvent &event) {
+  if (event.type == InputType::Button || event.type == InputType::TouchDown) {
+    ++inputCount_;  // Any user action cancels a pending folder auto-open (see drainFinishedNodeLoads).
+  }
   if (event.type == InputType::Button) {
     handle(event.button);
     return;
@@ -5128,17 +5131,21 @@ bool App::ensureNodeChildrenLoaded(MediaNode &node) {
     return false;
   }
 
+  // Remember this A press: if nothing else is pressed before the first page arrives, it is replayed
+  // to open the folder. Any other input in between only lets the load finish in the background.
+  nodeLoadReplayKey_ = loadedKey;
   nodeLoadSnapshot_ = navigationSnapshot();
-  if (nodeLoadActiveKey_ == loadedKey) {
-    return false;  // Already loading this folder; the latest A press context is kept above.
-  }
-
-  nodeLoadActiveKey_ = loadedKey;
+  nodeLoadReplayInputCount_ = inputCount_;
   state_.loading = false;
   state_.loadingMessage.clear();
   state_.channelListLoading = true;
   state_.channelListLoadingKey = "node:" + node.id;
   state_.message = "Loading " + (node.title.empty() ? node.name : node.title) + "...";
+
+  if (nodeLoadInFlight_.count(loadedKey)) {
+    return false;  // Already paging this folder.
+  }
+  nodeLoadInFlight_.insert(loadedKey);
 
   NodeLoadJob job;
   job.config = state_.config;
@@ -5148,12 +5155,14 @@ bool App::ensureNodeChildrenLoaded(MediaNode &node) {
   job.sourceUrl = state_.manifest.source.empty() ? playlist->sourceUrl() : state_.manifest.source;
   job.provider = state_.manifest.provider;
   job.type = streamTypeFromString(node.type);
-  job.generation = ++nodeLoadGeneration_;  // Supersedes any folder still loading.
 
   {
     std::lock_guard<std::mutex> lock(nodeLoadMutex_);
-    nodeLoadJob_ = job;
-    nodeLoadHasJob_ = true;
+    // Jobs from another playlist are obsolete.
+    for (auto it = nodeLoadQueue_.begin(); it != nodeLoadQueue_.end();) {
+      it = it->manifestId != job.manifestId ? nodeLoadQueue_.erase(it) : std::next(it);
+    }
+    nodeLoadQueue_.push_front(job);  // The folder the user just opened goes first.
   }
   nodeLoadCv_.notify_one();
   return false;
@@ -5212,63 +5221,53 @@ void App::stopNodeLoadWorker() {
 }
 
 void App::nodeLoadWorkerLoop() {
+  constexpr int kPageSize = 250;
+  constexpr int kMaxPages = 200;
+
   while (!nodeLoadStop_) {
     NodeLoadJob job;
     {
       std::unique_lock<std::mutex> lock(nodeLoadMutex_);
-      nodeLoadCv_.wait(lock, [this]() { return nodeLoadStop_ || nodeLoadHasJob_; });
+      nodeLoadCv_.wait(lock, [this]() { return nodeLoadStop_ || !nodeLoadQueue_.empty(); });
       if (nodeLoadStop_) {
         break;
       }
-      job = nodeLoadJob_;
-      nodeLoadHasJob_ = false;
+      job = nodeLoadQueue_.front();
+      nodeLoadQueue_.pop_front();
     }
 
-    ParserApiClient api(job.config);
-    constexpr int kPageSize = 250;
-    int pageNumber = 1;
-    int totalPages = 1;
+    // One page per turn, so a newly opened folder never waits for another folder's remaining pages.
+    NodeLoadPage result;
+    result.manifestId = job.manifestId;
+    result.nodeId = job.nodeId;
+    result.pageNumber = job.nextPage;
 
-    while (pageNumber <= totalPages && pageNumber <= 200) {
-      if (nodeLoadStop_ || job.generation != nodeLoadGeneration_.load()) {
-        break;  // A newer folder was requested: stop paging this one.
+    NodeChildrenPage page;
+    bool hasMore = false;
+    try {
+      result.fromCache = loadNodeChildrenPage(job.playlistId, job.nodeId, job.nextPage, page);
+      if (!result.fromCache) {
+        ParserApiClient api(job.config);
+        page = api.loadNodeChildren(job.sourceUrl, job.provider, job.type, job.nodeId, job.nextPage, kPageSize);
+        saveNodeChildrenPage(job.playlistId, job.nodeId, page);
       }
-
-      NodeLoadPage result;
-      result.manifestId = job.manifestId;
-      result.nodeId = job.nodeId;
-      result.generation = job.generation;
-      result.pageNumber = pageNumber;
-
-      NodeChildrenPage page;
-      try {
-        result.fromCache = loadNodeChildrenPage(job.playlistId, job.nodeId, pageNumber, page);
-        if (!result.fromCache) {
-          page = api.loadNodeChildren(job.sourceUrl, job.provider, job.type, job.nodeId, pageNumber, kPageSize);
-          saveNodeChildrenPage(job.playlistId, job.nodeId, page);
-        }
-      } catch (const std::exception &ex) {
-        std::printf("[KBORE] node children load failed (page %d): %s\n", pageNumber, ex.what());
-        result.failed = true;
-        result.last = true;
-        result.error = ex.what();
-        std::lock_guard<std::mutex> lock(nodeLoadMutex_);
-        nodeLoadFinished_.push_back(std::move(result));
-        break;
-      }
-
-      totalPages = std::max(1, page.totalPages);
+      const int totalPages = std::max(1, page.totalPages);
+      hasMore = page.hasNextPage && job.nextPage < totalPages && job.nextPage < kMaxPages;
       result.totalItems = page.totalItems;
       result.items = std::move(page.items);
-      result.last = !page.hasNextPage || pageNumber >= totalPages || pageNumber >= 200;
-      {
-        std::lock_guard<std::mutex> lock(nodeLoadMutex_);
-        nodeLoadFinished_.push_back(std::move(result));
-      }
-      if (!page.hasNextPage) {
-        break;
-      }
-      ++pageNumber;
+      result.last = !hasMore;
+    } catch (const std::exception &ex) {
+      std::printf("[KBORE] node children load failed (page %d): %s\n", job.nextPage, ex.what());
+      result.failed = true;
+      result.last = true;
+      result.error = ex.what();
+    }
+
+    std::lock_guard<std::mutex> lock(nodeLoadMutex_);
+    nodeLoadFinished_.push_back(std::move(result));
+    if (hasMore) {
+      ++job.nextPage;
+      nodeLoadQueue_.push_back(job);
     }
   }
 }
@@ -5281,11 +5280,14 @@ void App::drainFinishedNodeLoads() {
   }
 
   for (NodeLoadPage &page : finished) {
-    if (page.generation != nodeLoadGeneration_.load() || page.manifestId != state_.manifest.id) {
-      continue;  // Superseded by a newer folder or another playlist.
+    const std::string loadedKey = page.manifestId + ":" + page.nodeId;
+    if (page.last) {
+      nodeLoadInFlight_.erase(loadedKey);
+    }
+    if (page.manifestId != state_.manifest.id) {
+      continue;  // From a playlist that is no longer active.
     }
 
-    const std::string loadedKey = page.manifestId + ":" + page.nodeId;
     const bool firstPage = page.pageNumber == 1;
     auto finishLoadingIndicator = [&]() {
       if (state_.channelListLoadingKey == "node:" + page.nodeId) {
@@ -5296,7 +5298,7 @@ void App::drainFinishedNodeLoads() {
 
     if (page.failed) {
       finishLoadingIndicator();
-      nodeLoadActiveKey_.clear();
+      if (nodeLoadReplayKey_ == loadedKey) nodeLoadReplayKey_.clear();
       state_.message = "Failed to load folder items.";
       continue;
     }
@@ -5304,7 +5306,7 @@ void App::drainFinishedNodeLoads() {
     MediaNode *node = findNodeById(page.nodeId);
     if (!node) {
       finishLoadingIndicator();
-      nodeLoadActiveKey_.clear();
+      if (nodeLoadReplayKey_ == loadedKey) nodeLoadReplayKey_.clear();
       continue;
     }
 
@@ -5326,8 +5328,7 @@ void App::drainFinishedNodeLoads() {
     // Loaded even when empty, so entering an empty folder does not reload it forever.
     node->hasChildren = !node->children.empty() || node->childCount > 0;
 
-    if (page.last) {
-      nodeLoadActiveKey_.clear();
+    if (page.last && state_.channelListLoadingKey.empty()) {
       state_.message = node->children.empty()
         ? (page.fromCache ? "Folder cache is empty" : "Folder has no items")
         : (page.fromCache ? "Loaded folder from cache" : "Loaded folder from API");
@@ -5336,8 +5337,14 @@ void App::drainFinishedNodeLoads() {
     if (firstPage) {
       nodeChildrenLoaded_.insert(loadedKey);
       finishLoadingIndicator();
-      // Replay the A press that requested this folder, if the user has not moved since.
-      if (state_.screen == ScreenId::Dashboard && navigationSnapshot() == nodeLoadSnapshot_) {
+      // Replay the A press only when it was the latest folder request and nothing was pressed
+      // since: if the user moved on (even back to the same spot), just finish loading quietly.
+      const bool replay = nodeLoadReplayKey_ == loadedKey &&
+        inputCount_ == nodeLoadReplayInputCount_ &&
+        state_.screen == ScreenId::Dashboard &&
+        navigationSnapshot() == nodeLoadSnapshot_;
+      if (nodeLoadReplayKey_ == loadedKey) nodeLoadReplayKey_.clear();
+      if (replay) {
         handleDashboard(Button::Select);
       } else {
         loadVisibleEpgForChannelList();
