@@ -211,6 +211,11 @@ private:
 
   void render();
   void paceFrame();
+  void startNativePlayback(const Channel &channel);
+  void startStreamProbe(const Channel &channel, int attempt);
+  void cancelStreamProbe();
+  void updateStreamProbe();
+  void streamProbeLoop(std::string url);
   void renderSplashGraphic();
   void renderDashboard();
   void renderDashboardGraphic();
@@ -385,6 +390,20 @@ private:
   std::set<std::string> epgQueuedKeys_;
   std::vector<EpgResult> epgFinished_;
   std::atomic<bool> epgStop_{false};
+  // Stream connection check before native playback (see openChannel).
+  enum class StreamProbeState { Idle, Running, Reachable, Failed };
+  std::thread streamProbeThread_;
+  std::atomic<bool> streamProbeCancel_{false};
+  std::atomic<StreamProbeState> streamProbeState_{StreamProbeState::Idle};
+  std::mutex streamProbeMutex_;
+  std::string streamProbeError_;       // guarded by streamProbeMutex_
+  bool streamProbeRetryable_ = false;  // guarded by streamProbeMutex_
+  // UI thread only.
+  Channel streamProbeChannel_;
+  int streamProbeAttempt_ = 0;
+  long long streamProbeRetryAtMs_ = 0;
+  static constexpr int kStreamProbeMaxAttempts = 2;
+
   std::thread nodeLoadWorker_;
   std::mutex nodeLoadMutex_;
   std::condition_variable nodeLoadCv_;
