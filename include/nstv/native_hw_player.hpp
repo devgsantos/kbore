@@ -18,6 +18,8 @@ public:
   ~NativeHwPlayerBackend() override;
 
   bool open(const std::string &url) override;
+  bool openInput(const std::string &url) override;
+  bool finishOpen() override;
   void close() override;
   bool update() override;
   void togglePause() override;

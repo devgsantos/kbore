@@ -650,6 +650,12 @@ void NativeHwPlayerBackend::updateCpuFrameCost(long long elapsedMs) {
 }
 
 bool NativeHwPlayerBackend::open(const std::string &url) {
+  return openInput(url) && finishOpen();
+}
+
+// Network step: connect and read the stream header. Touches only the demuxer (no GPU, no SDL), so
+// it can run on a worker thread while the UI keeps rendering.
+bool NativeHwPlayerBackend::openInput(const std::string &url) {
   close();
 
   url_ = url;
@@ -681,7 +687,24 @@ bool NativeHwPlayerBackend::open(const std::string &url) {
   if (!demuxer_.open(url)) {
     return failOpen(demuxer_.error());
   }
+  return true;
+#endif
+}
 
+// Main-thread step: hardware decoder, audio and native renderer setup on the opened input.
+bool NativeHwPlayerBackend::finishOpen() {
+  auto failOpen = [this](const std::string &message) -> bool {
+    const std::string preserved = message;
+    close();
+    error_ = preserved;
+    open_ = false;
+    return false;
+  };
+  const std::string url = url_;
+
+#ifndef NSTV_ENABLE_NATIVE_HW_PLAYER
+  return failOpen("Native hardware player is not enabled.");
+#else
   if (!demuxer_.video().exists && demuxer_.audio().exists) {
     audioOnlyMode_ = true;
 

@@ -1492,6 +1492,10 @@ App::~App() {
   stopEpgWorker();
   stopNodeLoadWorker();
   cancelStreamProbe();
+  if (streamProbeThread_.joinable()) {
+    streamProbeThread_.join();
+  }
+  pendingPlayer_.reset();
   if (vodDetailsThread_.joinable()) {
     vodDetailsThread_.join();
   }
@@ -1576,9 +1580,6 @@ int App::run() {
 
       if (input.type != InputType::None) {
         handleInput(input);
-      }
-      if (state_.screen == ScreenId::Player) {
-        updateStreamProbe();
       }
 
       applyPlaybackSleepPolicy();
@@ -4450,116 +4451,72 @@ void App::openChannel(const Channel &channel) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Stream connection check. Opens the stream URL with libcurl (following the provider's redirects)
-// and drops the connection as soon as the server answers, so the native player only takes over the
-// screen once the server is known to respond.
+// Background stream connection. The player's network step (openInput: connect + read the stream
+// header) runs on a worker thread while the UI keeps rendering the loading box; only once it has
+// connected does the main thread hand the screen to the native player (finishOpen). A single
+// connection is used: providers were seen dropping a second connection opened right after a first.
 // ---------------------------------------------------------------------------------------------
-namespace {
-struct StreamProbeContext {
-  std::atomic<bool> *cancel = nullptr;
-  long status = 0;
-  bool gotBody = false;
-};
-
-size_t streamProbeWrite(char *, size_t size, size_t nmemb, void *userdata) {
-  auto *ctx = static_cast<StreamProbeContext *>(userdata);
-  if (size * nmemb > 0) ctx->gotBody = true;
-  return 0;  // First bytes arrived: the server is streaming. Abort the transfer here.
-}
-
-int streamProbeProgress(void *userdata, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
-  auto *ctx = static_cast<StreamProbeContext *>(userdata);
-  return ctx->cancel && ctx->cancel->load() ? 1 : 0;
-}
-} // namespace
-
 void App::streamProbeLoop(std::string url) {
-  StreamProbeContext ctx;
-  ctx.cancel = &streamProbeCancel_;
-
-  CURL *curl = curl_easy_init();
-  CURLcode code = CURLE_FAILED_INIT;
-  if (curl) {
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 8L);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "NSTV-NativeDemuxer/0.1");
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 8L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
-    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, streamProbeWrite);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx);
-    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
-    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, streamProbeProgress);
-    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &ctx);
-    curl_easy_setopt(curl, CURLOPT_FORBID_REUSE, 1L);  // Never keep a provider connection open.
-    code = curl_easy_perform(curl);
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &ctx.status);
-    curl_easy_cleanup(curl);
-  }
-
-  if (streamProbeCancel_) {
-    streamProbeState_ = StreamProbeState::Idle;
+  // pendingPlayer_ is owned by this thread until streamProbeState_ leaves Running.
+  const bool connected = pendingPlayer_ && pendingPlayer_->openInput(url);
+  if (!connected) {
+    std::string error = pendingPlayer_ ? pendingPlayer_->error() : "Player backend not available";
+    const bool timeout = error.find("timed out") != std::string::npos || error.find("Timeout") != std::string::npos;
+    const bool refused = error.find("refused") != std::string::npos || error.find("unreachable") != std::string::npos;
+    const bool httpClientError = error.find("4XX") != std::string::npos || error.find("403") != std::string::npos ||
+      error.find("404") != std::string::npos || error.find("401") != std::string::npos;
+    std::string friendly = timeout ? "Server did not respond (timeout)"
+      : refused ? "Could not connect to the server"
+      : httpClientError ? "Access denied or stream not found"
+      : error;
+    {
+      std::lock_guard<std::mutex> lock(streamProbeMutex_);
+      streamProbeError_ = friendly;
+      streamProbeDetail_ = error;
+      streamProbeRetryable_ = !httpClientError;
+    }
+    streamProbeState_ = StreamProbeState::Failed;
     return;
   }
-
-  const bool httpOk = ctx.status >= 200 && ctx.status < 400;
-  const bool reachable = httpOk && (ctx.gotBody || code == CURLE_OK || code == CURLE_WRITE_ERROR);
-  if (reachable) {
-    streamProbeState_ = StreamProbeState::Reachable;
-    return;
-  }
-
-  std::string error;
-  bool retryable = true;
-  if (ctx.status >= 400) {
-    error = "Server answered HTTP " + std::to_string(ctx.status);
-    retryable = ctx.status >= 500;  // 4xx (expired/blocked/not found) will not fix itself on retry.
-  } else if (code == CURLE_OPERATION_TIMEDOUT) {
-    error = "Server did not respond (timeout)";
-  } else if (code == CURLE_COULDNT_RESOLVE_HOST) {
-    error = "Server address not found";
-  } else if (code == CURLE_COULDNT_CONNECT) {
-    error = "Could not connect to the server";
-  } else {
-    error = std::string("Connection failed: ") + curl_easy_strerror(code);
-  }
-  logLinef("[KBORE][PLAYBACK][PROBE] url check failed code=%d status=%ld error='%s'", static_cast<int>(code), ctx.status, error.c_str());
-
-  {
-    std::lock_guard<std::mutex> lock(streamProbeMutex_);
-    streamProbeError_ = error;
-    streamProbeRetryable_ = retryable;
-  }
-  streamProbeState_ = StreamProbeState::Failed;
+  streamProbeState_ = StreamProbeState::Reachable;
 }
 
 void App::startStreamProbe(const Channel &channel, int attempt) {
-  cancelStreamProbe();
   streamProbeChannel_ = channel;
   streamProbeAttempt_ = attempt;
   streamProbeRetryAtMs_ = 0;
   streamProbeCancel_ = false;
+
+  if (streamProbeThread_.joinable()) {
+    // A cancelled connection is still finishing (it cannot be interrupted); start this one as soon
+    // as it returns, from updateStreamProbe(). The UI stays responsive meanwhile.
+    streamProbeQueued_ = true;
+    state_.message = "Connecting";
+    return;
+  }
+
+  streamProbeQueued_ = false;
+  pendingPlayer_ = createPlayerBackend();
+  pendingPlayer_->setNativeVideoAllowed(true);
+  pendingPlayer_->setOverlayVisible(true);
   streamProbeState_ = StreamProbeState::Running;
   state_.message = attempt > 1 ? "Retrying connection" : "Connecting";
-  logLinef("[KBORE][PLAYBACK][PROBE] checking stream name='%s' attempt=%d", channel.name.c_str(), attempt);
+  logLinef("[KBORE][PLAYBACK][CONNECT] connecting name='%s' attempt=%d", channel.name.c_str(), attempt);
   streamProbeThread_ = std::thread(&App::streamProbeLoop, this, channel.url);
 }
 
+// Abandons the connection in progress without blocking: its result is discarded when it returns.
 void App::cancelStreamProbe() {
   streamProbeCancel_ = true;
-  if (streamProbeThread_.joinable()) {
-    streamProbeThread_.join();  // Returns within ~1 s: the progress callback aborts the transfer.
-  }
-  streamProbeState_ = StreamProbeState::Idle;
+  streamProbeQueued_ = false;
   streamProbeRetryAtMs_ = 0;
   streamProbeAttempt_ = 0;
 }
 
-// Called from the main loop while the Player screen is showing.
+// Called every frame (from render()).
 void App::updateStreamProbe() {
   if (streamProbeRetryAtMs_ > 0) {
-    if (nowMs() >= streamProbeRetryAtMs_) {
+    if (nowMs() >= streamProbeRetryAtMs_ && !streamProbeCancel_) {
       startStreamProbe(streamProbeChannel_, streamProbeAttempt_ + 1);
     }
     return;
@@ -4574,26 +4531,59 @@ void App::updateStreamProbe() {
     streamProbeThread_.join();
   }
   streamProbeState_ = StreamProbeState::Idle;
+  std::unique_ptr<IPlayerBackend> connected = std::move(pendingPlayer_);
+
+  if (streamProbeCancel_) {
+    // User left (B) while connecting: drop this connection.
+    if (connected) connected->close();
+    logLine("[KBORE][PLAYBACK][CONNECT] connection finished after cancel; discarded");
+    if (streamProbeQueued_) {
+      streamProbeCancel_ = false;
+      startStreamProbe(streamProbeChannel_, 1);
+    }
+    return;
+  }
+
+  if (streamProbeQueued_) {
+    // Another channel was requested while this one was connecting: start it instead.
+    if (connected) connected->close();
+    startStreamProbe(streamProbeChannel_, 1);
+    return;
+  }
 
   if (probeState == StreamProbeState::Reachable) {
-    const Channel channel = streamProbeChannel_;
     streamProbeAttempt_ = 0;
-    startNativePlayback(channel);
+    if (state_.screen != ScreenId::Player) {
+      if (connected) connected->close();  // The user is no longer on the player screen.
+      return;
+    }
+    const Channel channel = streamProbeChannel_;
+    finishNativePlayback(channel, std::move(connected));
+    return;
+  }
+
+  if (state_.screen != ScreenId::Player) {
+    if (connected) connected->close();
+    streamProbeAttempt_ = 0;
     return;
   }
 
   std::string error;
+  std::string detail;
   bool retryable = false;
   {
     std::lock_guard<std::mutex> lock(streamProbeMutex_);
     error = streamProbeError_;
+    detail = streamProbeDetail_;
     retryable = streamProbeRetryable_;
   }
+  if (connected) connected->close();
 
   if (retryable && streamProbeAttempt_ < kStreamProbeMaxAttempts) {
-    // One automatic retry after a short pause: providers often drop a single connection attempt.
-    streamProbeRetryAtMs_ = nowMs() + 1000;
+    // One automatic retry. Wait a few seconds: the provider dropped connections opened in a rush.
+    streamProbeRetryAtMs_ = nowMs() + 3000;
     state_.message = "Retrying connection";
+    logLinef("[KBORE][PLAYBACK][CONNECT] attempt %d failed ('%s'); retrying in 3 s", streamProbeAttempt_, detail.c_str());
     return;
   }
 
@@ -4601,7 +4591,7 @@ void App::updateStreamProbe() {
     "[KBORE][PLAYBACK] failed to load %s stream name='%s' error='%s'",
     toString(streamProbeChannel_.type).c_str(),
     streamProbeChannel_.name.c_str(),
-    error.c_str()
+    detail.c_str()
   );
   streamProbeAttempt_ = 0;
   state_.message = "Failed to load stream";
@@ -4616,13 +4606,27 @@ void App::updateStreamProbe() {
 void App::startNativePlayback(const Channel &channel) {
   render();
 
-  player_ = createPlayerBackend();
+  std::unique_ptr<IPlayerBackend> player = createPlayerBackend();
+  player->setNativeVideoAllowed(true);
+  player->setOverlayVisible(true);
+  if (!player->openInput(channel.url)) {
+    player_ = std::move(player);
+    gfx_.suspendForNativeVideo();
+    finishNativePlaybackResult(channel, false);
+    return;
+  }
+  finishNativePlayback(channel, std::move(player));
+}
 
+// Main thread: the input is connected; hand the screen to the native player and start decoding.
+void App::finishNativePlayback(const Channel &channel, std::unique_ptr<IPlayerBackend> player) {
+  player_ = std::move(player);
   gfx_.suspendForNativeVideo();
-  player_->setNativeVideoAllowed(true);
-  player_->setOverlayVisible(true);
+  finishNativePlaybackResult(channel, player_ && player_->finishOpen());
+}
 
-  if (player_->open(channel.url)) {
+void App::finishNativePlaybackResult(const Channel &channel, bool opened) {
+  if (opened) {
     resetPlaybackSleepTimers();
     state_.playbackStartedAtMs = nowMs();
     state_.lastPlaybackInputMs = state_.playbackStartedAtMs;
@@ -6029,6 +6033,7 @@ static int gridWindowStart(int selected, int size, int columns, int rows) {
 void App::render() {
   // Bound decoded logo memory; safe here because no peek() pointer is held across frames.
   imageCache_.trim(240);
+  updateStreamProbe();
   drainFinishedChannelLoads();
   drainFinishedNodeLoads();
   drainFinishedEpg();

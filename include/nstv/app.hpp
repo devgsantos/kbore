@@ -212,6 +212,8 @@ private:
   void render();
   void paceFrame();
   void startNativePlayback(const Channel &channel);
+  void finishNativePlayback(const Channel &channel, std::unique_ptr<IPlayerBackend> player);
+  void finishNativePlaybackResult(const Channel &channel, bool opened);
   void startStreamProbe(const Channel &channel, int attempt);
   void cancelStreamProbe();
   void updateStreamProbe();
@@ -396,8 +398,11 @@ private:
   std::atomic<bool> streamProbeCancel_{false};
   std::atomic<StreamProbeState> streamProbeState_{StreamProbeState::Idle};
   std::mutex streamProbeMutex_;
-  std::string streamProbeError_;       // guarded by streamProbeMutex_
+  std::string streamProbeError_;       // guarded by streamProbeMutex_ (short, shown to the user)
+  std::string streamProbeDetail_;      // guarded by streamProbeMutex_ (full error, for the log)
   bool streamProbeRetryable_ = false;  // guarded by streamProbeMutex_
+  std::unique_ptr<IPlayerBackend> pendingPlayer_;  // owned by the connect thread while Running
+  bool streamProbeQueued_ = false;     // UI thread: a channel waits for a cancelled connect to end
   // UI thread only.
   Channel streamProbeChannel_;
   int streamProbeAttempt_ = 0;
