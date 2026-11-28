@@ -68,6 +68,8 @@ struct AppState {
   int selectedSettingsOption = 0;
   int settingsSection = 0;          // section shown in the settings content panel
   bool settingsInSections = true;   // focus on the section list (true) or on its options
+  int pendingDeletePlaylist = -1;   // X pressed once on this playlist; a second X deletes it
+  long long pendingDeleteAtMs = 0;
   int selectedParentalType = 0;
   int selectedParentalCategory = 0;
   bool parentalUnlocked = false;
@@ -216,7 +218,8 @@ private:
   void paceFrame();
   void renderSettingsShell(int activeSection, bool sectionListFocused);
   void renderFooterHints(const std::vector<std::pair<std::string, std::string>> &hints, const std::string &leftNote = "");
-  void openSettingsScreen();
+  void openSettingsScreen(int section = 0, bool focusOptions = false);
+  std::vector<int> settingsSectionOptions(int section) const;
   void startNativePlayback(const Channel &channel);
   void finishNativePlayback(const Channel &channel, std::unique_ptr<IPlayerBackend> player);
   void finishNativePlaybackResult(const Channel &channel, bool opened);
@@ -227,7 +230,6 @@ private:
   void renderSplashGraphic();
   void renderDashboard();
   void renderDashboardGraphic();
-  void renderAddPlaylistGraphic();
   void renderPlayerGraphic();
   void renderSettingsGraphic();
   void renderParentalGraphic();
@@ -240,14 +242,12 @@ private:
   void handleTouchTap(int x, int y);
   void handleDashboardTouchTap(int x, int y);
   void handleDashboardTouchDrag(int x, int y);
-  void handleAddPlaylistTouchTap(int x, int y);
   void handleSettingsTouchTap(int x, int y);
   void handleParentalTouchTap(int x, int y);
   void handleSecondaryTouchDrag(int x, int y);
   void handlePlayerTouchTap(int x, int y);
   void handlePlayerTouchDrag(int x, int y);
   void handleDashboard(Button button);
-  void handleAddPlaylist(Button button);
   void handleParental(Button button);
 
   bool touchActive_ = false;

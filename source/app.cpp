@@ -176,6 +176,7 @@ struct SettingsSectionDef {
 
 const std::vector<SettingsSectionDef> &settingsSections() {
   static const std::vector<SettingsSectionDef> sections = {
+    {"playlist", "Playlists", "Choose the active list or add a new source.", {}},
     {"player-play", "Playback", "How the console behaves while a channel or movie is playing.", {1, 2, 3, 4}},
     {"calendar", "TV guide", "Programme times and how long guide data is kept.", {0, 7}},
     {"shield-lock", "Parental control", "Hide categories or require a PIN to open them.", {5}},
@@ -196,6 +197,22 @@ const Color kSetRow = rgb(14, 24, 48);
 const Color kSetRowFocus = rgb(16, 40, 74);
 const Color kSetSelected = rgb(15, 42, 77);
 const Color kSetSelectedBorder = rgb(30, 95, 148);
+// Section indexes in settingsSections().
+constexpr int kSectionPlaylists = 0;
+constexpr int kSectionParental = 3;
+constexpr int kSectionAbout = 6;
+// Option ids beyond the fixed settings (0-8) used by the Playlists section.
+constexpr int kOptionAddM3u = 90;
+constexpr int kOptionAddXtream = 91;
+constexpr int kOptionPlaylistBase = 100;  // + playlist index
+constexpr int kSettingsVisibleRows = 4;
+constexpr long long kDeleteConfirmMs = 3000;
+
+bool settingsOptionActs(int option) {
+  // Rows activated with A (open a screen, add or activate) rather than changed with Left/Right.
+  return option == 5 || option >= kOptionAddM3u;
+}
+
 constexpr int kSettingsNavX = 48;
 constexpr int kSettingsNavY = 92;
 constexpr int kSettingsNavW = 296;
@@ -1779,7 +1796,8 @@ void App::handleTouchTap(int x, int y) {
       break;
     case ScreenId::AddPlaylist:
     case ScreenId::Playlists:
-      handleAddPlaylistTouchTap(x, y);
+      // Legacy playlist screens now live in Settings > Playlists.
+      openSettingsScreen(kSectionPlaylists, true);
       break;
     case ScreenId::Settings:
       handleSettingsTouchTap(x, y);
@@ -1947,29 +1965,6 @@ void App::handleDashboardTouchDrag(int x, int y) {
   (void)x;
 }
 
-void App::handleAddPlaylistTouchTap(int x, int y) {
-  if (x < 80 || x >= 1012) {
-    return;
-  }
-
-  const int playlistCount = static_cast<int>(state_.config.playlists.size());
-  const int totalOptions = playlistCount + 4;
-  const int start = windowStart(state_.selectedAddOption, totalOptions, 6);
-  for (int row = 0; row < 6; ++row) {
-    const int top = 202 + row * 66;
-    const int index = start + row;
-    if (index < totalOptions && y >= top && y < top + 62) {
-      state_.selectedAddOption = index;
-      handleAddPlaylist(Button::Select);
-      return;
-    }
-  }
-
-  if (y >= 620 && y < 710) {
-    handleAddPlaylist(Button::Back);
-  }
-}
-
 void App::handleSettingsTouchTap(int x, int y) {
   if (y >= kSettingsFooterY) {
     handle(Button::Back);
@@ -1990,15 +1985,22 @@ void App::handleSettingsTouchTap(int x, int y) {
     return;
   }
 
-  const std::vector<int> &options = sections[static_cast<std::size_t>(std::clamp(state_.settingsSection, 0, count - 1))].options;
-  for (std::size_t j = 0; j < options.size(); ++j) {
-    const int top = kSettingsRowsY + static_cast<int>(j) * kSettingsRowPitch;
+  const std::vector<int> options = settingsSectionOptions(std::clamp(state_.settingsSection, 0, count - 1));
+  const int optionCount = static_cast<int>(options.size());
+  int focusedPosition = 0;
+  for (int j = 0; j < optionCount; ++j) {
+    if (options[static_cast<std::size_t>(j)] == state_.selectedSettingsOption) focusedPosition = j;
+  }
+  const int firstRow = state_.settingsInSections ? 0 : windowStart(focusedPosition, optionCount, kSettingsVisibleRows);
+  for (int row = 0; row < kSettingsVisibleRows && firstRow + row < optionCount; ++row) {
+    const int top = kSettingsRowsY + row * kSettingsRowPitch;
     if (y < top || y >= top + kSettingsRowH || x < kSettingsInnerX || x >= kSettingsInnerRight) {
       continue;
     }
+    const int option = options[static_cast<std::size_t>(firstRow + row)];
     state_.settingsInSections = false;
-    state_.selectedSettingsOption = options[j];
-    if (options[j] == 5) {
+    state_.selectedSettingsOption = option;
+    if (settingsOptionActs(option) || option >= kOptionPlaylistBase) {
       handle(Button::Select);
     } else if (x >= kStepperLeftX - 8 && x < kStepperValueX) {
       handle(Button::Left);
@@ -2054,16 +2056,20 @@ void App::handleSecondaryTouchDrag(int x, int y) {
     return;
   }
 
+  const int direction = deltaY < 0 ? 1 : -1;
   if (state_.screen == ScreenId::Settings) {
-    return;  // Every settings section fits on screen; nothing to scroll.
+    // Dragging moves the focus through the section's options (the playlist list can be long).
+    const std::vector<int> options = settingsSectionOptions(state_.settingsSection);
+    auto position = std::find(options.begin(), options.end(), state_.selectedSettingsOption);
+    if (!state_.settingsInSections && position != options.end()) {
+      const int index = std::clamp(static_cast<int>(position - options.begin()) + direction, 0, static_cast<int>(options.size()) - 1);
+      state_.selectedSettingsOption = options[static_cast<std::size_t>(index)];
+    }
+    touchLastY_ = y;
+    return;
   }
 
-  const int direction = deltaY < 0 ? 1 : -1;
-  if (state_.screen == ScreenId::AddPlaylist || state_.screen == ScreenId::Playlists) {
-    const int count = static_cast<int>(state_.config.playlists.size()) + 4;
-    state_.selectedAddOption = std::clamp(state_.selectedAddOption + direction, 0, std::max(0, count - 1));
-    touchLastY_ = y;
-  } else if (state_.screen == ScreenId::Parental) {
+  if (state_.screen == ScreenId::Parental) {
     const std::vector<StreamType> streamTypes{
       StreamType::Live,
       StreamType::Movies,
@@ -2172,7 +2178,7 @@ void App::handle(Button button) {
 
   switch (state_.screen) {
     case ScreenId::Dashboard: handleDashboard(button); break;
-    case ScreenId::AddPlaylist: handleAddPlaylist(button); break;
+    case ScreenId::AddPlaylist: openSettingsScreen(kSectionPlaylists, true); break;
     case ScreenId::Parental: handleParental(button); break;
     case ScreenId::Player: {
       const long long now = nowMs();
@@ -2258,7 +2264,7 @@ void App::handle(Button button) {
       const auto &sections = settingsSections();
       const int sectionCount = static_cast<int>(sections.size());
       state_.settingsSection = std::clamp(state_.settingsSection, 0, sectionCount - 1);
-      const std::vector<int> &options = sections[static_cast<std::size_t>(state_.settingsSection)].options;
+      const std::vector<int> options = settingsSectionOptions(state_.settingsSection);
 
       if (state_.settingsInSections) {
         if (button == Button::Back) {
@@ -2296,9 +2302,43 @@ void App::handle(Button button) {
         if (position + 1 != options.end()) state_.selectedSettingsOption = *(position + 1);
         break;
       }
-      // A row that opens another screen has no value to change: LEFT returns to the sections.
-      if (state_.selectedSettingsOption == 5 && button == Button::Left) {
+      // Rows activated with A have no value to change: LEFT returns to the sections.
+      if (settingsOptionActs(state_.selectedSettingsOption) && button == Button::Left) {
         state_.settingsInSections = true;
+        break;
+      }
+
+      if (state_.selectedSettingsOption >= kOptionPlaylistBase) {
+        const int index = state_.selectedSettingsOption - kOptionPlaylistBase;
+        if (button == Button::Select) {
+          state_.pendingDeletePlaylist = -1;
+          activatePlaylist(index);
+        } else if (button == Button::Favorite) {
+          // Deleting needs a second X within a few seconds.
+          const long long now = nowMs();
+          if (state_.pendingDeletePlaylist == index && now - state_.pendingDeleteAtMs <= kDeleteConfirmMs) {
+            state_.pendingDeletePlaylist = -1;
+            deletePlaylist(index);
+            const int remaining = static_cast<int>(state_.config.playlists.size());
+            state_.selectedSettingsOption = remaining > 0
+              ? kOptionPlaylistBase + std::min(index, remaining - 1)
+              : kOptionAddM3u;
+          } else if (index >= 0 && index < static_cast<int>(state_.config.playlists.size())) {
+            state_.pendingDeletePlaylist = index;
+            state_.pendingDeleteAtMs = now;
+            state_.message = "Press X again to delete " + state_.config.playlists[static_cast<std::size_t>(index)].name;
+          }
+        }
+        break;
+      }
+      if (state_.selectedSettingsOption == kOptionAddM3u || state_.selectedSettingsOption == kOptionAddXtream) {
+        if (button == Button::Select) {
+          if (state_.selectedSettingsOption == kOptionAddM3u) {
+            addM3uPlaylist();
+          } else {
+            addXtreamPlaylist();
+          }
+        }
         break;
       }
 
@@ -2396,7 +2436,7 @@ void App::handle(Button button) {
       break;
     }
     case ScreenId::Playlists:
-      state_.screen = ScreenId::AddPlaylist;
+      openSettingsScreen(kSectionPlaylists, true);
       break;
   }
   normalizeIndexes();
@@ -2404,7 +2444,7 @@ void App::handle(Button button) {
 
 void App::handleDashboard(Button button) {
   if (button == Button::Menu) {
-    state_.screen = ScreenId::AddPlaylist;
+    openSettingsScreen(kSectionPlaylists, false);
     return;
   }
 
@@ -2655,7 +2695,7 @@ void App::handleDashboard(Button button) {
 
     if (button == Button::Select) {
       if (state_.focus == FocusColumn::Playlist) {
-        state_.screen = ScreenId::AddPlaylist;
+        openSettingsScreen(kSectionPlaylists, true);
         return;
       }
 
@@ -2912,7 +2952,7 @@ void App::handleDashboard(Button button) {
 
   if (button == Button::Select) {
     if (state_.focus == FocusColumn::Playlist) {
-      state_.screen = ScreenId::AddPlaylist;
+      openSettingsScreen(kSectionPlaylists, true);
       return;
     }
 
@@ -2942,69 +2982,6 @@ void App::handleDashboard(Button button) {
   }
 }
 
-void App::handleAddPlaylist(Button button) {
-  const int playlistCount = static_cast<int>(state_.config.playlists.size());
-  const int addM3uIndex = playlistCount;
-  const int addXtreamIndex = playlistCount + 1;
-  const int settingsIndex = playlistCount + 2;
-  const int backIndex = playlistCount + 3;
-  const int maxIndex = backIndex;
-
-  if (button == Button::Back) {
-    state_.screen = ScreenId::Dashboard;
-    return;
-  }
-
-  if (button == Button::Up) {
-    state_.selectedAddOption--;
-  } else if (button == Button::Down) {
-    state_.selectedAddOption++;
-  }
-
-  if (state_.selectedAddOption < 0) {
-    state_.selectedAddOption = 0;
-  }
-
-  if (state_.selectedAddOption > maxIndex) {
-    state_.selectedAddOption = maxIndex;
-  }
-
-  if (button == Button::Favorite) {
-    if (state_.selectedAddOption < playlistCount) {
-      deletePlaylist(state_.selectedAddOption);
-    }
-    return;
-  }
-
-  if (button == Button::Select) {
-    if (state_.selectedAddOption < playlistCount) {
-      activatePlaylist(state_.selectedAddOption);
-      return;
-    }
-
-
-    if (state_.selectedAddOption == addM3uIndex) {
-      addM3uPlaylist();
-      return;
-    }
-
-    if (state_.selectedAddOption == addXtreamIndex) {
-      addXtreamPlaylist();
-      return;
-    }
-
-    if (state_.selectedAddOption == settingsIndex) {
-      openSettingsScreen();
-      return;
-    }
-
-    if (state_.selectedAddOption == backIndex) {
-      state_.screen = ScreenId::Dashboard;
-      return;
-    }
-  }
-}
-
 void App::handleParental(Button button) {
   const std::vector<StreamType> streamTypes{
     StreamType::Live,
@@ -3015,7 +2992,7 @@ void App::handleParental(Button button) {
 
   if (button == Button::Back) {
     state_.screen = ScreenId::Settings;
-    state_.settingsSection = 2;
+    state_.settingsSection = kSectionParental;
     state_.settingsInSections = false;
     state_.selectedSettingsOption = 5;
     return;
@@ -3363,7 +3340,7 @@ void App::updatePlaylistLoad() {
   if (!success) {
     state_.hasManifest = false;
     resetLoadedChannels();
-    state_.screen = ScreenId::AddPlaylist;
+    openSettingsScreen(kSectionPlaylists, true);
     state_.message = "Failed to load stream data. Check the playlist info and add it again.";
 
     if (!error.empty()) {
@@ -6171,11 +6148,11 @@ void App::render() {
 
   switch (state_.screen) {
     case ScreenId::Dashboard: renderDashboardGraphic(); break;
-    case ScreenId::AddPlaylist: renderAddPlaylistGraphic(); break;
+    case ScreenId::AddPlaylist: renderSettingsGraphic(); break;
     case ScreenId::Player: renderPlayerGraphic(); break;
     case ScreenId::Settings: renderSettingsGraphic(); break;
     case ScreenId::Parental: renderParentalGraphic(); break;
-    case ScreenId::Playlists: renderAddPlaylistGraphic(); break;
+    case ScreenId::Playlists: renderSettingsGraphic(); break;
   }
 
   if (state_.screen == ScreenId::Player && player_ && player_->nativeVideoActive()) {
@@ -6832,100 +6809,6 @@ void App::renderLoadingOverlay(const std::string &message) {
   gfx_.drawText("Please wait", cx - 56, cy + 56, 1, muted, false);
 }
 
-void App::renderAddPlaylistGraphic() {
-  const Color text = rgb(248, 250, 252);
-  const Color muted = rgb(166, 178, 207);
-  const Color blue = rgb(37, 99, 235);
-  const Color brightBlue = rgb(0, 191, 255);
-  const Color panel = rgba(17, 24, 39, 225);
-
-  gfx_.drawImageFileCentered(
-    "romfs:/logo/logo-horizontal.png",
-    34,
-    35,
-    320,
-    76
-  );
-
-  gfx_.drawText("PLAYLISTS", 64, 124, 5, muted, true);
-  gfx_.drawText("Select a saved list or add a new source", 64, 166, 2, muted, false);
-
-  const int playlistCount = static_cast<int>(state_.config.playlists.size());
-  const int addM3uIndex = playlistCount;
-  const int addXtreamIndex = playlistCount + 1;
-  const int settingsIndex = playlistCount + 2;
-  const int backIndex = playlistCount + 3;
-  const int totalOptions = playlistCount + 4;
-
-  const int rows = 6;
-  const int start = windowStart(state_.selectedAddOption, totalOptions, rows);
-
-  for (int i = 0; i < rows; ++i) {
-    const int optionIndex = start + i;
-
-    if (optionIndex >= totalOptions) {
-      break;
-    }
-
-    const int y = 210 + i * 66;
-    const bool selected = optionIndex == state_.selectedAddOption;
-
-    gfx_.fillRoundRect(
-      96,
-      y,
-      900,
-      54,
-      14,
-      selected ? rgba(37, 99, 235, 225) : panel
-    );
-
-    gfx_.strokeRoundRect(
-      96,
-      y,
-      900,
-      54,
-      14,
-      selected ? brightBlue : rgba(72, 92, 128, 30),
-      selected ? 3 : 1
-    );
-
-    std::string title;
-    std::string subtitle;
-
-    if (optionIndex < playlistCount) {
-      const PlaylistConfig &playlist = state_.config.playlists[static_cast<std::size_t>(optionIndex)];
-      const bool active = playlist.id == state_.config.activePlaylistId;
-
-      title = (active ? "* " : "  ") + playlist.name;
-      subtitle =
-        std::string(active ? "ACTIVE • " : "") +
-        (playlist.provider == Provider::Xtream ? "XTREAM" : "M3U");
-    } else if (optionIndex == addM3uIndex) {
-      title = "+ ADD M3U URL";
-      subtitle = "Add a playlist using an M3U link";
-    } else if (optionIndex == addXtreamIndex) {
-      title = "+ ADD XTREAM";
-      subtitle = "Add server, username and password";
-    } else if (optionIndex == settingsIndex) {
-      title = "ABOUT / SETTINGS";
-      subtitle = "Disclaimer, credits and app information";
-    } else {
-      title = "BACK";
-      subtitle = "Return to dashboard";
-    }
-
-    gfx_.drawText(Graphics::fitText(title, 36), 134, y + 11, 3, text, true);
-    gfx_.drawText(Graphics::fitText(subtitle, 60), 134, y + 34, 1, selected ? text : muted, false);
-  }
-
-  gfx_.drawText("TOUCH A ROW TO OPEN    DRAG TO SCROLL    X DELETE    B BACK", 96, 632, 2, muted, true);
-  gfx_.drawText(Graphics::fitText(state_.message, 86), 96, 666, 2, rgb(0, 145, 255), false);
-
-  if (state_.loading) {
-    renderLoadingOverlay(state_.loadingMessage.empty() ? "Loading" : state_.loadingMessage);
-  }
-}
-
 void App::renderPlayerGraphic() {
   const Channel *channel = state_.hasPlaybackChannel ? &state_.playbackChannel : selectedChannelPtr();
 
@@ -7332,7 +7215,7 @@ void App::renderParentalGraphic() {
   const std::vector<Category> categories = parentalCategoriesForType(activeType);
   state_.selectedParentalCategory = std::clamp(state_.selectedParentalCategory, 0, std::max(0, static_cast<int>(categories.size()) - 1));
 
-  renderSettingsShell(2, false);
+  renderSettingsShell(kSectionParental, false);
 
   gfx_.drawTextSize("Parental control", kSettingsInnerX, 116, 24, kSetText, true);
   gfx_.drawTextSize("Hide categories or require the PIN to open them.", kSettingsInnerX, 152, 15, kSetMuted, false);
@@ -7432,12 +7315,37 @@ void App::renderParentalGraphic() {
   );
 }
 
-void App::openSettingsScreen() {
+void App::openSettingsScreen(int section, bool focusOptions) {
   state_.screen = ScreenId::Settings;
-  state_.settingsSection = 0;
-  state_.settingsInSections = true;
-  state_.selectedSettingsOption = settingsSections().front().options.front();
+  state_.settingsSection = section;
   state_.settingsScroll = 0;
+  state_.pendingDeletePlaylist = -1;
+  const std::vector<int> options = settingsSectionOptions(section);
+  state_.settingsInSections = !focusOptions || options.empty();
+  state_.selectedSettingsOption = options.empty() ? 0 : options.front();
+  if (section == kSectionPlaylists) {
+    // Start on the active playlist.
+    for (std::size_t i = 0; i < state_.config.playlists.size(); ++i) {
+      if (state_.config.playlists[i].id == state_.config.activePlaylistId) {
+        state_.selectedSettingsOption = kOptionPlaylistBase + static_cast<int>(i);
+      }
+    }
+  }
+}
+
+std::vector<int> App::settingsSectionOptions(int section) const {
+  if (section == kSectionPlaylists) {
+    std::vector<int> options;
+    for (std::size_t i = 0; i < state_.config.playlists.size(); ++i) {
+      options.push_back(kOptionPlaylistBase + static_cast<int>(i));
+    }
+    options.push_back(kOptionAddM3u);
+    options.push_back(kOptionAddXtream);
+    return options;
+  }
+  const auto &sections = settingsSections();
+  if (section < 0 || section >= static_cast<int>(sections.size())) return {};
+  return sections[static_cast<std::size_t>(section)].options;
 }
 
 // Background, header, section list and the empty content panel shared by Settings and Parental.
@@ -7546,11 +7454,27 @@ void App::renderSettingsGraphic() {
         formatHoursOption(state_.config.epgRefreshHours), false};
       case 8: return {"language", "Interface language", "More languages are being prepared.",
         languageLabel(state_.config.uiLanguage), false};
-      default: return {"info-circle", "", "", "", false};
+      case kOptionAddM3u: return {"plus", "Add M3U playlist", "Type or paste an M3U link with the Switch keyboard.", "", true};
+      case kOptionAddXtream: return {"plus", "Add Xtream account", "Server, username and password from your provider.", "", true};
+      default:
+        if (option >= kOptionPlaylistBase) {
+          const std::size_t index = static_cast<std::size_t>(option - kOptionPlaylistBase);
+          if (index < state_.config.playlists.size()) {
+            const PlaylistConfig &item = state_.config.playlists[index];
+            const bool active = item.id == state_.config.activePlaylistId;
+            const std::string kind = item.provider == Provider::Xtream ? "Xtream account" : "M3U playlist";
+            const bool deletePending = state_.pendingDeletePlaylist == static_cast<int>(index) &&
+              nowMs() - state_.pendingDeleteAtMs <= kDeleteConfirmMs;
+            return {"playlist", item.name,
+              deletePending ? "Press X again to delete this playlist." : kind,
+              active ? "Active" : "", false};
+          }
+        }
+        return {"info-circle", "", "", "", false};
     }
   };
 
-  if (section.options.empty()) {
+  if (state_.settingsSection == kSectionAbout) {
     int y = 172;
     gfx_.drawTextSize("Kbore is an IPTV and VOD player for user-provided playlists.", kSettingsInnerX, y, 17, kSetSoft, false); y += 32;
     gfx_.drawTextSize("It does not provide playlists, channels, movies, series or servers.", kSettingsInnerX, y, 17, kSetSoft, false); y += 32;
@@ -7561,12 +7485,20 @@ void App::renderSettingsGraphic() {
     gfx_.drawTextSize("Config file: " + Graphics::fitText(configPath(), 70), kSettingsInnerX, y, 13, kSetMuted, false);
   }
 
-  for (std::size_t j = 0; j < section.options.size(); ++j) {
-    const int option = section.options[j];
+  const std::vector<int> options = settingsSectionOptions(state_.settingsSection);
+  const int optionCount = static_cast<int>(options.size());
+  int focusedPosition = 0;
+  for (int j = 0; j < optionCount; ++j) {
+    if (options[static_cast<std::size_t>(j)] == state_.selectedSettingsOption) focusedPosition = j;
+  }
+  const int firstRow = state_.settingsInSections ? 0 : windowStart(focusedPosition, optionCount, kSettingsVisibleRows);
+
+  for (int row = 0; row < kSettingsVisibleRows && firstRow + row < optionCount; ++row) {
+    const int option = options[static_cast<std::size_t>(firstRow + row)];
     const OptionView view = optionView(option);
     const bool focused = !state_.settingsInSections && state_.selectedSettingsOption == option;
     const int x = kSettingsInnerX;
-    const int y = kSettingsRowsY + static_cast<int>(j) * kSettingsRowPitch;
+    const int y = kSettingsRowsY + row * kSettingsRowPitch;
     const int w = kSettingsInnerRight - kSettingsInnerX;
 
     if (focused) {
@@ -7580,9 +7512,22 @@ void App::renderSettingsGraphic() {
     gfx_.fillRoundRect(x + 18, y + 19, 46, 46, 13, focused ? rgb(15, 60, 102) : rgb(20, 32, 57));
     gfx_.drawIcon(view.icon, x + 29, y + 30, 24, focused ? rgb(127, 219, 255) : rgb(159, 179, 217));
     gfx_.drawTextSize(view.title, x + 80, y + 15, 18, kSetText, focused);
-    gfx_.drawTextSize(Graphics::fitText(view.description, 64), x + 80, y + 44, 14, focused ? rgb(185, 198, 224) : kSetMuted, false);
+    const bool deleteWarning = option >= kOptionPlaylistBase &&
+      state_.pendingDeletePlaylist == option - kOptionPlaylistBase &&
+      nowMs() - state_.pendingDeleteAtMs <= kDeleteConfirmMs;
+    gfx_.drawTextSize(Graphics::fitText(view.description, 64), x + 80, y + 44, 14,
+      deleteWarning ? rgb(253, 186, 116) : (focused ? rgb(185, 198, 224) : kSetMuted), deleteWarning);
 
-    if (view.opensScreen) {
+    if (option >= kOptionPlaylistBase) {
+      if (view.value == "Active") {
+        // Active playlist chip.
+        const int chipW = 112;
+        const int chipX = kSettingsInnerRight - 18 - chipW;
+        gfx_.fillRoundRect(chipX, y + 25, chipW, 34, 17, rgb(14, 58, 52));
+        gfx_.drawIcon("circle-check", chipX + 14, y + 33, 18, rgb(110, 231, 183));
+        gfx_.drawTextSize("Active", chipX + 39, y + 32, 14, rgb(110, 231, 183), true);
+      }
+    } else if (view.opensScreen) {
       const int valueW = gfx_.textWidthSize(view.value, 16, false);
       gfx_.drawTextSize(view.value, kSettingsInnerRight - 54 - valueW, y + 31, 16, kSetMuted, false);
       gfx_.drawIcon("chevron-right", kSettingsInnerRight - 46, y + 28, 28, focused ? kSetText : rgb(159, 179, 217));
@@ -7601,11 +7546,22 @@ void App::renderSettingsGraphic() {
     }
   }
 
+  if (optionCount > kSettingsVisibleRows) {
+    const int trackX = kSettingsContentX + kSettingsContentW - 14;
+    const int trackH = kSettingsVisibleRows * kSettingsRowPitch - (kSettingsRowPitch - kSettingsRowH);
+    const int thumbH = std::max(24, trackH * kSettingsVisibleRows / optionCount);
+    const int thumbY = kSettingsRowsY + (trackH - thumbH) * firstRow / std::max(1, optionCount - kSettingsVisibleRows);
+    gfx_.fillRoundRect(trackX, kSettingsRowsY, 4, trackH, 2, rgb(22, 33, 58));
+    gfx_.fillRoundRect(trackX, thumbY, 4, thumbH, 2, rgb(59, 76, 112));
+  }
+
   if (state_.settingsInSections) {
-    renderFooterHints(section.options.empty()
+    renderFooterHints(options.empty()
       ? std::vector<std::pair<std::string, std::string>>{{"B", "Back"}}
       : std::vector<std::pair<std::string, std::string>>{{"A", "Open"}, {"B", "Back"}});
-  } else if (state_.selectedSettingsOption == 5) {
+  } else if (state_.selectedSettingsOption >= kOptionPlaylistBase) {
+    renderFooterHints({{"A", "Use this list"}, {"X", "Delete"}, {"B", "Back"}});
+  } else if (settingsOptionActs(state_.selectedSettingsOption)) {
     renderFooterHints({{"A", "Open"}, {"B", "Back"}});
   } else {
     renderFooterHints({{"LR", "Change"}, {"Y", "Default"}, {"B", "Back"}});
