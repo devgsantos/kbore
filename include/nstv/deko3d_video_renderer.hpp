@@ -20,6 +20,7 @@ public:
   void setOverlayProgress(int64_t positionMs, int64_t durationMs, bool visible) override;
 
 #ifdef NSTV_USE_FFMPEG
+  void releaseImportedFrames() override;
   bool canRender(const AVFrame *frame) const override;
   bool renderFrame(const AVFrame *frame) override;
 #endif

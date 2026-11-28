@@ -656,6 +656,27 @@ bool Deko3dVideoRenderer::initialize() {
 #endif
 }
 
+void Deko3dVideoRenderer::releaseImportedFrames() {
+#ifdef __SWITCH__
+  if (!switchState_) {
+    return;
+  }
+
+  if (switchState_->queue) {
+    switchState_->queue.waitIdle();
+  }
+  switchState_->waitForInFlightFrames();
+
+  for (auto &item : switchState_->externalFrameMems) {
+    if (item.mem) {
+      item.mem.destroy();
+    }
+  }
+  switchState_->externalFrameMems.clear();
+  logLine("[KBORE][DEKO3D] released imported decoder frames");
+#endif
+}
+
 void Deko3dVideoRenderer::shutdown() {
 #ifdef __SWITCH__
   if (switchState_) {

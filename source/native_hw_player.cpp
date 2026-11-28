@@ -1319,6 +1319,12 @@ bool NativeHwPlayerBackend::seekToMs(int64_t positionMs) {
     return false;
   }
 
+  // The renderer imports the decoder's frame buffers directly into the GPU. Flushing the hardware
+  // decoder can free or reuse those buffers, so make the GPU let go of them first; skipping this
+  // crashed nvservices (Atmosphere crash report, whole system down) when seeking.
+  if (nativeRenderer_) {
+    nativeRenderer_->releaseImportedFrames();
+  }
   decoder_.flushForSeek();
   yuvFrame_ = YuvFrame{};
   nativeFramePresented_ = false;

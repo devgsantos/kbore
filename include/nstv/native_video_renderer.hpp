@@ -34,6 +34,12 @@ public:
   }
 
 #ifdef NSTV_USE_FFMPEG
+  // Waits for the GPU to finish with every decoder frame it imported and drops those imports.
+  // Must be called before the decoder flushes or frees its frame pool (e.g. on seek): imported
+  // memory blocks map the decoder's buffers directly, and a mapping left pointing at freed
+  // decoder memory makes nvservices abort, taking the whole system down.
+  virtual void releaseImportedFrames() {}
+
   virtual bool canRender(const AVFrame *frame) const = 0;
   virtual bool renderFrame(const AVFrame *frame) = 0;
 #endif
