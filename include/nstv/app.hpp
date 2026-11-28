@@ -12,6 +12,7 @@
 #include "nstv/video_player.hpp"
 #include <atomic>
 #include <condition_variable>
+#include <array>
 #include <deque>
 #include <map>
 #include <mutex>
@@ -408,6 +409,17 @@ private:
   int streamProbeAttempt_ = 0;
   long long streamProbeRetryAtMs_ = 0;
   static constexpr int kStreamProbeMaxAttempts = 2;
+
+  // Memo for filteredNodeChildren() when parental "hidden" rules exist (UI thread only).
+  struct FilteredChildrenCache {
+    const MediaNode *parent = nullptr;
+    const MediaNode *firstChild = nullptr;  // detects the children vector being reallocated
+    std::size_t size = 0;
+    std::string signature;                  // hidden rule keys + manifest id
+    std::vector<const MediaNode *> result;
+  };
+  mutable std::array<FilteredChildrenCache, 2> filteredChildrenCache_;
+  mutable std::size_t filteredChildrenCacheNext_ = 0;
 
   std::thread nodeLoadWorker_;
   std::mutex nodeLoadMutex_;

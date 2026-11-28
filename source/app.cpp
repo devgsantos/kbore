@@ -5029,49 +5029,21 @@ const MediaNode *App::selectedCurrentNode() const {
 }
 
 MediaNode *App::selectedCurrentNode() {
-  MediaNode *parent = currentNodeParent();
-
-  if (!parent || parent->children.empty()) {
+  const std::vector<const MediaNode *> visible = filteredNodeChildren(currentNodeParent());
+  if (visible.empty()) {
     return nullptr;
   }
 
-  std::vector<int> visibleIndexes;
-  for (int i = 0; i < static_cast<int>(parent->children.size()); ++i) {
-    if (!isParentalHidden(parentalKeyForNode(parent->children[static_cast<std::size_t>(i)]))) {
-      visibleIndexes.push_back(i);
-    }
-  }
-
-  if (visibleIndexes.empty()) {
-    return nullptr;
-  }
-
-  int index = std::clamp(
-    state_.selectedCategory,
-    0,
-    std::max(0, static_cast<int>(visibleIndexes.size()) - 1)
-  );
-
-  return &parent->children[static_cast<std::size_t>(visibleIndexes[static_cast<std::size_t>(index)])];
+  const int index = std::clamp(state_.selectedCategory, 0, static_cast<int>(visible.size()) - 1);
+  // The tree is owned (non-const) by this App; filteredNodeChildren only hands out const views.
+  return const_cast<MediaNode *>(visible[static_cast<std::size_t>(index)]);
 }
 
 std::vector<const MediaNode *> App::previewNodeChildren() const {
   std::vector<const MediaNode *> nodes;
 
   if (currentNodeChildrenAreItems()) {
-    const MediaNode *parent = currentNodeParent();
-
-    if (!parent) {
-      return nodes;
-    }
-
-    for (const auto &child : parent->children) {
-      if (!isParentalHidden(parentalKeyForNode(child))) {
-        nodes.push_back(&child);
-      }
-    }
-
-    return nodes;
+    return filteredNodeChildren(currentNodeParent());
   }
 
   const MediaNode *selected = selectedCurrentNode();
@@ -5081,12 +5053,7 @@ std::vector<const MediaNode *> App::previewNodeChildren() const {
   }
 
   if (!selected->children.empty()) {
-    for (const auto &child : selected->children) {
-      if (!isParentalHidden(parentalKeyForNode(child))) {
-        nodes.push_back(&child);
-      }
-    }
-    return nodes;
+    return filteredNodeChildren(selected);
   }
 
   if ((selected->playable || !selected->url.empty()) && !isParentalHidden(parentalKeyForNode(*selected))) {
@@ -5136,24 +5103,13 @@ MediaNode *App::selectedPreviewNode() {
   }
 
   if (!selected->children.empty()) {
-    std::vector<int> visibleIndexes;
-    for (int i = 0; i < static_cast<int>(selected->children.size()); ++i) {
-      if (!isParentalHidden(parentalKeyForNode(selected->children[static_cast<std::size_t>(i)]))) {
-        visibleIndexes.push_back(i);
-      }
-    }
-
-    if (visibleIndexes.empty()) {
+    const std::vector<const MediaNode *> visible = filteredNodeChildren(selected);
+    if (visible.empty()) {
       return nullptr;
     }
 
-    int index = std::clamp(
-      state_.selectedChannel,
-      0,
-      std::max(0, static_cast<int>(visibleIndexes.size()) - 1)
-    );
-
-    return &selected->children[static_cast<std::size_t>(visibleIndexes[static_cast<std::size_t>(index)])];
+    const int index = std::clamp(state_.selectedChannel, 0, static_cast<int>(visible.size()) - 1);
+    return const_cast<MediaNode *>(visible[static_cast<std::size_t>(index)]);
   }
 
   if (selected->playable || !selected->url.empty()) {
@@ -5255,10 +5211,38 @@ void App::changeParentalPin() {
   state_.message = "Parental PIN changed";
 }
 
+// Called several times per frame and per key press. Building a parental key string for every
+// child made large folders (10k items) lag on every move, so: skip keys entirely when no "hidden"
+// rule exists, and otherwise reuse the last result until the folder or the rules change.
 std::vector<const MediaNode *> App::filteredNodeChildren(const MediaNode *parent) const {
   std::vector<const MediaNode *> nodes;
   if (!parent) {
     return nodes;
+  }
+
+  std::string hiddenSignature;
+  for (const auto &rule : state_.config.parentalRules) {
+    if (rule.second == ParentalRule::Hidden) {
+      hiddenSignature += rule.first;
+      hiddenSignature.push_back('\x1f');
+    }
+  }
+
+  nodes.reserve(parent->children.size());
+  if (hiddenSignature.empty()) {
+    for (const auto &child : parent->children) {
+      nodes.push_back(&child);
+    }
+    return nodes;
+  }
+
+  hiddenSignature += state_.manifest.id;
+  const MediaNode *firstChild = parent->children.empty() ? nullptr : &parent->children.front();
+  for (const FilteredChildrenCache &entry : filteredChildrenCache_) {
+    if (entry.parent == parent && entry.firstChild == firstChild &&
+        entry.size == parent->children.size() && entry.signature == hiddenSignature) {
+      return entry.result;
+    }
   }
 
   for (const auto &child : parent->children) {
@@ -5267,6 +5251,14 @@ std::vector<const MediaNode *> App::filteredNodeChildren(const MediaNode *parent
     }
   }
 
+  // Two entries: the current folder and the preview column alternate every frame.
+  FilteredChildrenCache &slot = filteredChildrenCache_[filteredChildrenCacheNext_];
+  filteredChildrenCacheNext_ = (filteredChildrenCacheNext_ + 1) % filteredChildrenCache_.size();
+  slot.parent = parent;
+  slot.firstChild = firstChild;
+  slot.size = parent->children.size();
+  slot.signature = std::move(hiddenSignature);
+  slot.result = nodes;
   return nodes;
 }
 
@@ -6090,6 +6082,7 @@ void App::renderDashboardGraphic() {
 
   auto types = visibleTypes();
   std::vector<Category> categories;
+  bool categoriesFromNodes = false;  // rows come from nodeChildren instead of `categories`
   const TypeGroup *type = selectedTypeGroup();
 
   std::vector<const MediaNode *> nodeChildren;
@@ -6115,18 +6108,9 @@ void App::renderDashboardGraphic() {
         categories.push_back(category);
       }
     } else {
-      for (const MediaNode *node : nodeChildren) {
-        if (!node) {
-          continue;
-        }
-
-        Category category;
-        category.id = node->id;
-        category.name = node->title.empty() ? node->name : node->title;
-        category.totalChannels = nodeCount(*node);
-        category.type = streamTypeFromString(node->type);
-        categories.push_back(category);
-      }
+      // Folders: rows are built on demand for the visible window only (see categoryAt below).
+      // Building a Category (string copies) for every child each frame lagged 10k-item folders.
+      categoriesFromNodes = true;
     }
 
     const MediaNode *previewNode = selectedPreviewNode();
@@ -6370,12 +6354,26 @@ void App::renderDashboardGraphic() {
 
   // Categories: no side acronym/icon, smaller text -------------------------
   int catRows = 9;
-  int catStart = windowStart(state_.selectedCategory, (int)categories.size(), catRows);
+  const int categoryTotal = categoriesFromNodes ? static_cast<int>(nodeChildren.size()) : static_cast<int>(categories.size());
+  auto categoryAt = [&](int index) -> Category {
+    if (!categoriesFromNodes) {
+      return categories[static_cast<std::size_t>(index)];
+    }
+    Category category;
+    if (const MediaNode *node = nodeChildren[static_cast<std::size_t>(index)]) {
+      category.id = node->id;
+      category.name = node->title.empty() ? node->name : node->title;
+      category.totalChannels = nodeCount(*node);
+      category.type = streamTypeFromString(node->type);
+    }
+    return category;
+  };
+  int catStart = windowStart(state_.selectedCategory, categoryTotal, catRows);
   for (int i=0; i<catRows; ++i) {
     int index = catStart + i;
     int y = categoriesPanel.y + 68 + i * 42;
-    if (index >= (int)categories.size()) break;
-    const auto &c = categories[index];
+    if (index >= categoryTotal) break;
+    const Category c = categoryAt(index);
     bool selected = index == state_.selectedCategory;
     gfx_.fillRoundRect(categoriesPanel.x + 14, y, categoriesPanel.w - 30, 36, 10, selected ? rgba(18,45,94,230) : rgba(15,23,42,180));
     gfx_.strokeRoundRect(categoriesPanel.x + 14, y, categoriesPanel.w - 30, 36, 10, selected ? brightBlue : rgba(72,92,128,24), selected ? 2 : 1);
