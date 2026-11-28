@@ -166,6 +166,99 @@ bool isNetworkStreamUrl(const std::string &url) {
   return startsWith("http://") || startsWith("https://");
 }
 
+// ---- Settings layout (shared by rendering and touch) ----------------------------------------
+struct SettingsSectionDef {
+  const char *icon;
+  const char *title;
+  const char *subtitle;
+  std::vector<int> options;  // indexes handled by App::handle() for ScreenId::Settings
+};
+
+const std::vector<SettingsSectionDef> &settingsSections() {
+  static const std::vector<SettingsSectionDef> sections = {
+    {"player-play", "Playback", "How the console behaves while a channel or movie is playing.", {1, 2, 3, 4}},
+    {"calendar", "TV guide", "Programme times and how long guide data is kept.", {0, 7}},
+    {"shield-lock", "Parental control", "Hide categories or require a PIN to open them.", {5}},
+    {"refresh", "Updates", "How long playlists are served from cache before reloading.", {6}},
+    {"language", "Language", "Language used by the interface.", {8}},
+    {"info-circle", "About", "", {}},
+  };
+  return sections;
+}
+
+const Color kSetText = rgb(248, 250, 252);
+const Color kSetMuted = rgb(166, 178, 207);
+const Color kSetSoft = rgb(195, 205, 227);
+const Color kSetAccent = rgb(0, 191, 255);
+const Color kSetPanel = rgb(11, 18, 34);
+const Color kSetPanelBorder = rgb(24, 35, 59);
+const Color kSetRow = rgb(14, 24, 48);
+const Color kSetRowFocus = rgb(16, 40, 74);
+const Color kSetSelected = rgb(15, 42, 77);
+const Color kSetSelectedBorder = rgb(30, 95, 148);
+constexpr int kSettingsNavX = 48;
+constexpr int kSettingsNavY = 92;
+constexpr int kSettingsNavW = 296;
+constexpr int kSettingsPanelH = 552;
+constexpr int kSettingsNavItemH = 54;
+constexpr int kSettingsNavItemPitch = 60;
+constexpr int kSettingsContentX = 368;
+constexpr int kSettingsContentW = 864;
+constexpr int kSettingsInnerX = kSettingsContentX + 30;
+constexpr int kSettingsInnerRight = kSettingsContentX + kSettingsContentW - 30;
+constexpr int kSettingsRowsY = 190;
+constexpr int kSettingsRowH = 84;
+constexpr int kSettingsRowPitch = 94;
+constexpr int kSettingsFooterY = 644;
+constexpr int kStepperButton = 38;
+constexpr int kStepperValueW = 176;
+// Stepper geometry (absolute x), right-aligned inside the row.
+constexpr int kStepperRightX = kSettingsInnerRight - 18 - kStepperButton;
+constexpr int kStepperValueX = kStepperRightX - 6 - kStepperValueW;
+constexpr int kStepperLeftX = kStepperValueX - 6 - kStepperButton;
+
+int settingsNavItemY(int index, int count) {
+  // The last section (About) sits at the bottom of the list.
+  if (index == count - 1) {
+    return kSettingsNavY + kSettingsPanelH - 15 - kSettingsNavItemH;
+  }
+  return kSettingsNavY + 15 + index * kSettingsNavItemPitch;
+}
+
+// Parental screen geometry.
+constexpr int kParentalTabsY = 186;
+constexpr int kParentalTabH = 44;
+constexpr int kParentalRowsY = 250;
+constexpr int kParentalRowH = 58;
+constexpr int kParentalRowPitch = 66;
+constexpr int kParentalVisibleRows = 5;
+constexpr int kParentalPinX = kSettingsInnerRight - 178;
+constexpr int kParentalPinY = 112;
+constexpr int kParentalPinW = 178;
+constexpr int kParentalPinH = 42;
+
+const char *parentalTypeIcon(StreamType type) {
+  switch (type) {
+    case StreamType::Movies: return "movie";
+    case StreamType::Series: return "list-details";
+    case StreamType::Radio: return "radio";
+    default: return "device-tv";
+  }
+}
+
+const char *parentalTypeTitle(StreamType type) {
+  switch (type) {
+    case StreamType::Movies: return "Movies";
+    case StreamType::Series: return "Series";
+    case StreamType::Radio: return "Radio";
+    default: return "Live TV";
+  }
+}
+
+int parentalTabWidth(const Graphics &gfx, StreamType type) {
+  return 18 + 20 + 9 + gfx.textWidthSize(parentalTypeTitle(type), 16, true) + 18;
+}
+
 bool cacheFileFresh(const std::string &path, int refreshHours) {
   if (refreshHours <= 0) {
     return true;
@@ -1713,9 +1806,7 @@ void App::handleDashboardTouchTap(int x, int y) {
     return;
   }
   if (contains(1204, 10, 66, 66)) {
-    state_.screen = ScreenId::Settings;
-    state_.selectedSettingsOption = 0;
-    state_.settingsScroll = 0;
+    openSettingsScreen();
     return;
   }
 
@@ -1880,68 +1971,76 @@ void App::handleAddPlaylistTouchTap(int x, int y) {
 }
 
 void App::handleSettingsTouchTap(int x, int y) {
-  if (y >= 640) {
+  if (y >= kSettingsFooterY) {
     handle(Button::Back);
     return;
   }
-  if (x < 50 || x >= 1230 || y < 180 || y >= 632) {
+
+  const auto &sections = settingsSections();
+  const int count = static_cast<int>(sections.size());
+  if (x >= kSettingsNavX && x < kSettingsNavX + kSettingsNavW) {
+    for (int i = 0; i < count; ++i) {
+      const int top = settingsNavItemY(i, count);
+      if (y >= top && y < top + kSettingsNavItemH) {
+        state_.settingsSection = i;
+        state_.settingsInSections = true;
+        return;
+      }
+    }
     return;
   }
 
-  const int contentY = y + std::max(0, state_.settingsScroll);
-  if (contentY < 198) {
+  const std::vector<int> &options = sections[static_cast<std::size_t>(std::clamp(state_.settingsSection, 0, count - 1))].options;
+  for (std::size_t j = 0; j < options.size(); ++j) {
+    const int top = kSettingsRowsY + static_cast<int>(j) * kSettingsRowPitch;
+    if (y < top || y >= top + kSettingsRowH || x < kSettingsInnerX || x >= kSettingsInnerRight) {
+      continue;
+    }
+    state_.settingsInSections = false;
+    state_.selectedSettingsOption = options[j];
+    if (options[j] == 5) {
+      handle(Button::Select);
+    } else if (x >= kStepperLeftX - 8 && x < kStepperValueX) {
+      handle(Button::Left);
+    } else if (x >= kStepperRightX - 8) {
+      handle(Button::Right);
+    }
     return;
-  }
-  const int index = (contentY - 198) / 78;
-  if (index < 0 || index >= 9) {
-    return;
-  }
-
-  state_.selectedSettingsOption = index;
-  if (index == 5) {
-    handle(Button::Select);
-  } else {
-    handle(x < Graphics::Width / 2 ? Button::Left : Button::Right);
   }
 }
 
 void App::handleParentalTouchTap(int x, int y) {
-  if (y >= 640) {
-    if (x >= 850) {
-      handleParental(Button::FavoriteToggle);
-    } else {
-      handleParental(Button::Back);
-    }
+  if (y >= kSettingsFooterY) {
+    handleParental(Button::Back);
+    return;
+  }
+  if (x >= kParentalPinX && x < kParentalPinX + kParentalPinW && y >= kParentalPinY && y < kParentalPinY + kParentalPinH) {
+    handleParental(Button::FavoriteToggle);
     return;
   }
 
-  const int tabTop = 204;
-  if (y >= tabTop && y < tabTop + 52) {
-    for (int index = 0; index < 4; ++index) {
-      const int tabX = 92 + index * 184;
-      if (x >= tabX && x < tabX + 170) {
+  const std::vector<StreamType> streamTypes{StreamType::Live, StreamType::Movies, StreamType::Series, StreamType::Radio};
+  if (y >= kParentalTabsY && y < kParentalTabsY + kParentalTabH) {
+    int tabX = kSettingsInnerX;
+    for (int index = 0; index < static_cast<int>(streamTypes.size()); ++index) {
+      const int tabW = parentalTabWidth(gfx_, streamTypes[static_cast<std::size_t>(index)]);
+      if (x >= tabX && x < tabX + tabW) {
         state_.selectedParentalType = index;
         state_.selectedParentalCategory = 0;
         return;
       }
+      tabX += tabW + 10;
     }
+    return;
   }
 
-  const std::vector<StreamType> streamTypes{
-    StreamType::Live,
-    StreamType::Movies,
-    StreamType::Series,
-    StreamType::Radio
-  };
   const int typeIndex = std::clamp(state_.selectedParentalType, 0, 3);
-  const int categoryCount = static_cast<int>(parentalCategoriesForType(
-    streamTypes[static_cast<std::size_t>(typeIndex)]
-  ).size());
-  const int start = windowStart(state_.selectedParentalCategory, categoryCount, 8);
-  for (int row = 0; row < 8; ++row) {
-    const int top = 268 + row * 42;
+  const int categoryCount = static_cast<int>(parentalCategoriesForType(streamTypes[static_cast<std::size_t>(typeIndex)]).size());
+  const int start = windowStart(state_.selectedParentalCategory, categoryCount, kParentalVisibleRows);
+  for (int row = 0; row < kParentalVisibleRows; ++row) {
+    const int top = kParentalRowsY + row * kParentalRowPitch;
     const int index = start + row;
-    if (index < categoryCount && x >= 80 && x < 1200 && y >= top && y < top + 42) {
+    if (index < categoryCount && x >= kSettingsInnerX && x < kSettingsInnerRight && y >= top && y < top + kParentalRowH) {
       state_.selectedParentalCategory = index;
       handleParental(Button::Select);
       return;
@@ -1956,10 +2055,7 @@ void App::handleSecondaryTouchDrag(int x, int y) {
   }
 
   if (state_.screen == ScreenId::Settings) {
-    constexpr int maxSettingsScroll = 970 - 412;
-    state_.settingsScroll = std::clamp(state_.settingsScroll - deltaY, 0, maxSettingsScroll);
-    touchLastY_ = y;
-    return;
+    return;  // Every settings section fits on screen; nothing to scroll.
   }
 
   const int direction = deltaY < 0 ? 1 : -1;
@@ -2157,28 +2253,53 @@ void App::handle(Button button) {
       }
       break;
     }
-    case ScreenId::Settings:
-      if (button == Button::Back) {
-        state_.screen = ScreenId::Dashboard;
+    case ScreenId::Settings: {
+      // Two columns: the section list, then the options of the selected section.
+      const auto &sections = settingsSections();
+      const int sectionCount = static_cast<int>(sections.size());
+      state_.settingsSection = std::clamp(state_.settingsSection, 0, sectionCount - 1);
+      const std::vector<int> &options = sections[static_cast<std::size_t>(state_.settingsSection)].options;
+
+      if (state_.settingsInSections) {
+        if (button == Button::Back) {
+          state_.screen = ScreenId::Dashboard;
+        } else if (button == Button::Up) {
+          state_.settingsSection = std::max(0, state_.settingsSection - 1);
+        } else if (button == Button::Down) {
+          state_.settingsSection = std::min(sectionCount - 1, state_.settingsSection + 1);
+        } else if ((button == Button::Right || button == Button::Select) && !options.empty()) {
+          state_.settingsInSections = false;
+          state_.selectedSettingsOption = options.front();
+        }
         break;
       }
 
-      {
-        const int optionCount = 9;
-        const int settingsViewportHeight = 412;
-        const int settingsContentHeight = 970;
-        const int maxSettingsScroll = std::max(0, settingsContentHeight - settingsViewportHeight);
+      auto position = std::find(options.begin(), options.end(), state_.selectedSettingsOption);
+      if (position == options.end()) {
+        if (options.empty()) {
+          state_.settingsInSections = true;
+          break;
+        }
+        state_.selectedSettingsOption = options.front();
+        position = options.begin();
+      }
 
-        if (button == Button::Up) {
-          state_.selectedSettingsOption = std::max(0, state_.selectedSettingsOption - 1);
-          state_.settingsScroll = std::max(0, std::min(maxSettingsScroll, state_.selectedSettingsOption * 74));
-          break;
-        }
-        if (button == Button::Down) {
-          state_.selectedSettingsOption = std::min(optionCount - 1, state_.selectedSettingsOption + 1);
-          state_.settingsScroll = std::max(0, std::min(maxSettingsScroll, state_.selectedSettingsOption * 74));
-          break;
-        }
+      if (button == Button::Back) {
+        state_.settingsInSections = true;
+        break;
+      }
+      if (button == Button::Up) {
+        if (position != options.begin()) state_.selectedSettingsOption = *(position - 1);
+        break;
+      }
+      if (button == Button::Down) {
+        if (position + 1 != options.end()) state_.selectedSettingsOption = *(position + 1);
+        break;
+      }
+      // A row that opens another screen has no value to change: LEFT returns to the sections.
+      if (state_.selectedSettingsOption == 5 && button == Button::Left) {
+        state_.settingsInSections = true;
+        break;
       }
 
       if (button == Button::Select && state_.selectedSettingsOption != 5) {
@@ -2273,6 +2394,7 @@ void App::handle(Button button) {
         }
       }
       break;
+    }
     case ScreenId::Playlists:
       state_.screen = ScreenId::AddPlaylist;
       break;
@@ -2872,9 +2994,7 @@ void App::handleAddPlaylist(Button button) {
     }
 
     if (state_.selectedAddOption == settingsIndex) {
-      state_.screen = ScreenId::Settings;
-      state_.settingsScroll = 0;
-      state_.selectedSettingsOption = 0;
+      openSettingsScreen();
       return;
     }
 
@@ -2895,6 +3015,9 @@ void App::handleParental(Button button) {
 
   if (button == Button::Back) {
     state_.screen = ScreenId::Settings;
+    state_.settingsSection = 2;
+    state_.settingsInSections = false;
+    state_.selectedSettingsOption = 5;
     return;
   }
 
@@ -7203,230 +7326,290 @@ void App::renderPlayerGraphic() {
 }
 
 void App::renderParentalGraphic() {
-  const Color text = rgb(248, 250, 252);
-  const Color muted = rgb(166, 178, 207);
-  const Color blue = rgb(0, 191, 255);
-  const Color warning = rgb(251, 191, 36);
-  const Color danger = rgb(248, 113, 113);
-  const Color panelTop = rgb(16, 24, 45);
-  const Color panelBottom = rgb(7, 11, 22);
-
-  const std::vector<StreamType> streamTypes{
-    StreamType::Live,
-    StreamType::Movies,
-    StreamType::Series,
-    StreamType::Radio
-  };
-
-  state_.selectedParentalType = std::clamp(
-    state_.selectedParentalType,
-    0,
-    std::max(0, static_cast<int>(streamTypes.size()) - 1)
-  );
-
+  const std::vector<StreamType> streamTypes{StreamType::Live, StreamType::Movies, StreamType::Series, StreamType::Radio};
+  state_.selectedParentalType = std::clamp(state_.selectedParentalType, 0, static_cast<int>(streamTypes.size()) - 1);
   const StreamType activeType = streamTypes[static_cast<std::size_t>(state_.selectedParentalType)];
   const std::vector<Category> categories = parentalCategoriesForType(activeType);
-  state_.selectedParentalCategory = std::clamp(
-    state_.selectedParentalCategory,
-    0,
-    std::max(0, static_cast<int>(categories.size()) - 1)
-  );
+  state_.selectedParentalCategory = std::clamp(state_.selectedParentalCategory, 0, std::max(0, static_cast<int>(categories.size()) - 1));
 
-  gfx_.fillVerticalGradient(0, 0, Graphics::Width, Graphics::Height, rgb(7, 11, 22), rgb(2, 5, 11));
-  gfx_.drawImageFileCentered("romfs:/logo/logo-horizontal.png", 34, 28, 300, 72);
-  gfx_.drawText("PARENTAL CONTROL", 80, 104, 5, text, true);
-  gfx_.drawText("PIN is numeric and entered with the Switch software keyboard.", 80, 142, 2, muted, false);
+  renderSettingsShell(2, false);
 
-  Rect panel{64, 180, 1152, 452};
-  gfx_.fillVerticalGradient(panel.x, panel.y, panel.w, panel.h, panelTop, panelBottom);
-  gfx_.strokeRoundRect(panel.x, panel.y, panel.w, panel.h, 18, rgba(72, 92, 128, 55), 1);
+  gfx_.drawTextSize("Parental control", kSettingsInnerX, 116, 24, kSetText, true);
+  gfx_.drawTextSize("Hide categories or require the PIN to open them.", kSettingsInnerX, 152, 15, kSetMuted, false);
 
-  int tabX = panel.x + 28;
+  // "Change PIN" (X) button.
+  gfx_.fillRoundRect(kParentalPinX, kParentalPinY, kParentalPinW, kParentalPinH, 12, rgb(17, 27, 49));
+  gfx_.strokeRoundRect(kParentalPinX, kParentalPinY, kParentalPinW, kParentalPinH, 12, rgb(42, 58, 92), 1);
+  gfx_.drawIcon("key", kParentalPinX + 16, kParentalPinY + 11, 20, rgb(220, 228, 245));
+  gfx_.drawTextSize("Change PIN", kParentalPinX + 46, kParentalPinY + 10, 15, rgb(220, 228, 245), true);
+  gfx_.fillCircle(kParentalPinX + kParentalPinW - 22, kParentalPinY + 21, 11, kSetText);
+  gfx_.drawTextSize("X", kParentalPinX + kParentalPinW - 26, kParentalPinY + 12, 13, rgb(6, 10, 20), true);
+
+  int tabX = kSettingsInnerX;
   for (int i = 0; i < static_cast<int>(streamTypes.size()); ++i) {
+    const StreamType type = streamTypes[static_cast<std::size_t>(i)];
     const bool selected = i == state_.selectedParentalType;
-    const int tabW = 170;
-    gfx_.fillRoundRect(tabX, panel.y + 24, tabW, 36, 10, selected ? rgba(14, 165, 233, 95) : rgba(15, 23, 42, 160));
-    gfx_.strokeRoundRect(tabX, panel.y + 24, tabW, 36, 10, selected ? blue : rgba(72, 92, 128, 45), selected ? 2 : 1);
-    gfx_.drawText(typeIcon(streamTypes[static_cast<std::size_t>(i)], state_.config.useUnicodeIcons), tabX + 16, panel.y + 35, 1, selected ? text : muted, true);
-    gfx_.drawText(Graphics::fitText(toString(streamTypes[static_cast<std::size_t>(i)]), 14), tabX + 56, panel.y + 34, 2, selected ? text : muted, true);
-    tabX += tabW + 14;
+    const int tabW = parentalTabWidth(gfx_, type);
+    gfx_.fillRoundRect(tabX, kParentalTabsY, tabW, kParentalTabH, kParentalTabH / 2, selected ? kSetSelected : kSetRow);
+    gfx_.strokeRoundRect(tabX, kParentalTabsY, tabW, kParentalTabH, kParentalTabH / 2, selected ? kSetSelectedBorder : rgb(31, 43, 69), 1);
+    gfx_.drawIcon(parentalTypeIcon(type), tabX + 18, kParentalTabsY + 12, 20, selected ? kSetAccent : kSetSoft);
+    gfx_.drawTextSize(parentalTypeTitle(type), tabX + 47, kParentalTabsY + 11, 16, selected ? kSetText : kSetSoft, true);
+    tabX += tabW + 10;
   }
 
+  const int rowsRight = kSettingsInnerRight - 18;
   if (categories.empty()) {
-    gfx_.drawText("No categories loaded for this stream type.", panel.x + 40, panel.y + 118, 3, muted, true);
-    gfx_.drawText("Load a playlist first, then return here to protect categories.", panel.x + 40, panel.y + 154, 2, muted, false);
+    gfx_.drawTextSize("No categories loaded for this type.", kSettingsInnerX, kParentalRowsY + 20, 20, kSetSoft, true);
+    gfx_.drawTextSize("Load a playlist first, then come back to protect its categories.", kSettingsInnerX, kParentalRowsY + 54, 15, kSetMuted, false);
   } else {
-    const int rows = 8;
-    const int start = windowStart(state_.selectedParentalCategory, static_cast<int>(categories.size()), rows);
-
-    for (int i = 0; i < rows; ++i) {
+    const int count = static_cast<int>(categories.size());
+    const int start = windowStart(state_.selectedParentalCategory, count, kParentalVisibleRows);
+    for (int i = 0; i < kParentalVisibleRows; ++i) {
       const int index = start + i;
-      if (index >= static_cast<int>(categories.size())) {
-        break;
+      if (index >= count) break;
+      const Category &category = categories[static_cast<std::size_t>(index)];
+      const bool focused = index == state_.selectedParentalCategory;
+      const ParentalRule rule = parentalRuleForKey(parentalKeyForCategory(category));
+      const int x = kSettingsInnerX;
+      const int y = kParentalRowsY + i * kParentalRowPitch;
+      const int w = rowsRight - x;
+
+      if (focused) {
+        gfx_.fillRoundRect(x - 4, y - 4, w + 8, kParentalRowH + 8, 18, rgba(0, 191, 255, 30));
+        gfx_.fillRoundRect(x, y, w, kParentalRowH, 14, kSetRowFocus);
+        gfx_.strokeRoundRect(x, y, w, kParentalRowH, 14, kSetAccent, 2);
+      } else {
+        gfx_.fillRoundRect(x, y, w, kParentalRowH, 14, kSetRow);
       }
 
-      const Category &category = categories[static_cast<std::size_t>(index)];
-      const bool selected = index == state_.selectedParentalCategory;
-      const ParentalRule rule = parentalRuleForKey(parentalKeyForCategory(category));
-      const int y = panel.y + 92 + i * 42;
-      const Color badgeColor = rule == ParentalRule::Hidden
-        ? danger
-        : (rule == ParentalRule::Locked ? warning : muted);
+      const bool hidden = rule == ParentalRule::Hidden;
+      gfx_.drawTextSize(Graphics::fitText(category.name, 44), x + 18, y + 17, 17, hidden ? kSetMuted : kSetText, focused);
 
-      gfx_.fillRoundRect(panel.x + 28, y, panel.w - 56, 36, 10, selected ? rgba(18, 45, 94, 230) : rgba(15, 23, 42, 180));
-      gfx_.strokeRoundRect(panel.x + 28, y, panel.w - 56, 36, 10, selected ? blue : rgba(72, 92, 128, 24), selected ? 2 : 1);
-      gfx_.drawText(Graphics::fitText(category.name, 58), panel.x + 48, y + 10, 2, selected ? text : muted, true);
-      gfx_.drawTextRight(parentalRuleLabel(rule), panel.x + panel.w - 54, y + 10, 2, badgeColor, true);
+      const int chipW = 132;
+      const int chipX = x + w - 16 - chipW;
+      const std::string countLabel = std::to_string(category.totalChannels) + " items";
+      gfx_.drawTextSize(countLabel, chipX - 16 - gfx_.textWidthSize(countLabel, 14), y + 20, 14, kSetMuted, false);
+
+      Color chipBg = rgb(22, 33, 58);
+      Color chipFg = kSetSoft;
+      const char *chipIcon = "eye";
+      const char *chipLabel = "Visible";
+      if (rule == ParentalRule::Locked) {
+        chipBg = rgb(14, 58, 99);
+        chipFg = rgb(165, 216, 255);
+        chipIcon = "lock";
+        chipLabel = "Locked";
+      } else if (hidden) {
+        chipBg = rgb(58, 36, 16);
+        chipFg = rgb(253, 186, 116);
+        chipIcon = "eye-off";
+        chipLabel = "Hidden";
+      }
+      gfx_.fillRoundRect(chipX, y + 12, chipW, 34, 17, chipBg);
+      const int labelW = gfx_.textWidthSize(chipLabel, 14, true);
+      const int contentW = 18 + 7 + labelW;
+      const int cx = chipX + (chipW - contentW) / 2;
+      gfx_.drawIcon(chipIcon, cx, y + 20, 18, chipFg);
+      gfx_.drawTextSize(chipLabel, cx + 25, y + 19, 14, chipFg, true);
+    }
+
+    // Scroll position.
+    const int trackY = kParentalRowsY;
+    const int trackH = kParentalVisibleRows * kParentalRowPitch - (kParentalRowPitch - kParentalRowH);
+    gfx_.fillRoundRect(kSettingsInnerRight - 4, trackY, 4, trackH, 2, rgb(22, 33, 58));
+    if (count > kParentalVisibleRows) {
+      const int thumbH = std::max(24, trackH * kParentalVisibleRows / count);
+      const int thumbY = trackY + (trackH - thumbH) * start / std::max(1, count - kParentalVisibleRows);
+      gfx_.fillRoundRect(kSettingsInnerRight - 4, thumbY, 4, thumbH, 2, rgb(59, 76, 112));
+    } else {
+      gfx_.fillRoundRect(kSettingsInnerRight - 4, trackY, 4, trackH, 2, rgb(59, 76, 112));
     }
   }
 
-  gfx_.drawText("TOUCH TAB/ROW TO CHANGE    DRAG TO SCROLL    LEFT: BACK    RIGHT: CHANGE PIN", 64, 660, 2, muted, true);
+  renderFooterHints(
+    {{"A", "Change state"}, {"X", "Change PIN"}, {"LR", "Type"}, {"B", "Back"}},
+    "A cycles: Visible -> Hidden -> Locked"
+  );
+}
+
+void App::openSettingsScreen() {
+  state_.screen = ScreenId::Settings;
+  state_.settingsSection = 0;
+  state_.settingsInSections = true;
+  state_.selectedSettingsOption = settingsSections().front().options.front();
+  state_.settingsScroll = 0;
+}
+
+// Background, header, section list and the empty content panel shared by Settings and Parental.
+void App::renderSettingsShell(int activeSection, bool sectionListFocused) {
+  gfx_.fillRect(0, 0, Graphics::Width, Graphics::Height, rgb(6, 10, 20));
+
+  gfx_.drawImageFileCentered("romfs:/logo/logo-horizontal.png", kSettingsNavX, 22, 150, 48);
+  gfx_.fillRect(kSettingsNavX + 168, 32, 1, 28, rgb(35, 49, 79));
+  gfx_.drawTextSize("Settings", kSettingsNavX + 186, 28, 26, kSetText, true);
+  gfx_.fillCircle(1078, 47, 5, rgb(52, 211, 153));
+  gfx_.drawTextSize("Online", 1090, 36, 16, kSetMuted, false);
+  const std::string clock = formatSystemClockTime();
+  gfx_.drawTextSize(clock, kSettingsInnerRight + 30 - gfx_.textWidthSize(clock, 22, true), 31, 22, kSetText, true);
+
+  gfx_.fillRoundRect(kSettingsNavX, kSettingsNavY, kSettingsNavW, kSettingsPanelH, 20, kSetPanel);
+  gfx_.strokeRoundRect(kSettingsNavX, kSettingsNavY, kSettingsNavW, kSettingsPanelH, 20, kSetPanelBorder, 1);
+
+  const auto &sections = settingsSections();
+  const int count = static_cast<int>(sections.size());
+  for (int i = 0; i < count; ++i) {
+    const int x = kSettingsNavX + 14;
+    const int y = settingsNavItemY(i, count);
+    const int w = kSettingsNavW - 28;
+    const bool active = i == activeSection;
+    if (active) {
+      gfx_.fillRoundRect(x, y, w, kSettingsNavItemH, 14, kSetSelected);
+      if (sectionListFocused) {
+        gfx_.strokeRoundRect(x, y, w, kSettingsNavItemH, 14, kSetAccent, 2);
+      } else {
+        gfx_.strokeRoundRect(x, y, w, kSettingsNavItemH, 14, kSetSelectedBorder, 1);
+      }
+    }
+    gfx_.drawIcon(sections[static_cast<std::size_t>(i)].icon, x + 16, y + 16, 22, active ? kSetAccent : kSetSoft);
+    gfx_.drawTextSize(sections[static_cast<std::size_t>(i)].title, x + 52, y + 15, 17, active ? kSetText : kSetSoft, active);
+  }
+
+  gfx_.fillRoundRect(kSettingsContentX, kSettingsNavY, kSettingsContentW, kSettingsPanelH, 20, kSetPanel);
+  gfx_.strokeRoundRect(kSettingsContentX, kSettingsNavY, kSettingsContentW, kSettingsPanelH, 20, kSetPanelBorder, 1);
+}
+
+// Controller hints, right-aligned in the footer: {glyph, label}. Glyph "A"/"B"/"X"/"Y" draws a
+// Switch-style button; "LR" draws the left/right D-pad icon.
+void App::renderFooterHints(const std::vector<std::pair<std::string, std::string>> &hints, const std::string &leftNote) {
+  if (!leftNote.empty()) {
+    gfx_.drawTextSize(leftNote, kSettingsNavX, kSettingsFooterY + 27, 15, kSetMuted, false);
+  }
+  int x = kSettingsInnerRight + 30;
+  for (auto it = hints.rbegin(); it != hints.rend(); ++it) {
+    const int labelW = gfx_.textWidthSize(it->second, 16, true);
+    x -= labelW;
+    gfx_.drawTextSize(it->second, x, kSettingsFooterY + 26, 16, kSetSoft, true);
+    x -= 9 + 30;
+    const int cy = kSettingsFooterY + 38;
+    if (it->first == "LR") {
+      gfx_.fillRoundRect(x, cy - 15, 30, 30, 8, rgb(26, 36, 64));
+      gfx_.drawIcon("arrows-horizontal", x + 5, cy - 10, 20, kSetText);
+    } else {
+      gfx_.fillCircle(x + 15, cy, 15, kSetText);
+      const int glyphW = gfx_.textWidthSize(it->first, 15, true);
+      gfx_.drawTextSize(it->first, x + 15 - glyphW / 2, cy - 11, 15, rgb(6, 10, 20), true);
+    }
+    x -= 28;
+  }
 }
 
 void App::renderSettingsGraphic() {
-  const Color text = rgb(248, 250, 252);
-  const Color muted = rgb(166, 178, 207);
-  const Color blue = rgb(0, 191, 255);
-  const Color selectedBg = rgba(14, 165, 233, 45);
-  const Color panelTop = rgb(16, 24, 45);
-  const Color panelBottom = rgb(7, 11, 22);
+  const auto &sections = settingsSections();
+  state_.settingsSection = std::clamp(state_.settingsSection, 0, static_cast<int>(sections.size()) - 1);
+  const SettingsSectionDef &section = sections[static_cast<std::size_t>(state_.settingsSection)];
 
-  gfx_.fillVerticalGradient(0, 0, Graphics::Width, Graphics::Height, rgb(7, 11, 22), rgb(2, 5, 11));
-  gfx_.drawImageFileCentered("romfs:/logo/logo-horizontal.png", 34, 28, 300, 72);
-  gfx_.drawText("SETTINGS / ABOUT", 80, 104, 5, text, true);
-  gfx_.drawText("CONFIG: " + Graphics::fitText(configPath(), 80), 80, 142, 2, muted, false);
+  renderSettingsShell(state_.settingsSection, state_.settingsInSections);
 
-  Rect panel{64, 180, 1152, 452};
-  gfx_.fillVerticalGradient(panel.x, panel.y, panel.w, panel.h, panelTop, panelBottom);
-  gfx_.strokeRoundRect(panel.x, panel.y, panel.w, panel.h, 18, rgba(72, 92, 128, 55), 1);
-
-  const int viewportTop = panel.y + 18;
-  const int viewportBottom = panel.y + panel.h - 22;
-  const int contentX = panel.x + 34;
-  const int scroll = std::max(0, state_.settingsScroll);
-
-  auto drawLine = [&](const std::string &line, int baseY, int scale, Color color, bool bold, int xOffset = 0) {
-    const int y = baseY - scroll;
-    const int height = (scale == 4 ? 30 : (scale == 3 ? 24 : 18));
-    if (y < viewportTop || y + height > viewportBottom) {
-      return;
-    }
-    gfx_.drawText(line, contentX + xOffset, y, scale, color, bold);
-  };
-
-  auto drawSetting = [&](int index, const std::string &title, const std::string &value, const std::string &hint, int &y) {
-    const int rowY = y - scroll;
-    const bool selected = state_.selectedSettingsOption == index;
-
-    if (rowY >= viewportTop && rowY + 70 <= viewportBottom) {
-      if (selected) {
-        gfx_.fillRoundRect(contentX - 14, rowY - 8, panel.w - 68, 70, 12, selectedBg);
-        gfx_.strokeRoundRect(contentX - 14, rowY - 8, panel.w - 68, 70, 12, rgba(0, 191, 255, 95), 1);
-      }
-
-      gfx_.drawText((selected ? "> " : "  ") + title, contentX, rowY, 3, selected ? blue : text, true);
-      gfx_.drawText(Graphics::fitText(value, 72), contentX + 30, rowY + 28, 2, text, true);
-      gfx_.drawText(Graphics::fitText(hint, 88), contentX + 30, rowY + 52, 1, muted, false);
-      if (index == 5) {
-        gfx_.drawTextRight("OPEN >", panel.x + panel.w - 34, rowY + 24, 2, blue, true);
-      } else {
-        gfx_.drawText("-", contentX + 760, rowY + 22, 3, muted, true);
-        gfx_.drawTextRight("+", panel.x + panel.w - 38, rowY + 22, 3, blue, true);
-      }
-    }
-
-    y += 78;
-  };
+  gfx_.drawTextSize(section.title, kSettingsInnerX, 116, 24, kSetText, true);
+  if (section.subtitle[0] != '\0') {
+    gfx_.drawTextSize(section.subtitle, kSettingsInnerX, 152, 15, kSetMuted, false);
+  }
 
   const PlaylistConfig *playlist = activePlaylist();
   const int epgOffset = playlist ? playlist->epgOffsetMinutes : 0;
+  struct OptionView {
+    const char *icon;
+    std::string title;
+    std::string description;
+    std::string value;
+    bool opensScreen;
+  };
+  auto optionView = [&](int option) -> OptionView {
+    switch (option) {
+      case 0: return {"clock", "Time offset", "Per playlist. L/R changes by 1 hour.", formatEpgOffsetMinutes(epgOffset), false};
+      case 1: return {"moon", "Keep awake while playing", "Prevents the console from sleeping while something plays.",
+        playbackSleepBehaviorLabel(state_.config.playbackSleepBehavior), false};
+      case 2: return {"clock", "Docked sleep timer", "Stops playback after the chosen time. Any button resets it.",
+        formatMinutesOption(state_.config.dockedSleepTimerMinutes), false};
+      case 3: return {"battery", "Battery warning", "In handheld mode, warns before the console goes to sleep.",
+        "After " + std::to_string(state_.config.batterySleepTimeoutMinutes) + " min", false};
+      case 4: return {"bell", "Warning lead time", "How long before sleep the warning appears.",
+        std::to_string(state_.config.sleepWarningSeconds) + " seconds", false};
+      case 5: {
+        const std::size_t protectedCount = state_.config.parentalRules.size();
+        return {"shield-lock", "Manage categories", "Choose which categories are hidden or need the PIN.",
+          std::to_string(protectedCount) + (protectedCount == 1 ? " protected" : " protected"), true};
+      }
+      case 6: return {"playlist", "Playlist refresh", "Playlists load from cache until this interval expires.",
+        formatHoursOption(state_.config.manifestRefreshHours), false};
+      case 7: return {"refresh", "Guide refresh", "Guide data stays cached for this long.",
+        formatHoursOption(state_.config.epgRefreshHours), false};
+      case 8: return {"language", "Interface language", "More languages are being prepared.",
+        languageLabel(state_.config.uiLanguage), false};
+      default: return {"info-circle", "", "", "", false};
+    }
+  };
 
-  int y = panel.y + 26;
-  drawSetting(
-    0,
-    "EPG TIME OFFSET",
-    "Current offset: " + formatEpgOffsetMinutes(epgOffset),
-    "Per-playlist. LEFT/RIGHT = 30 min, L/R = 1 hour, Y = reset.",
-    y
-  );
-  drawSetting(
-    1,
-    "PLAYBACK SLEEP",
-    playbackSleepBehaviorLabel(state_.config.playbackSleepBehavior),
-    "Dashboard follows system. Docked only is the recommended default.",
-    y
-  );
-  drawSetting(
-    2,
-    "DOCKED SLEEP TIMER",
-    formatMinutesOption(state_.config.dockedSleepTimerMinutes),
-    "Optional TV bedtime timer. Any button resets it during playback.",
-    y
-  );
-  drawSetting(
-    3,
-    "BATTERY SLEEP WARNING",
-    "After ~" + std::to_string(state_.config.batterySleepTimeoutMinutes) + " minutes idle",
-    "Handheld mode respects the console sleep settings and only warns the user.",
-    y
-  );
-  drawSetting(
-    4,
-    "WARNING LEAD TIME",
-    std::to_string(state_.config.sleepWarningSeconds) + " seconds before",
-    "Shows: Console may sleep soon / Press any button to keep watching.",
-    y
-  );
-  drawSetting(
-    5,
-    "PARENTAL CONTROL",
-    std::to_string(state_.config.parentalRules.size()) + " protected categor" +
-      (state_.config.parentalRules.size() == 1 ? "y" : "ies"),
-    "A = manage categories, X = reset selected options inside parental screen.",
-    y
-  );
-  drawSetting(
-    6,
-    "MANIFEST REFRESH",
-    formatHoursOption(state_.config.manifestRefreshHours),
-    "Uses local cache until this interval expires. X resets to 24 hours.",
-    y
-  );
-  drawSetting(
-    7,
-    "EPG REFRESH",
-    formatHoursOption(state_.config.epgRefreshHours),
-    "EPG remains on demand and cached. X resets to 12 hours.",
-    y
-  );
-  drawSetting(
-    8,
-    "LANGUAGE",
-    languageLabel(state_.config.uiLanguage),
-    "Switch UI strings are staged for English, Portuguese and Spanish.",
-    y
-  );
-
-  y += 8;
-  drawLine("ABOUT KBORE", y, 4, text, true); y += 42;
-  drawLine("Kboré is an IPTV/VOD player for user-provided playlists.", y, 2, muted, false); y += 28;
-  drawLine("The app does not provide playlists, channels, movies, series or servers.", y, 2, muted, false); y += 28;
-  drawLine("All playlist URLs, credentials and playback sources are the user's responsibility.", y, 2, muted, false); y += 42;
-  drawLine("Built with devkitPro/libnx, FFmpeg, Deko3D, SDL, cURL and related libraries.", y, 2, muted, false); y += 28;
-  drawLine("Developed by Gilson Santos", y, 2, text, true); y += 28;
-  drawLine("github.com/devgsantos", y, 2, blue, true);
-
-  const int settingsViewportHeight = 412;
-  const int settingsContentHeight = 970;
-  const int maxSettingsScroll = std::max(0, settingsContentHeight - settingsViewportHeight);
-  if (state_.settingsScroll > 0) {
-    gfx_.drawText("^ MORE", panel.x + panel.w - 120, panel.y + 18, 2, blue, true);
-  }
-  if (state_.settingsScroll < maxSettingsScroll) {
-    gfx_.drawText("v MORE", panel.x + panel.w - 120, panel.y + panel.h - 32, 2, blue, true);
+  if (section.options.empty()) {
+    int y = 172;
+    gfx_.drawTextSize("Kbore is an IPTV and VOD player for user-provided playlists.", kSettingsInnerX, y, 17, kSetSoft, false); y += 32;
+    gfx_.drawTextSize("It does not provide playlists, channels, movies, series or servers.", kSettingsInnerX, y, 17, kSetSoft, false); y += 32;
+    gfx_.drawTextSize("Playlist URLs, credentials and playback sources are the user's responsibility.", kSettingsInnerX, y, 17, kSetSoft, false); y += 52;
+    gfx_.drawTextSize("Built with devkitPro/libnx, FFmpeg, Deko3D, SDL, cURL and Tabler Icons.", kSettingsInnerX, y, 15, kSetMuted, false); y += 30;
+    gfx_.drawTextSize("Developed by Gilson Santos", kSettingsInnerX, y, 16, kSetText, true); y += 28;
+    gfx_.drawTextSize("github.com/devgsantos", kSettingsInnerX, y, 16, kSetAccent, true); y += 52;
+    gfx_.drawTextSize("Config file: " + Graphics::fitText(configPath(), 70), kSettingsInnerX, y, 13, kSetMuted, false);
   }
 
-  gfx_.drawText("TOUCH LEFT/RIGHT TO CHANGE    DRAG TO SCROLL    TOUCH FOOTER TO BACK", 64, 660, 2, muted, true);
+  for (std::size_t j = 0; j < section.options.size(); ++j) {
+    const int option = section.options[j];
+    const OptionView view = optionView(option);
+    const bool focused = !state_.settingsInSections && state_.selectedSettingsOption == option;
+    const int x = kSettingsInnerX;
+    const int y = kSettingsRowsY + static_cast<int>(j) * kSettingsRowPitch;
+    const int w = kSettingsInnerRight - kSettingsInnerX;
+
+    if (focused) {
+      gfx_.fillRoundRect(x - 4, y - 4, w + 8, kSettingsRowH + 8, 20, rgba(0, 191, 255, 30));
+      gfx_.fillRoundRect(x, y, w, kSettingsRowH, 16, kSetRowFocus);
+      gfx_.strokeRoundRect(x, y, w, kSettingsRowH, 16, kSetAccent, 2);
+    } else {
+      gfx_.fillRoundRect(x, y, w, kSettingsRowH, 16, kSetRow);
+    }
+
+    gfx_.fillRoundRect(x + 18, y + 19, 46, 46, 13, focused ? rgb(15, 60, 102) : rgb(20, 32, 57));
+    gfx_.drawIcon(view.icon, x + 29, y + 30, 24, focused ? rgb(127, 219, 255) : rgb(159, 179, 217));
+    gfx_.drawTextSize(view.title, x + 80, y + 15, 18, kSetText, focused);
+    gfx_.drawTextSize(Graphics::fitText(view.description, 64), x + 80, y + 44, 14, focused ? rgb(185, 198, 224) : kSetMuted, false);
+
+    if (view.opensScreen) {
+      const int valueW = gfx_.textWidthSize(view.value, 16, false);
+      gfx_.drawTextSize(view.value, kSettingsInnerRight - 54 - valueW, y + 31, 16, kSetMuted, false);
+      gfx_.drawIcon("chevron-right", kSettingsInnerRight - 46, y + 28, 28, focused ? kSetText : rgb(159, 179, 217));
+    } else {
+      const Color buttonBg = focused ? rgb(26, 61, 102) : rgb(22, 35, 63);
+      const Color arrow = focused ? kSetText : rgb(159, 179, 217);
+      const int by = y + (kSettingsRowH - kStepperButton) / 2;
+      gfx_.fillCircle(kStepperLeftX + kStepperButton / 2, by + kStepperButton / 2, kStepperButton / 2, buttonBg);
+      gfx_.drawIcon("chevron-left", kStepperLeftX + 9, by + 9, 20, arrow);
+      gfx_.fillCircle(kStepperRightX + kStepperButton / 2, by + kStepperButton / 2, kStepperButton / 2, buttonBg);
+      gfx_.drawIcon("chevron-right", kStepperRightX + 9, by + 9, 20, arrow);
+      const std::string value = Graphics::fitText(view.value, 20);
+      const int valueW = gfx_.textWidthSize(value, 17, true);
+      gfx_.drawTextSize(value, kStepperValueX + (kStepperValueW - valueW) / 2, y + 29, 17,
+        focused ? kSetText : rgb(220, 228, 245), focused);
+    }
+  }
+
+  if (state_.settingsInSections) {
+    renderFooterHints(section.options.empty()
+      ? std::vector<std::pair<std::string, std::string>>{{"B", "Back"}}
+      : std::vector<std::pair<std::string, std::string>>{{"A", "Open"}, {"B", "Back"}});
+  } else if (state_.selectedSettingsOption == 5) {
+    renderFooterHints({{"A", "Open"}, {"B", "Back"}});
+  } else {
+    renderFooterHints({{"LR", "Change"}, {"Y", "Default"}, {"B", "Back"}});
+  }
 }
 
 

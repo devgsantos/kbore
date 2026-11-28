@@ -66,6 +66,8 @@ struct AppState {
   int selectedAddOption = 0;
   int settingsScroll = 0;
   int selectedSettingsOption = 0;
+  int settingsSection = 0;          // section shown in the settings content panel
+  bool settingsInSections = true;   // focus on the section list (true) or on its options
   int selectedParentalType = 0;
   int selectedParentalCategory = 0;
   bool parentalUnlocked = false;
@@ -212,6 +214,9 @@ private:
 
   void render();
   void paceFrame();
+  void renderSettingsShell(int activeSection, bool sectionListFocused);
+  void renderFooterHints(const std::vector<std::pair<std::string, std::string>> &hints, const std::string &leftNote = "");
+  void openSettingsScreen();
   void startNativePlayback(const Channel &channel);
   void finishNativePlayback(const Channel &channel, std::unique_ptr<IPlayerBackend> player);
   void finishNativePlaybackResult(const Channel &channel, bool opened);

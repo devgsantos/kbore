@@ -94,6 +94,11 @@ public:
   void drawLine(int x0, int y0, int x1, int y1, Color color, int thickness = 1);
   void drawText(const std::string &text, int x, int y, int scale, Color color, bool bold = false);
   void drawTextRight(const std::string &text, int rightX, int y, int scale, Color color, bool bold = false);
+  // Text at an exact point size (the scale-based calls only offer 12/16/22/28/34/42).
+  void drawTextSize(const std::string &text, int x, int y, int pointSize, Color color, bool bold = false);
+  int textWidthSize(const std::string &text, int pointSize, bool bold = false) const;
+  // Line-art UI icon (romfs:/icons/ui/<name>.svg, Tabler Icons), tinted with `color`.
+  void drawIcon(const std::string &name, int x, int y, int size, Color color);
   void drawBadge(const std::string &text, int x, int y, int w, int h, Color bg, Color fg);
   void drawIconBox(const std::string &kind, int x, int y, int size, Color bg1, Color bg2, Color fg);
   void drawLogoPlaceholder(const std::string &name, const std::string &logoUrl, int x, int y, int w, int h);
@@ -111,6 +116,7 @@ private:
   void putPixel(int x, int y, Color color);
   void blendPixel(int x, int y, Color color);
   void drawGlyph(char ch, int x, int y, int scale, Color color, bool bold);
+  void drawBitmapFallbackText(const std::string &text, int x, int y, int scale, Color color, bool bold);
 };
 
 Color rgb(uint8_t r, uint8_t g, uint8_t b);

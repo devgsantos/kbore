@@ -285,7 +285,24 @@ const char *firstExistingFont() {
 }
 
 #ifdef NSTV_USE_SDL_TTF
+TTF_Font *fontForPointSize(int size, bool bold);
+
 TTF_Font *fontForScale(int scale, bool bold) {
+  // Map legacy scale values to TV-friendly point sizes.
+  int size = 12;
+  switch (scale) {
+    case 1: size = 12; break;
+    case 2: size = 16; break;
+    case 3: size = 22; break;
+    case 4: size = 28; break;
+    case 5: size = 34; break;
+    case 6: size = 42; break;
+    default: size = std::max(10, scale * 7); break;
+  }
+  return fontForPointSize(size, bold);
+}
+
+TTF_Font *fontForPointSize(int size, bool bold) {
   if (!g_ttfReady) {
     std::printf("[NSTV] SDL_ttf is not ready\n");
     return nullptr;
@@ -298,18 +315,7 @@ TTF_Font *fontForScale(int scale, bool bold) {
     return nullptr;
   }
 
-  // Map legacy scale values to TV-friendly point sizes.
-  int size = 12;
-  switch (scale) {
-    case 1: size = 12; break;
-    case 2: size = 16; break;
-    case 3: size = 22; break;
-    case 4: size = 28; break;
-    case 5: size = 34; break;
-    case 6: size = 42; break;
-    default: size = std::max(10, scale * 7); break;
-  }
-
+  size = std::clamp(size, 8, 96);
   std::string key = std::string(fontPath) + ":" + std::to_string(size) + (bold ? ":bold" : ":regular");
   auto found = g_fontCache.find(key);
   if (found != g_fontCache.end()) return found->second;
@@ -823,44 +829,92 @@ void Graphics::drawLine(int x0, int y0, int x1, int y1, Color color, int thickne
   for (int i=0; i<thickness; ++i) SDL_RenderDrawLine(g_renderer, x0, y0+i, x1, y1+i);
 }
 
+#ifdef NSTV_USE_SDL_TTF
+namespace {
+// Draws text with a given font through the text texture cache. Returns false without a font.
+bool drawTextWithFont(TTF_Font *font, const std::string &text, int x, int y, Color color);
+int textWidthWithFont(TTF_Font *font, const std::string &text);
+}
+#endif
+
+void Graphics::drawTextSize(const std::string &text, int x, int y, int pointSize, Color color, bool bold) {
+  if (!g_renderer) return;
+#ifdef NSTV_USE_SDL_TTF
+  if (drawTextWithFont(fontForPointSize(pointSize, bold), text, x, y, color)) return;
+#endif
+  drawText(text, x, y, std::max(1, pointSize / 8), color, bold);
+}
+
+int Graphics::textWidthSize(const std::string &text, int pointSize, bool bold) const {
+#ifdef NSTV_USE_SDL_TTF
+  if (TTF_Font *font = fontForPointSize(pointSize, bold)) return textWidthWithFont(font, text);
+#endif
+  return textWidth(text, std::max(1, pointSize / 8));
+}
+
 void Graphics::drawText(const std::string &text, int x, int y, int scale, Color color, bool bold) {
   if (!g_renderer) return;
 #ifdef NSTV_USE_SDL_TTF
-  TTF_Font *font = fontForScale(scale, bold);
-  if (font) {
-    if (text.empty() || color.a == 0) return;
-    // Glyphs are rasterised once in white and tinted per draw, so a label keeps one texture
-    // regardless of focus/selection colour changes.
-    std::string key = std::to_string(reinterpret_cast<std::uintptr_t>(font));
-    key.push_back('\x1f');
-    key += text;
-    auto found = g_textTextureCache.find(key);
-    if (found == g_textTextureCache.end()) {
-      LruTexture entry;
-      const std::string s = normalizeAscii(text);
-      SDL_Surface *surface = s.empty() ? nullptr : TTF_RenderUTF8_Blended(font, s.c_str(), SDL_Color{255, 255, 255, 255});
-      if (surface) {
-        entry.texture = SDL_CreateTextureFromSurface(g_renderer, surface);
-        entry.width = surface->w;
-        entry.height = surface->h;
-        if (entry.texture) SDL_SetTextureBlendMode(entry.texture, SDL_BLENDMODE_BLEND);
-        SDL_FreeSurface(surface);
-      }
-      found = g_textTextureCache.emplace(std::move(key), entry).first;
-    }
-    LruTexture &entry = found->second;
-    entry.lastUsedFrame = g_frameIndex;
-    if (!entry.texture) return;
-    SDL_SetTextureColorMod(entry.texture, color.r, color.g, color.b);
-    SDL_SetTextureAlphaMod(entry.texture, color.a);
-    SDL_Rect dst{x, y, entry.width, entry.height};
-    SDL_RenderCopy(g_renderer, entry.texture, nullptr, &dst);
-    return;
-  }
+  if (drawTextWithFont(fontForScale(scale, bold), text, x, y, color)) return;
 #endif
   const std::string s = normalizeAscii(text);
-  // Built-in bitmap fallback. This prevents the UI from disappearing if SDL_ttf
-  // cannot load the TTF font on the Switch SD card.
+  drawBitmapFallbackText(s, x, y, scale, color, bold);
+}
+
+#ifdef NSTV_USE_SDL_TTF
+namespace {
+bool drawTextWithFont(TTF_Font *font, const std::string &text, int x, int y, Color color) {
+  if (!font) return false;
+  if (text.empty() || color.a == 0) return true;
+  // Glyphs are rasterised once in white and tinted per draw, so a label keeps one texture
+  // regardless of focus/selection colour changes.
+  std::string key = std::to_string(reinterpret_cast<std::uintptr_t>(font));
+  key.push_back('\x1f');
+  key += text;
+  auto found = g_textTextureCache.find(key);
+  if (found == g_textTextureCache.end()) {
+    LruTexture entry;
+    const std::string s = normalizeAscii(text);
+    SDL_Surface *surface = s.empty() ? nullptr : TTF_RenderUTF8_Blended(font, s.c_str(), SDL_Color{255, 255, 255, 255});
+    if (surface) {
+      entry.texture = SDL_CreateTextureFromSurface(g_renderer, surface);
+      entry.width = surface->w;
+      entry.height = surface->h;
+      if (entry.texture) SDL_SetTextureBlendMode(entry.texture, SDL_BLENDMODE_BLEND);
+      SDL_FreeSurface(surface);
+    }
+    found = g_textTextureCache.emplace(std::move(key), entry).first;
+  }
+  LruTexture &entry = found->second;
+  entry.lastUsedFrame = g_frameIndex;
+  if (!entry.texture) return true;
+  SDL_SetTextureColorMod(entry.texture, color.r, color.g, color.b);
+  SDL_SetTextureAlphaMod(entry.texture, color.a);
+  SDL_Rect dst{x, y, entry.width, entry.height};
+  SDL_RenderCopy(g_renderer, entry.texture, nullptr, &dst);
+  return true;
+}
+
+int textWidthWithFont(TTF_Font *font, const std::string &text) {
+  std::string key = std::to_string(reinterpret_cast<std::uintptr_t>(font));
+  key.push_back('\x1f');
+  key += text;
+  auto textFound = g_textTextureCache.find(key);
+  if (textFound != g_textTextureCache.end()) return textFound->second.width;
+  auto found = g_textWidthCache.find(key);
+  if (found != g_textWidthCache.end()) return found->second;
+  const std::string s = normalizeAscii(text);
+  int w = 0, h = 0;
+  TTF_SizeUTF8(font, s.c_str(), &w, &h);
+  g_textWidthCache.emplace(std::move(key), w);
+  return w;
+}
+} // namespace
+#endif
+
+// Built-in bitmap fallback. This prevents the UI from disappearing if SDL_ttf cannot load the
+// TTF font on the Switch SD card.
+void Graphics::drawBitmapFallbackText(const std::string &s, int x, int y, int scale, Color color, bool bold) {
   int cx = x;
   const int pixel = std::max(1, scale);
   const int step = 6 * pixel + (bold ? 1 : 0);
@@ -889,24 +943,34 @@ void Graphics::drawTextRight(const std::string &text, int rightX, int y, int sca
 
 int Graphics::textWidth(const std::string &text, int scale) const {
 #ifdef NSTV_USE_SDL_TTF
-  TTF_Font *font = fontForScale(scale, false);
-  if (font) {
-    std::string key = std::to_string(reinterpret_cast<std::uintptr_t>(font));
-    key.push_back('\x1f');
-    key += text;
-    auto textFound = g_textTextureCache.find(key);
-    if (textFound != g_textTextureCache.end()) return textFound->second.width;
-    auto found = g_textWidthCache.find(key);
-    if (found != g_textWidthCache.end()) return found->second;
-    const std::string s = normalizeAscii(text);
-    int w=0,h=0;
-    TTF_SizeUTF8(font, s.c_str(), &w, &h);
-    g_textWidthCache.emplace(std::move(key), w);
-    return w;
-  }
+  if (TTF_Font *font = fontForScale(scale, false)) return textWidthWithFont(font, text);
 #endif
   const std::string s = normalizeAscii(text);
   return int(s.size()) * (6*scale);
+}
+
+// Tinted icon from romfs:/icons/ui/<name>.svg (white strokes, rasterised once at the size set in
+// the file, then scaled and coloured per draw).
+void Graphics::drawIcon(const std::string &name, int x, int y, int size, Color color) {
+  if (!g_renderer || size <= 0 || color.a == 0) return;
+#ifdef NSTV_USE_SDL_IMAGE
+#ifdef __SWITCH__
+  const std::string path = "romfs:/icons/ui/" + name + ".svg";
+#else
+  const std::string path = "./romfs/icons/ui/" + name + ".svg";
+#endif
+  int texW = 0, texH = 0;
+  SDL_Texture *texture = loadTextureFromFile(path, texW, texH);
+  if (!texture) return;
+  SDL_SetTextureColorMod(texture, color.r, color.g, color.b);
+  SDL_SetTextureAlphaMod(texture, color.a);
+  SDL_Rect dst{x, y, size, size};
+  SDL_RenderCopy(g_renderer, texture, nullptr, &dst);
+  SDL_SetTextureColorMod(texture, 255, 255, 255);
+  SDL_SetTextureAlphaMod(texture, 255);
+#else
+  (void)name; (void)x; (void)y; (void)color;
+#endif
 }
 
 std::string Graphics::fitText(const std::string &text, int maxChars) {
